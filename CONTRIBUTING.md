@@ -24,7 +24,7 @@ Thanks for your interest in improving gemma-realtime. Here's how to help.
 ## Development Setup
 
 ```bash
-git clone https://github.com/h-uman/gemma-realtime.git
+git clone https://github.com/sethdford/gemma-realtime.git
 cd gemma-realtime
 pip install mlx mlx-lm
 ```

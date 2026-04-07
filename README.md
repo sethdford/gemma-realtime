@@ -13,7 +13,7 @@
   <a href="guides/01-quickstart.md">Guides</a> &nbsp;&bull;&nbsp;
   <a href="#benchmark-results">Benchmarks</a> &nbsp;&bull;&nbsp;
   <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
-  <a href="https://h-uman.github.io/gemma-realtime">Website</a>
+  <a href="https://sethdford.github.io/gemma-realtime">Website</a>
 </p>
 
 <p align="center">
