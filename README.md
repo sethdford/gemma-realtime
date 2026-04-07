@@ -1,130 +1,202 @@
-# gemma-realtime
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="gemma-realtime" width="120" />
+</p>
 
-**Personalize Gemma 4 and make it real-time on Apple Silicon.**
+<h1 align="center">gemma-realtime</h1>
 
-Fine-tune Google's Gemma 4 models on your own conversation data (iMessage, Facebook Messenger, etc.) and serve them at real-time voice speeds on a Mac — no cloud required.
+<p align="center">
+  <strong>Personalize Gemma 4. Make it real-time. Run it locally.</strong>
+</p>
 
-## Benchmark Results (M4 Max, 128GB)
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &nbsp;&bull;&nbsp;
+  <a href="guides/01-quickstart.md">Guides</a> &nbsp;&bull;&nbsp;
+  <a href="#benchmark-results">Benchmarks</a> &nbsp;&bull;&nbsp;
+  <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
+  <a href="https://h-uman.github.io/gemma-realtime">Website</a>
+</p>
 
-| Backend | TTFT P50 | TPS P50 | TPS Mean | RTF | Verdict |
-|---------|----------|---------|----------|-----|---------|
-| **MLX Server** (mlx_lm) | 154ms | **111.6** | 111.4 | 0.029 | **REAL-TIME** |
-| **Ollama** (Go + llama.cpp) | 141ms | 107.9 | 102.7 | 0.031 | **REAL-TIME** |
-| **llama.cpp** Metal | **136ms** | 94.0 | 94.1 | 0.040 | **REAL-TIME** |
+<p align="center">
+  <img src="https://img.shields.io/badge/Apple_Silicon-M1%2B-000?logo=apple&logoColor=white" alt="Apple Silicon" />
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/MLX-Inference-FF6F00?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSIjZmZmIj48cGF0aCBkPSJNMTIgMkw0IDdWMTdMMTIgMjJMMjAgMTdWN0wxMiAyWiIvPjwvc3ZnPg==" alt="MLX" />
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License" />
+  <img src="https://img.shields.io/badge/Gemma_4-E4B%20%7C%20E2B%20%7C%2031B-4285F4?logo=google&logoColor=white" alt="Gemma 4" />
+</p>
 
-All three backends generate text **20-30x faster than a human speaks** (RTF < 0.05). That's Gemini Live territory, running locally on your Mac with your personalized fine-tuned model.
+---
+
+Fine-tune Google's Gemma 4 on your own conversations (iMessage, Facebook Messenger, etc.) and serve it at **real-time voice speeds** on Apple Silicon. No cloud. No API keys. Your data never leaves your machine.
+
+## Benchmark Results
+
+Measured on M4 Max (128GB unified memory), Gemma 4 E4B 4-bit quantization:
+
+```
+==========================================================================================
+  HEAD-TO-HEAD BENCHMARK RESULTS — Gemma 4 E4B on Apple Silicon
+==========================================================================================
+
+  Backend                        TTFT P50   TTFT P95   TPS P50  TPS Mean    Verdict
+  ──────────────────────────  ────────  ────────  ───────  ───────  ────────
+  MLX Server (mlx_lm)               154ms      889ms   111.6    111.4   REAL-TIME
+  Ollama (Go + llama.cpp)           141ms      150ms   107.9    102.7   REAL-TIME
+  llama.cpp Metal                   136ms      141ms    94.0     94.1   REAL-TIME
+
+  All backends generate text 20-30x faster than human speech (RTF < 0.05).
+==========================================================================================
+```
+
+> **111 tokens/sec** with a personalized fine-tuned model. That's Gemini Live territory — running locally on your Mac.
+
+## The Problem
+
+You want an AI that sounds like *you* — not a generic chatbot. And you want it fast enough for real-time voice conversation. Until now, that required cloud APIs and sending your data to someone else's servers.
+
+## The Solution
+
+```
+Your Messages ──→ Fine-Tune ──→ Serve Locally ──→ Real-Time Voice
+  (iMessage)       (5 min)      (111 tok/s)       (your style)
+  (Facebook)
+  (WhatsApp)
+```
+
+**gemma-realtime** gives you the complete pipeline:
+
+1. **Extract** your conversations from iMessage, Facebook, or any messaging platform
+2. **Fine-tune** Gemma 4 with LoRA in minutes on Apple Silicon
+3. **Serve** at real-time speeds through your choice of optimized backend
+4. **Benchmark** to prove it meets voice latency targets
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
+# Install
 pip install mlx mlx-lm
 
-# 2. Extract your conversation data
-python3 scripts/extract-imessage.py                    # iMessage (macOS)
-python3 scripts/extract-facebook.py --export ~/Downloads/facebook-export  # Facebook
+# Extract your data (pick one or both)
+python3 scripts/extract-imessage.py
+python3 scripts/extract-facebook.py --export ~/Downloads/facebook-export
 
-# 3. Prepare training data
+# Prepare training data
 python3 scripts/prepare-training-data.py --voice
 
-# 4. Fine-tune Gemma 4 E4B (real-time voice model)
+# Fine-tune (5-15 min on M4 Max)
 python3 scripts/finetune-gemma.py --target e4b --data data/finetune
 
-# 5. Serve with real-time optimizations
+# Serve with real-time optimizations
 python3 scripts/mlx-server.py \
   --model mlx-community/gemma-4-e4b-it-4bit \
   --adapter-path ~/.human/training-data/adapters/seth-lora-e4b \
   --realtime
 
-# 6. Benchmark
+# Prove it works
 python3 scripts/voice-bench.py
 ```
-
-## Why This Exists
-
-Google's Gemma 4 is the first open model family with dedicated real-time edge variants (E4B and E2B). Combined with Apple Silicon's unified memory and MLX, you can run a personalized AI that:
-
-- **Sounds like you** — fine-tuned on your actual conversations
-- **Responds in real-time** — 100+ tokens/sec, <200ms time-to-first-token
-- **Runs locally** — no cloud, no API keys, no data leaving your machine
-- **Costs nothing** — after the one-time fine-tuning (5-15 minutes on M4 Max)
 
 ## Architecture
 
 ```
-Your Data                    Fine-Tuning              Real-Time Serving
-─────────                    ───────────              ─────────────────
-iMessage ─┐                  ┌─ LoRA SFT ──┐         MLX Server (Python)
-Facebook ─┼─→ train.jsonl ──→│             │──→      Ollama (Go + llama.cpp)
-Custom   ─┘                  └─ DPO ───────┘         llama.cpp (C++ Metal)
+                         ┌──────────────────────────┐
+                         │     Your Conversations    │
+                         │  iMessage · Facebook · …  │
+                         └────────────┬─────────────┘
+                                      │
+                              extract & prepare
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │      Training Data        │
+                         │    train.jsonl (JSONL)     │
+                         └────────────┬─────────────┘
+                                      │
+                          LoRA fine-tune (SFT + DPO)
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                  ▼
+             ┌────────────┐  ┌──────────────┐  ┌──────────────┐
+             │  E4B (4B)   │  │  E2B (2B)    │  │  31B (dense) │
+             │  110 tok/s  │  │  180 tok/s   │  │  20 tok/s    │
+             │  Voice      │  │  Draft       │  │  Quality     │
+             └──────┬─────┘  └──────┬───────┘  └──────┬───────┘
+                    │               │                  │
+                    └───────┬───────┘                  │
+                            ▼                          ▼
+                    ┌──────────────┐          ┌──────────────┐
+                    │  MLX Server  │          │  MLX Server  │
+                    │  Ollama      │          │  (high qual) │
+                    │  llama.cpp   │          └──────────────┘
+                    │  vLLM Metal  │
+                    └──────────────┘
+                     Real-Time Voice
 ```
 
 ### Model Targets
 
-| Target | Model | Speed | Use Case |
-|--------|-------|-------|----------|
-| **E4B** | gemma-4-e4b-it | ~110 tok/s | Real-time voice, daily driver |
-| **E2B** | gemma-4-e2b-it | ~180 tok/s | Speculative decode draft model |
-| **31B** | gemma-4-31b-it | ~20 tok/s | Highest quality, complex tasks |
+| Target | Params | Speed | Use Case |
+|--------|--------|-------|----------|
+| **E4B** | 4B | ~110 tok/s | Real-time voice, daily driver |
+| **E2B** | 2B | ~180 tok/s | Speculative decode draft model |
+| **31B** | 31B | ~20 tok/s | Highest quality, complex reasoning |
 
 ### Serving Backends
 
 | Backend | Language | Key Advantage | Best For |
 |---------|----------|---------------|----------|
-| **MLX Server** | Python | Highest throughput, LoRA hot-swap | Development, fine-tuned models |
-| **Ollama** | Go | Zero Python overhead, easiest setup | Production, consistency |
-| **llama.cpp** | C++ | Lowest TTFT, fused Metal kernels | Latency-critical first response |
-| **vLLM Metal** | Python | Paged attention, continuous batching | Multi-user serving |
-| **ANE+GPU Bridge** | Python | Dual-compute speculative decode | Experimental, max throughput |
+| **MLX Server** | Python | Highest throughput, LoRA hot-swap | Development |
+| **Ollama** | Go | Zero GIL, most consistent latency | Production |
+| **llama.cpp** | C++ | Lowest TTFT, fused Metal kernels | First-word speed |
+| **vLLM Metal** | Python | Paged attention, continuous batching | Multi-user |
+| **ANE+GPU** | Python | Dual-compute speculative decode | Experimental |
+
+## Key Discoveries
+
+Things we learned making Gemma 4 real-time on Apple Silicon:
+
+### 1. `mlx_lm` vs `mlx_vlm` — 10x speedup
+
+Switching from the multimodal `mlx_vlm` import to text-only `mlx_lm` gave a **10x speedup** (13 → 110+ tok/s). The VLM path adds numpy synchronization overhead even for text-only inference.
+
+### 2. PLE-safe quantization is critical
+
+Gemma 4 uses `ScaledLinear` layers that most community quantizations corrupt. Only PLE-safe quants (which skip these layers) produce correct output. The scripts detect and warn about broken models automatically.
+
+### 3. Go eliminates the Python GIL bottleneck
+
+Ollama wraps llama.cpp in a Go server — no GIL serialization on token dispatch. Result: the most consistent P50-to-P95 latency spread of any backend.
+
+### 4. Fused Metal kernels matter for TTFT
+
+llama.cpp's fused RoPE+attention shaders give the fastest time-to-first-token. For voice UX, the first word is what the user feels.
+
+### 5. TurboQuant 3-bit KV cache
+
+Compresses the key-value cache by 4.6x with ~2% quality loss. Critical for long conversations on memory-constrained devices.
 
 ## Project Structure
 
 ```
 scripts/
-├── extract-imessage.py      # Extract iMessage conversations (macOS)
-├── extract-facebook.py      # Extract Facebook Messenger data
-├── prepare-training-data.py # Combine sources into train/valid splits
-├── finetune-gemma.py        # LoRA fine-tuning pipeline (SFT + DPO)
-├── mlx-server.py            # MLX inference server (OpenAI-compatible)
-├── ollama-serve.sh          # Ollama serving script
-├── llamacpp-serve.sh        # llama.cpp Metal server script
-├── vllm-metal-serve.sh      # vLLM Metal server script
-├── ane-gpu-bridge.py        # ANE+GPU dual-compute bridge
-├── voice-bench.py           # Single-backend voice benchmark
-└── bench-all-backends.py    # Head-to-head multi-backend comparison
+├── extract-imessage.py          # Extract iMessage conversations (macOS)
+├── extract-facebook.py          # Extract Facebook Messenger data
+├── prepare-training-data.py     # Combine sources → train/valid splits
+├── finetune-gemma.py            # LoRA pipeline (SFT + DPO + quantize)
+├── mlx-server.py                # MLX inference server (OpenAI-compatible)
+├── ollama-serve.sh              # Ollama serving script
+├── llamacpp-serve.sh            # llama.cpp Metal server
+├── vllm-metal-serve.sh          # vLLM Metal server
+├── ane-gpu-bridge.py            # ANE+GPU dual-compute bridge
+├── voice-bench.py               # Single-backend voice benchmark
+└── bench-all-backends.py        # Head-to-head comparison
 
 guides/
-├── 01-quickstart.md         # Get running in 10 minutes
-├── 02-data-preparation.md   # Download and prepare personal data
-├── 03-fine-tuning.md        # LoRA fine-tuning deep dive
-├── 04-real-time-serving.md  # Serving backends and optimization
-└── 05-benchmarking.md       # Measure and compare performance
-
-configs/
-└── example-training-config.json  # Reference configuration
+├── 01-quickstart.md             # Running in 10 minutes
+├── 02-data-preparation.md       # iMessage, Facebook, WhatsApp, custom
+├── 03-fine-tuning.md            # LoRA deep dive
+├── 04-real-time-serving.md      # All 5 backends explained
+└── 05-benchmarking.md           # Measuring and interpreting results
 ```
-
-## Guides
-
-1. **[Quick Start](guides/01-quickstart.md)** — Get a personalized Gemma running in 10 minutes
-2. **[Data Preparation](guides/02-data-preparation.md)** — Extract data from iMessage, Facebook, and more
-3. **[Fine-Tuning](guides/03-fine-tuning.md)** — LoRA training, DPO, quantization, speculative decoding
-4. **[Real-Time Serving](guides/04-real-time-serving.md)** — MLX, Ollama, llama.cpp setup and optimization
-5. **[Benchmarking](guides/05-benchmarking.md)** — Measure TTFT, TPS, RTF and compare backends
-
-## Key Discoveries
-
-Things we learned while making this work:
-
-1. **`mlx_lm` vs `mlx_vlm` matters enormously** — switching from the multimodal VLM import to the text-only LM import gave a 10x speedup (13 → 110+ tok/s). The VLM path adds numpy synchronization overhead even for text-only inference.
-
-2. **PLE-safe quantization is critical for Gemma 4** — Gemma 4 uses `ScaledLinear` layers (Per-Layer Embedding) that most community quantizations corrupt. Only PLE-safe quants (which skip these layers) produce correct output.
-
-3. **Ollama's Go HTTP server eliminates the Python GIL** — Python's GIL serializes token dispatch in the MLX server. Ollama wraps the same llama.cpp Metal backend in a Go server, completely bypassing this bottleneck.
-
-4. **llama.cpp has the lowest TTFT** — Its fused Metal kernels (RoPE+attention in one shader) give the fastest time-to-first-token, which matters most for voice UX.
-
-5. **TurboQuant 3-bit KV cache** compresses the key-value cache by 4.6x with ~2% quality loss, enabling much longer context on memory-constrained devices.
 
 ## Hardware Requirements
 
@@ -134,10 +206,39 @@ Things we learned while making this work:
 | **Recommended** | M2+, 16GB | M3 Pro+, 36GB | M4 Max, 128GB |
 | **Expected TPS** | 150-200 | 80-120 | 15-25 |
 
-Unified memory is key — Apple Silicon shares memory between CPU and GPU, so the full model weights are accessible without copying.
+Apple Silicon's unified memory is the key enabler — GPU reads model weights directly from main memory with no copying.
+
+## Guides
+
+| Guide | Description |
+|-------|-------------|
+| [Quick Start](guides/01-quickstart.md) | Get running in 10 minutes |
+| [Data Preparation](guides/02-data-preparation.md) | Extract from iMessage, Facebook, WhatsApp |
+| [Fine-Tuning](guides/03-fine-tuning.md) | LoRA hyperparameters, DPO, quantization |
+| [Real-Time Serving](guides/04-real-time-serving.md) | Backend setup and optimization |
+| [Benchmarking](guides/05-benchmarking.md) | Measure TTFT, TPS, RTF |
+
+## Privacy
+
+Everything runs locally. Your conversation data, training process, and inference all happen on your Mac:
+
+- Extracted JSONL files contain your messages — treat as sensitive
+- The LoRA adapter encodes your communication style — keep private
+- No network calls during extraction, training, or inference
+- The `.gitignore` excludes all data and model files by default
+
+## Contributing
+
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+Areas where help is most needed:
+- More data extractors (Telegram, Discord, Signal, WhatsApp native)
+- CoreML/ANE optimization for the draft model
+- Windows/Linux support (currently macOS-focused)
+- Voice pipeline integration (STT → inference → TTS)
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-The Gemma models themselves are licensed under [Google's Gemma Terms of Use](https://ai.google.dev/gemma/terms).
+Gemma models are licensed under [Google's Gemma Terms of Use](https://ai.google.dev/gemma/terms).

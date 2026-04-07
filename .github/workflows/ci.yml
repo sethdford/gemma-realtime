@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: |
+          python3 -m py_compile scripts/mlx-server.py
+          python3 -m py_compile scripts/finetune-gemma.py
+          python3 -m py_compile scripts/extract-facebook.py
+          python3 -m py_compile scripts/extract_imessage_pairs.py
+          python3 -m py_compile scripts/prepare-training-data.py
+          python3 -m py_compile scripts/voice-bench.py
+          python3 -m py_compile scripts/bench-all-backends.py
+          python3 -m py_compile scripts/ane-gpu-bridge.py
+
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/ollama-serve.sh
+          bash -n scripts/llamacpp-serve.sh
+          bash -n scripts/vllm-metal-serve.sh
+
+  pages:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v4
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+      - id: deployment
+        uses: actions/deploy-pages@v4

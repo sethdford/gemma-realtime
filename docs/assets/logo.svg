@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <defs>
+    <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4285F4"/>
+      <stop offset="50%" stop-color="#7B68EE"/>
+      <stop offset="100%" stop-color="#FF6B6B"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#4285F4"/>
+    </linearGradient>
+  </defs>
+  <circle cx="60" cy="60" r="56" stroke="url(#g1)" stroke-width="3" fill="none" opacity="0.9"/>
+  <circle cx="60" cy="60" r="44" stroke="url(#g2)" stroke-width="2" fill="none" opacity="0.6"/>
+  <!-- Gemma diamond -->
+  <path d="M60 24 L84 60 L60 96 L36 60 Z" fill="url(#g1)" opacity="0.15"/>
+  <path d="M60 24 L84 60 L60 96 L36 60 Z" stroke="url(#g1)" stroke-width="2.5" fill="none"/>
+  <!-- Speed lines -->
+  <line x1="18" y1="48" x2="32" y2="48" stroke="#34D399" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+  <line x1="14" y1="60" x2="32" y2="60" stroke="#34D399" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+  <line x1="18" y1="72" x2="32" y2="72" stroke="#34D399" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+  <!-- Pulse dot -->
+  <circle cx="60" cy="60" r="6" fill="url(#g2)"/>
+  <circle cx="60" cy="60" r="3" fill="white"/>
+</svg>
