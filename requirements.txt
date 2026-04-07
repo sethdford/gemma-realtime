@@ -1,0 +1,14 @@
+# Core — MLX inference and fine-tuning on Apple Silicon
+mlx>=0.22.0
+mlx-lm>=0.22.0
+
+# Optional — multimodal (vision) support
+# mlx-vlm>=0.1.0
+
+# Optional — ANE bridge (CoreML conversion)
+# coremltools>=8.0
+# torch>=2.4.0
+# transformers>=4.46.0
+
+# Optional — GGUF export for llama.cpp / Ollama
+# pip install llama-cpp-python  (or build llama.cpp from source)

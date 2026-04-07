@@ -1,0 +1,32 @@
+# Training data (contains personal messages — never commit)
+data/
+*.jsonl
+
+# Model files and adapters
+*.safetensors
+*.gguf
+*.mlpackage/
+*.pte
+adapters/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Benchmark results (may contain personal data in text previews)
+bench-*.json

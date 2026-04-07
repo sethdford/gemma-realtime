@@ -1,0 +1,52 @@
+{
+  "target": "e4b",
+  "model": "mlx-community/gemma-4-e4b-it-4bit",
+  "description": "Edge 4B — real-time voice on Apple Silicon",
+  "training": {
+    "iters": 1200,
+    "batch_size": 4,
+    "learning_rate": 2e-5,
+    "lora_rank": 32,
+    "lora_layers": 12,
+    "max_seq_length": 4096,
+    "mask_prompt": true,
+    "grad_checkpoint": true,
+    "optimizer": "adamw"
+  },
+  "dpo": {
+    "enabled": true,
+    "iters": 300,
+    "learning_rate": 2e-6,
+    "batch_size": 1
+  },
+  "quantization": {
+    "enabled": false,
+    "bits": 4,
+    "format": "mlx",
+    "ple_safe": true,
+    "exclude_layers": "model.layers.*.mlp.gate_proj,model.layers.*.mlp.up_proj"
+  },
+  "serving": {
+    "port": 8741,
+    "realtime": true,
+    "kv_bits": 3,
+    "speculative_draft": null
+  },
+  "data_sources": [
+    {
+      "type": "imessage",
+      "description": "macOS iMessage database (~/Library/Messages/chat.db)"
+    },
+    {
+      "type": "facebook",
+      "export_path": "~/Downloads/facebook-export",
+      "description": "Facebook Messenger JSON export"
+    }
+  ],
+  "voice_targets": {
+    "ttft_ms": 200,
+    "tps": 50,
+    "rtf": 1.0,
+    "description": "TTFT <200ms + TPS >50 = real-time voice"
+  }
+}
