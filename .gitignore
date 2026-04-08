@@ -30,3 +30,7 @@ Thumbs.db
 
 # Benchmark results (may contain personal data in text previews)
 bench-*.json
+benchmark-report.txt
+
+# Compiled binaries
+secret-apis/build/
