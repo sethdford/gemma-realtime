@@ -197,6 +197,18 @@ class AudioCodec:
         if not self._loaded:
             raise RuntimeError("Codec not loaded — call .load() first")
 
+        if audio.size == 0:
+            return CodecTokens(
+                codes=np.zeros((self.config.n_codebooks, 0), dtype=np.int64),
+                n_codebooks=self.config.n_codebooks,
+                frame_rate=self.config.frame_rate,
+                codec_type=self.codec_type,
+            )
+
+        min_samples = int(self.config.sample_rate * 0.01)  # 10ms minimum
+        if len(audio) < min_samples:
+            audio = np.pad(audio, (0, min_samples - len(audio)))
+
         audio = self._normalize(audio)
 
         if self.codec_type == CodecType.SNAC:
@@ -261,7 +273,8 @@ class AudioCodec:
                 x = x.to("mps")
             codes = self._model.encode(x)
             if isinstance(codes, (list, tuple)):
-                codes_np = [c.cpu().numpy().squeeze() for c in codes]
+                codes_np = [np.atleast_1d(c.cpu().numpy().squeeze()) for c in codes]
+                self._snac_codes_raw = codes_np
                 max_len = max(len(c) for c in codes_np)
                 aligned = np.zeros((len(codes_np), max_len), dtype=np.int64)
                 for i, c in enumerate(codes_np):
@@ -286,12 +299,15 @@ class AudioCodec:
     def _decode_snac(self, tokens: CodecTokens) -> np.ndarray:
         import torch
         with torch.no_grad():
-            if tokens.codes.ndim == 1:
-                codes_list = [torch.from_numpy(tokens.codes).unsqueeze(0)]
+            if hasattr(self, '_snac_codes_raw') and self._snac_codes_raw is not None:
+                codes_list = [torch.from_numpy(c).unsqueeze(0).long() for c in self._snac_codes_raw]
+            elif tokens.codes.ndim == 1:
+                codes_list = [torch.from_numpy(tokens.codes).unsqueeze(0).long()]
             else:
-                codes_list = [torch.from_numpy(tokens.codes[i]).unsqueeze(0) for i in range(tokens.n_codebooks)]
+                codes_list = [torch.from_numpy(tokens.codes[i]).unsqueeze(0).long()
+                              for i in range(tokens.n_codebooks)]
 
-            if self.device == "mps":
+            if self.device == "mps" and torch.backends.mps.is_available():
                 codes_list = [c.to("mps") for c in codes_list]
 
             audio = self._model.decode(codes_list)

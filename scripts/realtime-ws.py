@@ -2,9 +2,15 @@
 """
 WebSocket bidirectional realtime API for gemma-realtime.
 
-Provides an OpenAI Realtime API-compatible WebSocket endpoint that accepts
-streaming audio input and returns streaming audio + text output. Sits on top
-of the existing MLX server for LLM inference.
+Two TTS modes:
+    Default:      Kokoro TTS (external, high quality, requires kokoro package)
+    --native-tts: SNAC speech decoder + depth decoder (multi-codebook, on-device)
+
+Features:
+    - Whisper ASR (mlx-whisper on Apple Silicon)
+    - Sentence-level streaming LLM → TTS
+    - Full-duplex: client can send {"type": "interrupt"} to stop generation
+    - VAD: Silero (if onnxruntime installed) or energy-based fallback
 
 Protocol:
     ws://localhost:8742/v1/realtime
@@ -15,10 +21,10 @@ Protocol:
         {"type": "text.input", "text": "..."}
         {"type": "config", "voice": "af_bella", "vad_threshold": 0.4, ...}
         {"type": "session.close"}
+        {"type": "interrupt"}
 
     Server -> Client:
         {"type": "session.created", "session_id": "..."}
-        {"type": "transcript.partial", "text": "...", "confidence": 0.0}
         {"type": "transcript.final", "text": "..."}
         {"type": "response.start"}
         {"type": "text.delta", "text": "..."}
@@ -26,10 +32,12 @@ Protocol:
         {"type": "audio.chunk", "data": "<base64 PCM 24kHz s16le>", "seq": N}
         {"type": "audio.done"}
         {"type": "response.done", "latency": {...}}
+        {"type": "state.change", "state": "INTERRUPT"}
         {"type": "error", "message": "..."}
 
 Usage:
-    python3 scripts/realtime-ws.py
+    python3 scripts/realtime-ws.py                          # Kokoro TTS
+    python3 scripts/realtime-ws.py --native-tts             # SNAC decoder
     python3 scripts/realtime-ws.py --port 8742 --llm-url http://localhost:8741
 """
 
@@ -66,6 +74,7 @@ class RealtimeSession:
         self.messages = []
         self.audio_buffer = []
         self.is_recording = False
+        self._interrupted = False
         self._asr = None
         self._tts = None
         self._vad = None
@@ -103,16 +112,74 @@ class RealtimeSession:
             await self._llm.close()
 
 
+class NativeTTSEngine:
+    """SNAC-based TTS using the speech decoder + depth decoder pipeline.
+
+    Replaces Kokoro when --native-tts is set.
+    """
+
+    def __init__(self):
+        self._decoder = None
+        self._depth_decoder = None
+        self._codec = None
+        self._inner = None
+        self._tokenizer = None
+        self.available = False
+
+    def load(self, inner_model, tokenizer, decoder, depth_decoder, codec):
+        self._inner = inner_model
+        self._tokenizer = tokenizer
+        self._decoder = decoder
+        self._depth_decoder = depth_decoder
+        self._codec = codec
+        self.available = True
+
+    def synthesize(self, text: str) -> np.ndarray:
+        import mlx.core as mx
+        import torch
+
+        ids = self._tokenizer.encode(text[:120], add_special_tokens=False)
+        if not ids:
+            return np.zeros(2400, dtype=np.float32)
+
+        emb = self._inner.embed_tokens(mx.array([ids]))
+        tokens_mx = self._decoder.generate(emb, temperature=0.0, top_k=0)
+        mx.eval(tokens_mx)
+        cb0_tokens = tokens_mx[0].tolist()
+
+        if not cb0_tokens:
+            return np.zeros(2400, dtype=np.float32)
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        cb0_t = torch.tensor(cb0_tokens, dtype=torch.long).unsqueeze(0).to(device)
+
+        if self._depth_decoder is not None:
+            cb0_mx = mx.array([cb0_tokens], dtype=mx.int32)
+            cb1_mx, cb2_mx = self._depth_decoder.generate(cb0_mx)
+            mx.eval(cb1_mx, cb2_mx)
+            cb1_t = torch.tensor(cb1_mx[0].tolist(), dtype=torch.long).unsqueeze(0).to(device)
+            cb2_t = torch.tensor(cb2_mx[0].tolist(), dtype=torch.long).unsqueeze(0).to(device)
+        else:
+            cb1_t = torch.zeros(1, len(cb0_tokens) * 2, dtype=torch.long).to(device)
+            cb2_t = torch.zeros(1, len(cb0_tokens) * 4, dtype=torch.long).to(device)
+
+        with torch.no_grad():
+            audio = self._codec._model.decode([cb0_t, cb1_t, cb2_t])
+        return audio.detach().cpu().numpy().squeeze()
+
+
 class RealtimeServer:
     """WebSocket server implementing the realtime bidirectional protocol."""
 
     def __init__(self, host="0.0.0.0", port=8742, llm_url="http://localhost:8741",
-                 whisper_model="mlx-community/whisper-small-mlx", voice="af_bella"):
+                 whisper_model="mlx-community/whisper-small-mlx", voice="af_bella",
+                 native_tts=False):
         self.host = host
         self.port = port
         self.llm_url = llm_url
         self.whisper_model = whisper_model
         self.voice = voice
+        self.native_tts = native_tts
         self._sessions = {}
         self._shared_vad = None
         self._shared_asr = None
@@ -131,12 +198,50 @@ class RealtimeServer:
 
         self._shared_vad = speech.SileroVAD(threshold=VAD_THRESHOLD)
         self._shared_asr = speech.WhisperASR(model_name=self.whisper_model)
-        self._shared_tts = speech.TTSEngine(voice=self.voice)
+
+        if self.native_tts:
+            import mlx.core as mx
+            from mlx_lm import load as lm_load
+            from speech_decoder import SpeechDecoder
+            from codec import AudioCodec
+
+            print("  Loading native SNAC TTS pipeline...", flush=True)
+            gemma, tokenizer = lm_load("mlx-community/gemma-4-26b-a4b-it-4bit")
+            if hasattr(gemma, "language_model"):
+                inner = gemma.language_model.model
+            else:
+                inner = gemma.model
+
+            probe = inner.embed_tokens(mx.array([[0]]))
+            llm_dim = probe.shape[-1]
+
+            decoder = SpeechDecoder(llm_dim=llm_dim)
+            dec_weights = mx.load("adapters/speech-decoder/speech_decoder.safetensors")
+            decoder.load_weights(list(dec_weights.items()))
+
+            depth_decoder = None
+            depth_path = Path("adapters/depth-decoder/depth_decoder.safetensors")
+            if depth_path.exists():
+                tdd = import_module("train-depth-decoder")
+                depth_decoder = tdd.DepthDecoder()
+                dw = mx.load(str(depth_path))
+                depth_decoder.load_weights(list(dw.items()))
+                print("    Depth decoder loaded (3-codebook)", flush=True)
+
+            codec = AudioCodec("snac")
+            codec.load()
+
+            self._shared_tts = NativeTTSEngine()
+            self._shared_tts.load(inner, tokenizer, decoder, depth_decoder, codec)
+            self._gemma = gemma
+            print("    Native SNAC TTS ready", flush=True)
+        else:
+            self._shared_tts = speech.TTSEngine(voice=self.voice)
+            self._shared_tts.load()
 
         print("  Loading shared models (first connection)...", flush=True)
         self._shared_vad.load()
         self._shared_asr.load()
-        self._shared_tts.load()
 
     async def _handle_connection(self, websocket):
         session_id = str(uuid.uuid4())[:12]
@@ -204,6 +309,11 @@ class RealtimeServer:
                     await self._handle_text_input(session, websocket, msg)
                 elif msg_type == "config":
                     self._handle_config(session, msg)
+                elif msg_type == "interrupt":
+                    session._interrupted = True
+                    await websocket.send(json.dumps({
+                        "type": "state.change", "state": "INTERRUPT",
+                    }))
                 elif msg_type == "session.close":
                     break
                 else:
@@ -303,9 +413,13 @@ class RealtimeServer:
         first_token_time = None
         first_audio_time = None
 
+        session._interrupted = False
         async for delta in session._llm.stream_chat(
             session.messages, max_tokens=256, temperature=0.7
         ):
+            if session._interrupted:
+                break
+
             if delta.startswith("<|channel>") or delta.startswith("<|"):
                 continue
 
@@ -432,7 +546,8 @@ class RealtimeServer:
         print(f"{'='*60}", flush=True)
         print(f"  Endpoint: ws://{self.host}:{self.port}/v1/realtime", flush=True)
         print(f"  LLM:      {self.llm_url}", flush=True)
-        print(f"  Voice:    {self.voice}", flush=True)
+        tts_mode = "SNAC (native)" if self.native_tts else f"Kokoro ({self.voice})"
+        print(f"  TTS:      {tts_mode}", flush=True)
         print(f"  ASR:      {self.whisper_model}", flush=True)
         print(f"{'='*60}\n", flush=True)
 
@@ -457,6 +572,10 @@ def main():
     parser.add_argument("--llm-url", default="http://localhost:8741")
     parser.add_argument("--whisper-model", default="mlx-community/whisper-small-mlx")
     parser.add_argument("--voice", default="af_bella")
+    parser.add_argument(
+        "--native-tts", action="store_true",
+        help="Use SNAC speech decoder instead of Kokoro TTS (multi-codebook audio)",
+    )
     args = parser.parse_args()
 
     server = RealtimeServer(
@@ -465,6 +584,7 @@ def main():
         llm_url=args.llm_url,
         whisper_model=args.whisper_model,
         voice=args.voice,
+        native_tts=args.native_tts,
     )
     asyncio.run(server.start())
 

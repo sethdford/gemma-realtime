@@ -339,6 +339,9 @@ class DuplexStatePredictor(nn.Module):
         Returns:
             logits: (batch, n_states) state prediction logits
         """
+        if hidden_states.shape[1] == 0:
+            batch = hidden_states.shape[0]
+            return mx.zeros((batch, 3))
         last_hidden = hidden_states[:, -1, :]
         return self.classifier(last_hidden)
 
@@ -366,6 +369,135 @@ class _SinusoidalPE(nn.Module):
     def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
         seq_len = x.shape[1]
         return x + self._pe[offset : offset + seq_len]
+
+
+class ContextualSpeechDecoder(nn.Module):
+    """Speech decoder with conversation history conditioning (CSM insight).
+
+    Key improvement over base SpeechDecoder: conditions generation not just
+    on the current sentence's LLM embeddings, but also on a compressed
+    representation of prior conversation turns. This allows prosody and
+    speaking style to adapt to conversational context.
+
+    Architecture:
+        current_emb + context_emb → cross-attention → AR token generation
+    """
+
+    def __init__(
+        self,
+        llm_dim: int = 2816,
+        decoder_dim: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 4,
+        d_ff: int = 2048,
+        codebook_size: int = 4096,
+        max_tokens: int = 500,
+        context_window: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.llm_dim = llm_dim
+        self.decoder_dim = decoder_dim
+        self.codebook_size = codebook_size
+        self.max_tokens = max_tokens
+        self.context_window = context_window
+
+        self.input_adapter = nn.Sequential(
+            nn.Linear(llm_dim, decoder_dim),
+            nn.LayerNorm(decoder_dim),
+            nn.GELU(),
+        )
+
+        # Compress prior turns into fixed-size context vectors
+        self.context_compressor = nn.Sequential(
+            nn.Linear(llm_dim, decoder_dim),
+            nn.GELU(),
+            nn.Linear(decoder_dim, decoder_dim),
+        )
+
+        # Learnable turn-type embeddings (user vs assistant)
+        self.turn_embed = nn.Embedding(2, decoder_dim)
+
+        self.token_embedding = nn.Embedding(codebook_size + 2, decoder_dim)
+        self.BOS_TOKEN = codebook_size
+        self.EOS_TOKEN = codebook_size + 1
+
+        self.pos_encoding = _SinusoidalPE(decoder_dim)
+
+        self.layers = [
+            SpeechDecoderLayer(decoder_dim, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ]
+
+        self.output_norm = nn.LayerNorm(decoder_dim)
+        self.output_head = nn.Linear(decoder_dim, codebook_size + 1)
+
+    def _build_context(self, current_emb: mx.array,
+                       history: list[tuple[mx.array, int]] = None) -> mx.array:
+        """Build enriched context from current + history embeddings.
+
+        Args:
+            current_emb: (1, seq, llm_dim) current sentence
+            history: list of (embeddings, turn_type) where turn_type 0=user, 1=assistant
+        """
+        adapted = self.input_adapter(current_emb)
+
+        if not history:
+            return adapted
+
+        context_parts = []
+        for emb, turn_type in history[-self.context_window:]:
+            compressed = self.context_compressor(emb)
+            # Mean pool each turn to a single vector
+            pooled = mx.mean(compressed, axis=1, keepdims=True)  # (1, 1, decoder_dim)
+            turn_emb = self.turn_embed(mx.array([[turn_type]]))  # (1, 1, decoder_dim)
+            context_parts.append(pooled + turn_emb)
+
+        if context_parts:
+            history_ctx = mx.concatenate(context_parts, axis=1)  # (1, n_turns, decoder_dim)
+            return mx.concatenate([history_ctx, adapted], axis=1)
+
+        return adapted
+
+    def generate(self, llm_hidden: mx.array, temperature: float = 0.8,
+                 top_k: int = 50,
+                 history: list[tuple[mx.array, int]] = None) -> mx.array:
+        """Autoregressive generation with conversation context."""
+        context = self._build_context(llm_hidden, history)
+
+        tokens = [self.BOS_TOKEN]
+        kv_caches = [None] * len(self.layers)
+
+        for step in range(self.max_tokens):
+            token_id = mx.array([[tokens[-1]]], dtype=mx.int32)
+            x = self.token_embedding(token_id)
+            x = self.pos_encoding(x, offset=step)
+
+            new_caches = []
+            for i, layer in enumerate(self.layers):
+                x, cache = layer(x, context, kv_cache=kv_caches[i])
+                new_caches.append(cache)
+            kv_caches = new_caches
+
+            x = self.output_norm(x)
+            logits = self.output_head(x[:, -1, :])
+
+            if top_k > 0:
+                top_vals = mx.sort(logits, axis=-1)[:, -top_k]
+                logits = mx.where(logits < top_vals, -1e9, logits)
+
+            if temperature > 0:
+                probs = mx.softmax(logits / temperature, axis=-1)
+                next_token = mx.random.categorical(probs).item()
+            else:
+                next_token = mx.argmax(logits, axis=-1).item()
+
+            if next_token == self.EOS_TOKEN or next_token >= self.codebook_size:
+                break
+
+            tokens.append(next_token)
+
+        return mx.array([tokens[1:]], dtype=mx.int32)
 
 
 class SpeechDecoderConfig:
