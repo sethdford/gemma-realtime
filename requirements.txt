@@ -2,35 +2,31 @@
 mlx>=0.22.0
 mlx-lm>=0.22.0
 
-# Optional — TurboQuant+ KV cache compression (3.8-6.4x, near-zero quality loss)
-# Provides TurboKVCache drop-in for mlx-lm / mlx-vlm. Asymmetric K/V supported.
-# pip install git+https://github.com/TheTom/mlx.git@feature/turboquant-plus
+# Speech Pipeline — ASR
+mlx-whisper
+
+# Speech Pipeline — TTS (Kokoro, used by default)
+# kokoro                    # Optional: pip install kokoro
+
+# Speech Pipeline — Neural Audio Codec
+snac
+torch>=2.4.0
+soundfile
+
+# Speech Pipeline — WebSocket server + streaming
+websockets>=12.0
+aiohttp>=3.9.0
+numpy>=1.24.0
+
+# Speech Pipeline — VAD (Silero via ONNX)
+onnxruntime
 
 # Optional — multimodal (vision) support
 # mlx-vlm>=0.1.0
 
-# ── Speech Pipeline (Phase 1-2) ──────────────────────────────────
-# pip install mlx-whisper kokoro sounddevice websockets aiohttp silero-vad numpy
-#
-# mlx-whisper              # Whisper ASR on Apple Silicon
-# kokoro                   # Kokoro TTS (82M params, Apache 2.0)
-# sounddevice>=0.4.0       # Microphone/speaker I/O
-# websockets>=12.0         # WebSocket bidirectional API
-# aiohttp>=3.9.0           # Async HTTP client for LLM streaming
-# numpy>=1.24.0            # Audio processing
-
-# ── Neural Audio Codec (Phase 3) ─────────────────────────────────
-# pip install snac          # SNAC multi-scale codec (MIT)
-# pip install transformers  # Mimi/EnCodec via HuggingFace
-
-# ── Speech Adapter Training (Phase 4) ────────────────────────────
-# Requires mlx.nn for custom modules — included in mlx>=0.22.0
-# pip install soundfile     # Audio file loading for training data
+# Optional — TurboQuant+ KV cache compression
+# pip install git+https://github.com/TheTom/mlx.git@feature/turboquant-plus
 
 # Optional — ANE bridge (CoreML conversion)
 # coremltools>=8.0
-# torch>=2.4.0
 # transformers>=4.46.0
-
-# Optional — GGUF export for llama.cpp / Ollama
-# pip install llama-cpp-python  (or build llama.cpp from source)
