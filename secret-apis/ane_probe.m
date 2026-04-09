@@ -13,7 +13,7 @@
 #import <mach/mach_time.h>
 #include <stdio.h>
 
-static double mach_to_ms(uint64_t elapsed) {
+static __attribute__((unused)) double mach_to_ms(uint64_t elapsed) {
     mach_timebase_info_data_t info;
     mach_timebase_info(&info);
     return (double)elapsed * info.numer / info.denom / 1e6;

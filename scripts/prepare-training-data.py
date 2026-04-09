@@ -4,7 +4,7 @@ Combine extracted conversation data from multiple sources into training-ready
 JSONL files for Gemma 4 LoRA fine-tuning.
 
 Merges data from:
-  - iMessage (extract-imessage.py)
+  - iMessage (extract_imessage_pairs.py)
   - Facebook Messenger (extract-facebook.py)
   - Custom JSONL files
 
@@ -175,7 +175,7 @@ def main():
     if not all_pairs:
         print(f"\n  ERROR: No training data found!")
         print(f"  Run one of these first:")
-        print(f"    python3 scripts/extract-imessage.py")
+        print(f"    python3 scripts/extract_imessage_pairs.py")
         print(f"    python3 scripts/extract-facebook.py --export ~/Downloads/facebook-export")
         sys.exit(1)
 

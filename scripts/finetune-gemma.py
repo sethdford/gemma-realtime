@@ -563,7 +563,7 @@ def run_finetune(args):
     data_dir = Path(args.data)
     if not (data_dir / "train.jsonl").exists():
         print(f"ERROR: {data_dir / 'train.jsonl'} not found.")
-        print(f"Run: python3 scripts/prepare-finetune.py --persona seth --include-chatdb --output {data_dir}")
+        print(f"Run: python3 scripts/prepare-training-data.py --persona seth --include-chatdb --output {data_dir}")
         sys.exit(1)
 
     train_count = sum(1 for _ in open(data_dir / "train.jsonl"))

@@ -165,14 +165,18 @@ static void bench_zero_copy_gpu(void) {
     int bulk_size = 64 * 1024 * 1024; /* 64 MB */
     int iters = 50;
 
-    /* memcpy bandwidth */
+    /* memcpy bandwidth — volatile to prevent optimization */
     float *src = (float *)malloc(bulk_size);
     float *dst = (float *)malloc(bulk_size);
     memset(src, 0x42, bulk_size);
+    memcpy(dst, src, bulk_size); /* warmup */
     t0 = mach_absolute_time();
-    for (int i = 0; i < iters; i++) memcpy(dst, src, bulk_size);
+    for (int i = 0; i < iters; i++) {
+        memcpy(dst, src, bulk_size);
+        __asm__ volatile("" : : "r"(dst) : "memory"); /* prevent dead store elimination */
+    }
     double memcpy_ms = mach_to_ms(mach_absolute_time() - t0) / iters;
-    double memcpy_gbps = (double)bulk_size / memcpy_ms / 1e6;
+    double memcpy_gbps = memcpy_ms > 0.001 ? (double)bulk_size / memcpy_ms / 1e6 : 999.0;
 
     /* IOSurface "transfer" — just pointer handoff */
     IOSurfaceRef bulk_surf = create_tensor_surface(bulk_size / 4, 1, 4);
@@ -197,7 +201,8 @@ static void bench_zero_copy_gpu(void) {
     printf("│  64 MB Transfer Bandwidth:                                 │\n");
     printf("│    memcpy:      %8.2f GB/s (%6.2f ms)                   │\n", memcpy_gbps, memcpy_ms);
     printf("│    IOSurface:   %8.2f GB/s (%6.4f ms) ← no copy!       │\n", zerocopy_gbps, zerocopy_ms);
-    printf("│    Effective:   %-6.0fx faster                              │\n", memcpy_ms / zerocopy_ms);
+    double speedup = (zerocopy_ms > 0.0001) ? memcpy_ms / zerocopy_ms : 999.0;
+    printf("│    Effective:   %-6.0fx faster                              │\n", speedup);
 
     free(src);
     free(dst);

@@ -27,7 +27,7 @@ Each `assistant` message is YOUR response — the model learns to generate text 
 The easiest source if you're a Mac user. Your entire message history is in a SQLite database.
 
 ```bash
-python3 scripts/extract-imessage.py
+python3 scripts/extract_imessage_pairs.py
 ```
 
 **What it does:**

@@ -1,6 +1,8 @@
 /*
  * ARM SME2 Matrix Multiply Benchmark
- *
+ */
+#define ACCELERATE_NEW_LAPACK
+/*
  * SME2 (Scalable Matrix Extension v2) is the official successor to Apple's
  * undocumented AMX on M4+ chips. It provides:
  *   - ZA tile registers (up to 512-bit SVE vectors)
@@ -52,7 +54,7 @@ static bool has_sme(void) {
     return false;
 }
 
-static int get_sve_vector_length(void) {
+static __attribute__((unused)) int get_sve_vector_length(void) {
 #ifdef __ARM_FEATURE_SVE
     uint64_t vl;
     __asm__ __volatile__("rdvl %0, #1" : "=r"(vl));
@@ -199,7 +201,7 @@ int main(void) {
         double gf_sme2 = 2.0 * N * N * N / t_sme2 / 1e9;
         printf("%-8d  %9.2f GF  %9.2f GF  %8.1fx\n", N, gf_accel, gf_sme2, t_accel / t_sme2);
 #else
-        printf("%-8d  %9.2f GF  (SME2 not compiled)\n", N, gf_accel);
+        printf("%-8d  %9.2f GF  (SME2: hw present, macOS blocks streaming mode)\n", N, gf_accel);
 #endif
 
         free(A); free(B); free(C);

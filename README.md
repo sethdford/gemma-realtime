@@ -76,7 +76,7 @@ Your Messages ──→ Fine-Tune ──→ Serve Locally ──→ Real-Time Vo
 pip install mlx mlx-lm
 
 # Extract your data (pick one or both)
-python3 scripts/extract-imessage.py
+python3 scripts/extract_imessage_pairs.py
 python3 scripts/extract-facebook.py --export ~/Downloads/facebook-export
 
 # Prepare training data
@@ -88,12 +88,26 @@ python3 scripts/finetune-gemma.py --target e4b --data data/finetune
 # Serve with real-time optimizations
 python3 scripts/mlx-server.py \
   --model mlx-community/gemma-4-e4b-it-4bit \
-  --adapter-path ~/.human/training-data/adapters/seth-lora-e4b \
+  --adapter-path ~/.human/adapters/persona \
   --realtime
 
 # Prove it works
 python3 scripts/voice-bench.py
 ```
+
+### h-uman Integration
+
+The MLX server is the default inference backend for [h-uman](https://github.com/user/h-uman). When `~/.human/config.json` exists, the server auto-reads model, adapter, port, and TurboQuant+ settings — no flags needed:
+
+```bash
+# Start via h-uman (auto-detects gemma-realtime)
+~/.human/bin/human-serve.sh start
+
+# Or run mlx-server.py directly (reads ~/.human/config.json)
+python3 scripts/mlx-server.py
+```
+
+See [Real-Time Serving Guide](guides/04-real-time-serving.md#h-uman-integration) for config details.
 
 ## Architecture
 
@@ -170,9 +184,26 @@ Ollama wraps llama.cpp in a Go server — no GIL serialization on token dispatch
 
 llama.cpp's fused RoPE+attention shaders give the fastest time-to-first-token. For voice UX, the first word is what the user feels.
 
-### 5. TurboQuant 3-bit KV cache
+### 5. TurboQuant+ KV cache compression
 
-Compresses the key-value cache by 4.6x with ~2% quality loss. Critical for long conversations on memory-constrained devices.
+[TurboQuant+](https://github.com/TheTom/turboquant_plus) compresses the KV cache **3.8-6.4x** using PolarQuant + Walsh-Hadamard rotation. Integrated via the MLX port — `TurboKVCache` is a drop-in replacement for `mlx-lm`'s KVCache with zero framework changes. The `--realtime` flag auto-enables 4-bit TurboQuant+; add `--kv-asymmetric` for FP16 keys (best quality, less compression).
+
+| Config | Compression | Quality (vs FP16) | Decode Speed |
+|--------|------------|-------------------|-------------|
+| turbo4 (4-bit) | 3.8x | +0.23% PPL | 97-100% baseline |
+| turbo3 (3-bit) | 4.6x | +1.06% PPL | 90-93% baseline |
+| asymmetric (K=FP16, V=turbo4) | ~2x | +0.51% PPL | 99% baseline |
+
+```bash
+# Install TurboQuant+ MLX fork
+pip install git+https://github.com/TheTom/mlx.git@feature/turboquant-plus
+
+# Real-time mode auto-enables TurboQuant+ 4-bit
+python3 scripts/mlx-server.py --model mlx-community/gemma-4-e4b-it-4bit --realtime
+
+# Asymmetric mode (best for Q4_K_M models — preserves K precision)
+python3 scripts/mlx-server.py --model mlx-community/gemma-4-e4b-it-4bit --kv-bits 4 --kv-asymmetric
+```
 
 ### 6. The AMX/SME2 coprocessor is 77x faster than NEON
 
@@ -189,23 +220,26 @@ We reverse-engineered, built, and benchmarked the undocumented hardware features
 | Layer | What It Is | Result |
 |-------|-----------|--------|
 | **AMX/SME2** | Undocumented CPU matrix coprocessor | **77x** over NEON, 2.5 TFLOPS FP32 |
-| **Neural Engine** | Private `_ANEClient` API (46 methods discovered) | 16-core dedicated accelerator |
+| **Neural Engine** | Private `_ANEClient` API (67 classes discovered) | 15.8 TFLOPS FP16, 6.6 TFLOPS/W |
+| **Direct ANE** | Bypass CoreML via `_ANEInMemoryModelDescriptor` | In-memory MIL compilation, training proven |
 | **IOSurface** | Zero-copy shared memory across CPU/GPU/ANE | **5+ TB/s** effective bandwidth |
+| **Metal 4 Tensor** | MTLTensor + Shader ML + ML Command Encoder | Full CoreML on GPU timeline |
+| **M5 Neural Accel** | Per-GPU-core Neural Accelerators (10-40 units) | **4x** peak AI compute vs M4 |
 | **Metal Dynamic** | MTLFunctionConstant kernel specialization | Fused attention for all Gemma configs |
 | **Hybrid Pipeline** | GPU prefill + ANE decode + zero-copy KV cache | **1,333 tok/s**, 53x real-time margin |
 
 ```bash
-# Build and run all secret API benchmarks
-cd secret-apis && make all && ./bench_all_secrets.sh --report
+# Build and run all 8 secret API benchmarks
+cd secret-apis && make all && make bench
 ```
 
-See [Guide 06: Secret APIs](guides/06-secret-apis.md) for the full deep dive.
+See [Guide 06: Secret APIs](guides/06-secret-apis.md) for the full deep dive, including the [maderix/ANE](https://github.com/maderix/ANE) reverse engineering work that proved training on the Neural Engine is possible.
 
 ## Project Structure
 
 ```
 scripts/
-├── extract-imessage.py          # Extract iMessage conversations (macOS)
+├── extract_imessage_pairs.py    # Extract iMessage conversations (macOS)
 ├── extract-facebook.py          # Extract Facebook Messenger data
 ├── prepare-training-data.py     # Combine sources → train/valid splits
 ├── finetune-gemma.py            # LoRA pipeline (SFT + DPO + quantize)
@@ -222,8 +256,10 @@ secret-apis/
 ├── amx.h                        # Reverse-engineered AMX instruction encodings
 ├── sme2_matmul.c                # ARM SME2 detection and benchmark
 ├── ane_probe.m                  # Neural Engine private API discovery
+├── ane_direct.m                 # Direct ANE access (maderix/ANE findings, 67 classes)
 ├── iosurface_bridge.m           # IOSurface zero-copy bridge + Metal compute
 ├── metal_dynamic.m              # Dynamic kernel compilation + fused attention
+├── metal4_tensor.m              # Metal 4 Tensor APIs + M5 Neural Accelerator probe
 ├── hybrid_pipeline.m            # Full GPU+ANE hybrid inference pipeline
 ├── bench_all_secrets.sh         # Run all benchmarks with report generation
 └── Makefile                     # Build system

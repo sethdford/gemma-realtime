@@ -3,7 +3,7 @@
 Extract Facebook Messenger conversation pairs for LoRA fine-tuning.
 
 Reads Facebook's data export (Download Your Information → JSON format)
-and produces training pairs in the same format as extract-imessage.py.
+and produces training pairs in the same format as extract_imessage_pairs.py.
 
 Facebook export structure:
     your_facebook_activity/

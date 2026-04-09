@@ -40,7 +40,7 @@ static double mach_to_ms(uint64_t elapsed) {
     return (double)elapsed * info.numer / info.denom / 1e6;
 }
 
-static double mach_to_us(uint64_t elapsed) {
+static __attribute__((unused)) double mach_to_us(uint64_t elapsed) {
     return mach_to_ms(elapsed) * 1000.0;
 }
 

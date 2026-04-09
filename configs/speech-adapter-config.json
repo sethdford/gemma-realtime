@@ -1,0 +1,82 @@
+{
+  "target": "e4b",
+  "description": "Freeze-Omni speech adapter config for Gemma 4 E4B real-time voice",
+
+  "encoder": {
+    "llm_dim": 2560,
+    "encoder_dim": 512,
+    "n_heads": 8,
+    "n_layers": 2,
+    "d_ff": 2048,
+    "tokens_per_chunk": 4,
+    "chunk_ms": 160,
+    "dropout": 0.1
+  },
+
+  "decoder": {
+    "llm_dim": 2560,
+    "decoder_dim": 512,
+    "n_heads": 8,
+    "n_layers": 4,
+    "d_ff": 2048,
+    "codebook_size": 4096,
+    "max_tokens": 500,
+    "dropout": 0.1
+  },
+
+  "state_predictor": {
+    "llm_dim": 2560,
+    "hidden_dim": 256,
+    "n_states": 3
+  },
+
+  "codec": {
+    "type": "snac",
+    "sample_rate": 24000,
+    "n_codebooks": 3,
+    "codebook_size": 4096
+  },
+
+  "training": {
+    "stage1_encoder": {
+      "iters": 2000,
+      "batch_size": 4,
+      "learning_rate": 1e-4,
+      "warmup_steps": 100,
+      "data": "ASR pairs (LibriSpeech 960h recommended)",
+      "trainable": "encoder only"
+    },
+    "stage2_decoder": {
+      "iters": 1500,
+      "batch_size": 2,
+      "learning_rate": 5e-5,
+      "data": "TTS pairs (LJSpeech + VCTK recommended)",
+      "trainable": "decoder only"
+    },
+    "stage3_duplex": {
+      "iters": 1000,
+      "batch_size": 2,
+      "learning_rate": 2e-5,
+      "state_loss_weight": 0.5,
+      "data": "Conversational Q&A pairs with timing metadata",
+      "trainable": "encoder + decoder + state predictor"
+    }
+  },
+
+  "serving": {
+    "port": 8742,
+    "realtime": true,
+    "kv_bits": 4,
+    "codec": "snac",
+    "streaming_chunk_size": 12,
+    "vad_threshold": 0.4,
+    "voice": "af_bella"
+  },
+
+  "voice_targets": {
+    "e2e_latency_ms": 500,
+    "ttft_ms": 200,
+    "rtf": 1.0,
+    "description": "Sub-500ms end-to-end speech latency with Freeze-Omni adapter"
+  }
+}

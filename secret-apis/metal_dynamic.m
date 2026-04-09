@@ -161,7 +161,7 @@ static NSString *fused_attention_shader = @
 /*
  * Create a specialized compute pipeline with function constants.
  */
-static id<MTLComputePipelineState> create_specialized_pipeline(
+static __attribute__((unused)) id<MTLComputePipelineState> create_specialized_pipeline(
     id<MTLDevice> device, id<MTLLibrary> library, NSString *funcName,
     uint32_t *uint_values, float *float_values, bool *bool_values,
     int n_uint, int n_float, int n_bool, double *compile_time_ms) {
@@ -216,6 +216,7 @@ static void bench_softmax(void) {
     id<MTLFunction> generic_func = [generic_lib newFunctionWithName:@"softmax_generic"];
     id<MTLComputePipelineState> generic_pipe = [device newComputePipelineStateWithFunction:generic_func error:&error];
     double generic_compile = mach_to_ms(mach_absolute_time() - t0);
+    (void)generic_compile;
 
     /* Compile specialized shader */
     id<MTLLibrary> spec_lib = [device newLibraryWithSource:specialized_softmax_shader
@@ -240,6 +241,7 @@ static void bench_softmax(void) {
         uint32_t head_dim = 128;
         bool use_half = false;
         uint32_t spec_values[] = {seq_len, head_dim};
+        (void)spec_values;
 
         double spec_compile_ms;
         MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];

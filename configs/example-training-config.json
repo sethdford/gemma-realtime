@@ -29,7 +29,8 @@
   "serving": {
     "port": 8741,
     "realtime": true,
-    "kv_bits": 3,
+    "kv_bits": 4,
+    "kv_asymmetric": false,
     "speculative_draft": null
   },
   "data_sources": [

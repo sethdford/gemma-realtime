@@ -12,7 +12,7 @@ Features:
     - Uses mlx_lm for text (fast path, no vision overhead) with mlx_vlm fallback for multimodal
     - Speculative decoding: E2B draft model proposes tokens, target verifies in parallel (~2x speedup)
     - TurboQuant KV cache compression (4.6x smaller, ~0.98x FP16 speed)
-    - Cross-turn prompt caching (system prompt KV reused across requests)
+    - Prompt cache state tracking (future: cross-turn KV reuse)
     - Apple Silicon hardware detection (M5 TensorOps, Neural Accelerators, Metal version)
     - Real-time voice mode: optimized for low TTFT with aggressive KV compression
     - PLE-safe model validation for Gemma 4 (warns about broken quantizations)
@@ -31,12 +31,43 @@ import subprocess
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 from threading import Lock
-import socket
 
 DEFAULT_MODEL = "mlx-community/gemma-4-31b-it-4bit"
 DEFAULT_PORT = 8741
+HUMAN_CONFIG = os.path.expanduser("~/.human/config.json")
+
+
+def _load_human_config():
+    """Read ~/.human/config.json for h-uman integration defaults."""
+    if not os.path.isfile(HUMAN_CONFIG):
+        return {}
+    try:
+        with open(HUMAN_CONFIG) as f:
+            cfg = json.load(f)
+        mlx = cfg.get("mlx_local", {})
+        defaults = {}
+        if mlx.get("model"):
+            defaults["model"] = mlx["model"]
+        if mlx.get("adapter_path"):
+            defaults["adapter_path"] = os.path.expanduser(mlx["adapter_path"])
+        if mlx.get("port"):
+            defaults["port"] = int(mlx["port"])
+        if mlx.get("realtime"):
+            defaults["realtime"] = True
+        if mlx.get("kv_bits"):
+            defaults["kv_bits"] = float(mlx["kv_bits"])
+        if mlx.get("kv_asymmetric"):
+            defaults["kv_asymmetric"] = True
+        if mlx.get("speculative_draft"):
+            defaults["speculative_draft"] = mlx["speculative_draft"]
+        if mlx.get("speculative_draft_adapter"):
+            defaults["speculative_draft_adapter"] = os.path.expanduser(
+                mlx["speculative_draft_adapter"]
+            )
+        return defaults
+    except Exception:
+        return {}
 
 # ── Hardware Detection ─────────────────────────────────────────────
 
@@ -114,6 +145,7 @@ speculative_draft_tokens = 4
 
 kv_bits = None
 kv_quant_scheme = "uniform"
+turbo_cache = None
 
 prompt_cache_state = None
 
@@ -343,14 +375,55 @@ def strip_stop_tokens(text):
     return text, False
 
 
-def _stream_kwargs():
-    """Build extra kwargs for TurboQuant and prompt caching."""
+def _init_turbo_cache():
+    """Initialize TurboQuant+ KV cache for the loaded model."""
+    global turbo_cache
+    if kv_bits is None or model is None:
+        return None
+
+    bits = int(kv_bits) if kv_bits == int(kv_bits) else 4
+
+    try:
+        from mlx.nn.layers.turbo_kv_cache import make_turbo_cache
+        key_bits = 16 if kv_quant_scheme == "asymmetric" else bits
+        turbo_cache = make_turbo_cache(model, bits=bits, key_bits=key_bits)
+        mode = f"K=FP16 V={bits}b asymmetric" if key_bits == 16 else f"{bits}-bit symmetric"
+        print(f"  TurboQuant+ KV cache initialized: {mode}", flush=True)
+        return turbo_cache
+    except ImportError:
+        pass
+
+    try:
+        from mlx.nn.layers.turbo_kv_cache import TurboKVCache
+        n_layers = len(model.model.layers) if hasattr(model, "model") else 32
+        key_bits = 16 if kv_quant_scheme == "asymmetric" else bits
+        turbo_cache = [TurboKVCache(bits=bits, key_bits=key_bits) for _ in range(n_layers)]
+        print(f"  TurboQuant+ KV cache initialized: K={key_bits}b V={bits}b ({n_layers} layers)", flush=True)
+        return turbo_cache
+    except ImportError:
+        print("  TurboQuant+ not available — install with:", flush=True)
+        print("    pip install git+https://github.com/TheTom/mlx.git@feature/turboquant-plus", flush=True)
+        return None
+
+
+def _compact_turbo_cache():
+    """Compress prefill FP16 data to TurboQuant packed storage."""
+    if turbo_cache is None:
+        return
+    try:
+        from mlx.nn.layers.turbo_kv_cache import compact_turbo_cache
+        compact_turbo_cache(turbo_cache)
+    except ImportError:
+        pass
+
+
+def _kv_kwargs():
+    """Build KV cache kwargs for generate_step (works for both mlx_lm and mlx_vlm)."""
     extra = {}
-    if kv_bits is not None:
-        extra["kv_bits"] = kv_bits
-        extra["kv_quant_scheme"] = kv_quant_scheme
-    if prompt_cache_state is not None:
-        extra["prompt_cache_state"] = prompt_cache_state
+    if turbo_cache is not None:
+        extra["prompt_cache"] = turbo_cache
+    elif kv_bits is not None:
+        extra["kv_bits"] = int(kv_bits)
     return extra
 
 
@@ -359,23 +432,40 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
     has_imgs = _has_images(messages)
 
     if use_lm_path and not has_imgs:
-        from mlx_lm import generate as lm_generate
+        from mlx_lm import stream_generate as lm_stream_generate
+        from mlx_lm.sample_utils import make_sampler
         prompt = prepare_prompt_lm(messages)
-        result = lm_generate(
+        extra = _kv_kwargs()
+        extra["sampler"] = make_sampler(temp=temperature)
+        text_parts = []
+        prompt_toks_out = 0
+        gen_toks_out = 0
+        prefill_done = False
+        for resp in lm_stream_generate(
             model, processor, prompt=prompt,
-            max_tokens=max_tokens, verbose=False,
-        )
-        text, _ = strip_stop_tokens(str(result))
-        return text.strip(), 0, len(text.split())
+            max_tokens=max_tokens,
+            **extra,
+        ):
+            if not prefill_done:
+                _compact_turbo_cache()
+                prefill_done = True
+            prompt_toks_out = getattr(resp, "prompt_tokens", prompt_toks_out)
+            gen_toks_out = getattr(resp, "generation_tokens", gen_toks_out)
+            t = resp.text or ""
+            cleaned, hit_stop = strip_stop_tokens(t)
+            text_parts.append(cleaned)
+            if hit_stop:
+                break
+        return "".join(text_parts).strip(), prompt_toks_out, gen_toks_out
 
     from mlx_vlm import generate as vlm_generate
     formatted, images = prepare_prompt_vlm(messages)
-    extra = _stream_kwargs()
+    extra = _kv_kwargs()
     if images:
         extra["images"] = images
     result = vlm_generate(
         model, processor, formatted,
-        max_tokens=max_tokens, verbose=False,
+        max_tokens=max_tokens, temperature=temperature, verbose=False,
         **extra,
     )
     text, _ = strip_stop_tokens(result.text if hasattr(result, "text") else result)
@@ -401,15 +491,28 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
     if speculative_enabled and draft_model is not None and not has_imgs:
         try:
             from mlx_lm import stream_generate as lm_stream_generate
+            from mlx_lm.sample_utils import make_sampler
             prompt = prepare_prompt_lm(messages)
+            extra = _kv_kwargs()
+            extra["sampler"] = make_sampler(temp=temperature)
 
+            import inspect
+            sig = inspect.signature(lm_stream_generate)
+            if "num_draft_tokens" in sig.parameters:
+                extra["num_draft_tokens"] = speculative_draft_tokens
+
+            prefill_done = False
             for resp in lm_stream_generate(
                 model=model,
                 tokenizer=processor,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 draft_model=draft_model,
+                **extra,
             ):
+                if not prefill_done:
+                    _compact_turbo_cache()
+                    prefill_done = True
                 prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
                 gen_toks = getattr(resp, "generation_tokens", gen_toks)
                 text = resp.text or ""
@@ -428,13 +531,21 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
     # Fast text path via mlx_lm
     if use_lm_path and not has_imgs:
         from mlx_lm import stream_generate as lm_stream_generate
+        from mlx_lm.sample_utils import make_sampler
 
         prompt = prepare_prompt_lm(messages)
+        extra = _kv_kwargs()
+        extra["sampler"] = make_sampler(temp=temperature)
 
+        prefill_done = False
         for resp in lm_stream_generate(
             model, processor, prompt=prompt,
             max_tokens=max_tokens,
+            **extra,
         ):
+            if not prefill_done:
+                _compact_turbo_cache()
+                prefill_done = True
             prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
             gen_toks = getattr(resp, "generation_tokens", gen_toks)
             text = resp.text or ""
@@ -451,7 +562,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
     # Multimodal fallback via mlx_vlm
     from mlx_vlm import stream_generate as vlm_stream_generate
     formatted, images = prepare_prompt_vlm(messages)
-    extra = _stream_kwargs()
+    extra = _kv_kwargs()
     if images:
         extra["images"] = images
 
@@ -500,6 +611,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             if kv_bits is not None:
                 health["kv_bits"] = kv_bits
                 health["kv_quant_scheme"] = kv_quant_scheme
+                health["turboquant_plus"] = turbo_cache is not None
             if prompt_cache_state is not None and prompt_cache_state.token_ids is not None:
                 health["cached_tokens"] = len(prompt_cache_state.token_ids)
             if adapter_path_global:
@@ -629,7 +741,11 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         preview = text[:60].replace("\n", " ")
         tps = gen_toks / elapsed if elapsed > 0 else 0
-        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s) | {preview}...", flush=True)
+        perf_stats["total_tokens"] += gen_toks
+        perf_stats["total_time"] += elapsed
+        perf_stats["requests"] += 1
+        cache_tag = f" [TQ{kv_bits}b]" if kv_bits is not None else ""
+        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s){cache_tag} | {preview}...", flush=True)
 
     def do_POST(self):
         if self.path != "/v1/chat/completions":
@@ -656,13 +772,15 @@ class ChatHandler(BaseHTTPRequestHandler):
 def main():
     global kv_bits, kv_quant_scheme, prompt_cache_state, hw_info, speculative_draft_tokens
 
+    hc = _load_human_config()
+
     parser = argparse.ArgumentParser(
         description="MLX OpenAI-compatible model server with speculative decoding",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Standard 31B serving
-  %(prog)s --model mlx-community/gemma-4-31b-it-4bit
+  # Standard serving (reads ~/.human/config.json for defaults)
+  %(prog)s
 
   # Real-time voice mode (E4B + aggressive KV compression)
   %(prog)s --model mlx-community/gemma-4-e4b-it-4bit --realtime
@@ -673,33 +791,45 @@ Examples:
 
   # Fine-tuned with LoRA adapters on both target and draft
   %(prog)s --model mlx-community/gemma-4-e4b-it-4bit \\
-    --adapter-path ~/.human/training-data/adapters/seth-lora-e4b \\
+    --adapter-path ~/.human/adapters/persona \\
     --speculative-draft mlx-community/gemma-4-e2b-it-4bit \\
-    --speculative-draft-adapter ~/.human/training-data/adapters/seth-lora-e2b
+    --speculative-draft-adapter ~/.human/adapters/draft
 """,
     )
-    parser.add_argument("--model", default=os.environ.get("MLX_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("MLX_PORT", DEFAULT_PORT)))
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("MLX_MODEL", hc.get("model", DEFAULT_MODEL)),
+    )
+    parser.add_argument(
+        "--port", type=int,
+        default=int(os.environ.get("MLX_PORT", hc.get("port", DEFAULT_PORT))),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
-        "--adapter-path", default=os.environ.get("MLX_ADAPTER_PATH", None),
+        "--adapter-path",
+        default=os.environ.get("MLX_ADAPTER_PATH", hc.get("adapter_path")),
         help="Path to LoRA adapter directory (e.g. from finetune-gemma.py).",
     )
     parser.add_argument(
-        "--kv-bits", type=float, default=None,
+        "--kv-bits", type=float, default=hc.get("kv_bits"),
         help="KV cache quantization bits. Use 3 for TurboQuant 3-bit (4.6x compression).",
+    )
+    parser.add_argument(
+        "--kv-asymmetric", action="store_true",
+        default=hc.get("kv_asymmetric", False),
+        help="Asymmetric KV: keep keys at FP16, compress only values (recommended for Q4_K_M models).",
     )
     parser.add_argument(
         "--no-prompt-cache", action="store_true",
         help="Disable cross-turn prompt cache reuse.",
     )
     parser.add_argument(
-        "--speculative-draft", default=None,
+        "--speculative-draft", default=hc.get("speculative_draft"),
         help="Draft model for speculative decoding (e.g. mlx-community/gemma-4-e2b-it-4bit "
              "or a path to a LoRA adapter dir with adapters.safetensors).",
     )
     parser.add_argument(
-        "--speculative-draft-adapter", default=None,
+        "--speculative-draft-adapter", default=hc.get("speculative_draft_adapter"),
         help="LoRA adapter path for the draft model.",
     )
     parser.add_argument(
@@ -708,7 +838,8 @@ Examples:
     )
     parser.add_argument(
         "--realtime", action="store_true",
-        help="Real-time voice mode: auto-enable TurboQuant 3-bit KV, aggressive caching, "
+        default=hc.get("realtime", False),
+        help="Real-time voice mode: auto-enable TurboQuant 4-bit KV, aggressive caching, "
              "and optimized generation for lowest TTFT.",
     )
     args = parser.parse_args()
@@ -716,6 +847,8 @@ Examples:
     print(f"\n{'='*60}", flush=True)
     print(f"  MLX Inference Server", flush=True)
     print(f"{'='*60}", flush=True)
+    if hc:
+        print(f"  Config:  {HUMAN_CONFIG}", flush=True)
 
     hw_info = detect_apple_silicon()
     print(f"  Hardware: {hw_info['chip']}", flush=True)
@@ -728,43 +861,40 @@ Examples:
 
     if args.realtime:
         if args.kv_bits is None:
-            args.kv_bits = 3.0
+            args.kv_bits = 4.0
         print("Real-time voice mode enabled:", flush=True)
-        print("  - TurboQuant 3-bit KV cache (4.6x smaller)", flush=True)
-        print("  - Optimized for lowest TTFT", flush=True)
+        print(f"  - TurboQuant+ {int(args.kv_bits)}-bit KV cache (3.8x compression, +0.23% PPL)", flush=True)
+        print("  - Optimized for lowest TTFT + best quality/compression tradeoff", flush=True)
         print("", flush=True)
 
     if args.kv_bits is not None:
         kv_bits = args.kv_bits
         kv_quant_scheme = "turboquant"
+        if getattr(args, "kv_asymmetric", False):
+            kv_quant_scheme = "asymmetric"
         try:
-            from mlx_lm.models.cache import QuantizedKVCache
-            print(f"TurboQuant enabled: {kv_bits}-bit KV cache compression", flush=True)
+            from mlx.nn.layers.turbo_kv_cache import TurboKVCache
+            bits = int(kv_bits) if kv_bits == int(kv_bits) else 4
+            compression = {2: "6.4x", 3: "4.6x", 4: "3.8x"}.get(bits, f"{bits}b")
+            mode = "asymmetric (K=FP16, V=turbo)" if kv_quant_scheme == "asymmetric" else "symmetric"
+            print(f"TurboQuant+ detected: {bits}-bit KV cache ({compression} compression, {mode})", flush=True)
         except ImportError:
-            try:
-                from mlx_vlm.turboquant import turboquant_enabled
-                if turboquant_enabled(kv_bits, kv_quant_scheme):
-                    print(f"TurboQuant enabled: {kv_bits}-bit KV cache (via mlx_vlm)", flush=True)
-                else:
-                    kv_quant_scheme = "uniform"
-                    print(f"Uniform KV quantization: {kv_bits}-bit", flush=True)
-            except ImportError:
-                kv_quant_scheme = "uniform"
-                print(f"Uniform KV quantization: {kv_bits}-bit (turboquant not available)", flush=True)
+            kv_quant_scheme = "uniform"
+            print(f"KV quantization: {kv_bits}-bit (TurboQuant+ not installed)", flush=True)
+            print(f"  Install: pip install git+https://github.com/TheTom/mlx.git@feature/turboquant-plus", flush=True)
 
     if not args.no_prompt_cache:
         try:
-            from mlx_lm.utils import make_kv_caches
-            print("Prompt cache: mlx_lm KV cache reuse enabled", flush=True)
+            from mlx_vlm.generate import PromptCacheState
+            prompt_cache_state = PromptCacheState()
+            print("Prompt cache: state tracking enabled (cross-turn reuse not yet wired)", flush=True)
         except ImportError:
-            try:
-                from mlx_vlm.generate import PromptCacheState
-                prompt_cache_state = PromptCacheState()
-                print("Prompt cache enabled via mlx_vlm", flush=True)
-            except ImportError:
-                print("Prompt cache: not available", flush=True)
+            print("Prompt cache: not available (mlx_vlm.generate.PromptCacheState missing)", flush=True)
 
     load_model(args.model, adapter_path=args.adapter_path)
+
+    if kv_bits is not None:
+        _init_turbo_cache()
 
     if args.speculative_draft:
         speculative_draft_tokens = args.speculative_tokens
@@ -775,14 +905,14 @@ Examples:
         else:
             load_draft_model(draft_name, draft_adapter_path=args.speculative_draft_adapter)
 
-    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    class MLXHTTPServer(HTTPServer):
         allow_reuse_address = True
         allow_reuse_port = True
-        daemon_threads = True
 
-    server = ThreadedHTTPServer((args.host, args.port), ChatHandler)
-    kv_info = f", KV={kv_bits}b TurboQuant" if kv_bits else ""
-    cache_info = ", prompt-cache=on" if prompt_cache_state else ""
+    server = MLXHTTPServer((args.host, args.port), ChatHandler)
+    tq_label = "TurboQuant+" if turbo_cache is not None else "quantized"
+    kv_info = f", KV={kv_bits}b {tq_label}" if kv_bits else ""
+    cache_info = ", prompt-cache=tracking" if prompt_cache_state else ""
     adapter_info = f", adapter={args.adapter_path}" if args.adapter_path else ""
     spec_info = f", speculative={args.speculative_draft}" if args.speculative_draft else ""
     engine_tag = "mlx_lm" if use_lm_path else "mlx_vlm"

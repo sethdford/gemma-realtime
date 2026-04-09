@@ -20,7 +20,7 @@ Pick at least one data source:
 
 **iMessage** (easiest if you're on macOS):
 ```bash
-python3 scripts/extract-imessage.py
+python3 scripts/extract_imessage_pairs.py
 ```
 
 **Facebook Messenger** (if you have a data export):

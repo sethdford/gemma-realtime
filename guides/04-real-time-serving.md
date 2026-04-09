@@ -29,11 +29,33 @@ python3 scripts/mlx-server.py \
 
 | Flag | Effect |
 |------|--------|
-| `--realtime` | Enable TurboQuant 3-bit KV + optimized settings |
+| `--realtime` | Enable TurboQuant+ 4-bit KV + optimized settings |
 | `--adapter-path` | Load LoRA adapter weights |
-| `--kv-bits 3` | TurboQuant KV cache (4.6x smaller, ~2% quality loss) |
+| `--kv-bits 4` | TurboQuant+ 4-bit KV (3.8x compression, +0.23% PPL) |
+| `--kv-bits 3` | TurboQuant+ 3-bit KV (4.6x compression, +1.06% PPL) |
+| `--kv-asymmetric` | Keep keys at FP16, compress only values (best quality) |
 | `--speculative-draft MODEL` | Enable speculative decoding with a draft model |
 | `--speculative-tokens 4` | Number of draft tokens per step |
+
+### TurboQuant+ KV Cache Compression
+
+[TurboQuant+](https://github.com/TheTom/turboquant_plus) uses PolarQuant + Walsh-Hadamard rotation to compress the KV cache with near-zero quality loss. The MLX port provides `TurboKVCache` as a drop-in replacement.
+
+```bash
+# Install TurboQuant+ (MLX fork with TurboKVCache)
+pip install git+https://github.com/TheTom/mlx.git@feature/turboquant-plus
+```
+
+**Choosing the right config:**
+
+| Your Model | Recommended Config | Why |
+|-----------|-------------------|-----|
+| Q8_0+ weights | `--kv-bits 4` (symmetric) | Full turbo compression, ~0.2% PPL |
+| Q4_K_M weights | `--kv-bits 4 --kv-asymmetric` | Preserves K precision, ~0.5% PPL |
+| Memory pressure | `--kv-bits 3` | Maximum compression (4.6x), ~1% PPL |
+| Extreme memory | `--kv-bits 2` | 6.4x compression, ~6% PPL |
+
+The `--realtime` flag auto-selects `--kv-bits 4` for the best speed/quality tradeoff. Asymmetric mode (`--kv-asymmetric`) keeps keys at FP16 while compressing values — this matters because K precision controls attention routing via softmax.
 
 ### Speculative Decoding
 
@@ -55,9 +77,12 @@ This can give a ~1.5-2x speedup when the draft model's predictions closely match
 The MLX server uses `mlx_lm` for text inference (not `mlx_vlm`). This is critical — the `mlx_vlm` path adds numpy synchronization overhead that drops throughput from 110 to 13 tok/s.
 
 When `--realtime` is set:
-1. KV cache is compressed to 3-bit via TurboQuant
-2. Prompt caching is enabled (system prompt KV reused across requests)
-3. Generation parameters are optimized for low latency
+1. KV cache is compressed to 4-bit via TurboQuant+ (`TurboKVCache` from MLX fork)
+2. During prefill, raw FP16 is stored; on first decode, compressed to packed TurboQuant storage
+3. Prompt cache state tracking enabled (cross-turn KV reuse planned, not yet wired)
+4. Generation parameters are optimized for low latency
+
+TurboQuant+ architecture: prefill stores FP16, decode compresses to packed storage and seeds an internal KVCache with decoded FP16. Subsequent decode tokens use pre-allocated buffers (zero-alloc slice-assign). This gives 97-100% baseline decode speed with 3.8x memory savings.
 
 ### API
 
@@ -75,6 +100,39 @@ curl http://127.0.0.1:8741/v1/chat/completions \
 ```
 
 Health check: `GET /health` — returns model info, hardware, and TPS stats.
+
+### h-uman Integration
+
+The MLX server integrates with [h-uman](https://github.com/user/h-uman) as its local inference backend. When `~/.human/config.json` exists, the server auto-reads `mlx_local` settings for model, adapter, port, TurboQuant+, and speculative decoding defaults.
+
+**Config (`~/.human/config.json`):**
+
+```json
+{
+  "mlx_local": {
+    "model": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "adapter_path": "~/.human/adapters/persona",
+    "port": 8741,
+    "realtime": true,
+    "kv_bits": 4,
+    "kv_asymmetric": false,
+    "speculative_draft": "",
+    "speculative_draft_adapter": ""
+  }
+}
+```
+
+**Start via h-uman's service manager:**
+
+```bash
+~/.human/bin/human-serve.sh start    # auto-detects gemma-realtime mlx-server.py
+~/.human/bin/human-serve.sh status   # shows TurboQuant+, tok/s, hardware
+~/.human/bin/human-serve.sh stop     # graceful shutdown
+```
+
+The h-uman CLI auto-starts the server when it detects `mlx_local` as the provider and port 8741 is not listening. Voice mode (STT → MLX → TTS) connects to the same endpoint.
+
+**Priority order:** CLI args > environment variables > `~/.human/config.json` > built-in defaults.
 
 ## Backend 2: Ollama (Recommended for Production)
 
