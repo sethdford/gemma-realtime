@@ -93,6 +93,12 @@ python3 scripts/mlx-server.py \
 
 # Prove it works
 python3 scripts/voice-bench.py
+
+# Voice pipeline with Voxtral TTS (4B, 20 voices, 9 languages)
+python3 scripts/speech-server.py --tts voxtral --voice casual_male
+
+# Or with Kokoro TTS (lighter, Apache 2.0)
+python3 scripts/speech-server.py --tts kokoro
 ```
 
 ### h-uman Integration

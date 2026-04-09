@@ -5,8 +5,9 @@ mlx-lm>=0.22.0
 # Speech Pipeline — ASR
 mlx-whisper
 
-# Speech Pipeline — TTS (Kokoro, used by default)
-# kokoro                    # Optional: pip install kokoro
+# Speech Pipeline — TTS
+# kokoro                    # Optional: pip install kokoro (82M, Apache 2.0)
+mlx-audio                   # Voxtral 4B TTS via MLX (CC BY-NC 4.0, --tts voxtral)
 
 # Speech Pipeline — Neural Audio Codec
 snac

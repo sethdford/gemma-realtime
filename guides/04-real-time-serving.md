@@ -134,6 +134,31 @@ The h-uman CLI auto-starts the server when it detects `mlx_local` as the provide
 
 **Priority order:** CLI args > environment variables > `~/.human/config.json` > built-in defaults.
 
+### Voice Pipeline (TTS)
+
+The speech server (`speech-server.py`) and WebSocket server (`realtime-ws.py`) support three TTS backends via the `--tts` flag:
+
+| Backend | Flag | Model | Size | Speed | License |
+|---------|------|-------|------|-------|---------|
+| **Kokoro** (default) | `--tts kokoro` | Kokoro 82M | ~350MB | CPU real-time | Apache 2.0 |
+| **Voxtral** | `--tts voxtral` | Voxtral 4B (4-bit) | ~2.5GB | 0.2-0.3x RTF | CC BY-NC 4.0 |
+| **Native SNAC** | `--tts native` | Custom decoder | Varies | Depends on training | N/A |
+
+```bash
+# Voxtral: 20 preset voices, 9 languages, highest quality
+python3 scripts/speech-server.py --tts voxtral --voice casual_male
+
+# Kokoro: lightweight, Apache 2.0, good for commercial use
+python3 scripts/speech-server.py --tts kokoro --voice af_bella
+
+# WebSocket server with Voxtral
+python3 scripts/realtime-ws.py --tts voxtral --voice cheerful_female
+```
+
+Voxtral preset voices: `casual_male`, `casual_female`, `cheerful_male`, `cheerful_female`, `serious_male`, `serious_female`, `narrator_male`, `narrator_female`, plus language-specific voices (`fr_male`, `de_female`, `es_male`, `hi_female`, etc.).
+
+The 4-bit model (~2.5GB) downloads automatically from HuggingFace on first use. Running Gemma 4 26B-4bit (~14GB) + Voxtral 4B-4bit simultaneously requires ~17GB — comfortable on 32GB+ Apple Silicon.
+
 ## Backend 2: Ollama (Recommended for Production)
 
 **Strengths:** Zero Python GIL overhead, most consistent P95 latency, easiest setup.

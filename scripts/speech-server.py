@@ -222,6 +222,64 @@ class TTSEngine:
         return self._available
 
 
+class VoxtralTTSEngine:
+    """Text-to-speech using Voxtral 4B via mlx-audio (CC BY-NC 4.0).
+
+    20 preset voices, 9 languages, 24kHz output, ~0.2-0.3x RTF on Apple Silicon.
+    Uses the 4-bit quantized model (~2.5GB) by default.
+    """
+
+    VOICES = [
+        "casual_male", "casual_female", "cheerful_male", "cheerful_female",
+        "serious_male", "serious_female", "narrator_male", "narrator_female",
+        "fr_male", "fr_female", "de_male", "de_female",
+        "es_male", "es_female", "it_male", "it_female",
+        "pt_male", "pt_female", "ar_male", "hi_male", "hi_female",
+    ]
+
+    def __init__(self, voice="casual_male",
+                 model_path="mlx-community/Voxtral-4B-TTS-2603-mlx-4bit"):
+        self.voice = voice
+        self.model_path = model_path
+        self._model = None
+        self._available = False
+
+    def load(self):
+        try:
+            from mlx_audio.tts.utils import load as mlx_audio_load
+            print(f"  TTS: Loading Voxtral 4-bit from {self.model_path}...", flush=True)
+            self._model = mlx_audio_load(self.model_path)
+            self._available = True
+            print(f"  TTS: Voxtral loaded (voice={self.voice}, model={self.model_path})", flush=True)
+        except Exception as e:
+            print(f"  TTS: Voxtral not available — {e}", flush=True)
+            print("    Install: pip install mlx-audio", flush=True)
+            self._available = False
+
+    def synthesize(self, text: str) -> np.ndarray | None:
+        if not self._available or not text.strip():
+            return None
+        try:
+            chunks = []
+            for result in self._model.generate(text=text, voice=self.voice):
+                if result.audio is not None:
+                    chunks.append(np.array(result.audio))
+            if not chunks:
+                return None
+            return np.concatenate(chunks)
+        except Exception as e:
+            print(f"  TTS error: {e}", flush=True)
+            return None
+
+    @property
+    def sample_rate(self) -> int:
+        return SAMPLE_RATE
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+
 class LLMClient:
     """Async HTTP client for the MLX server's OpenAI-compatible streaming API."""
 
@@ -405,7 +463,14 @@ async def run_speech_pipeline(args):
 
     vad = SileroVAD(threshold=args.vad_threshold)
     asr = WhisperASR(model_name=args.whisper_model)
-    tts = TTSEngine(voice=args.voice, speed=args.speed)
+
+    if args.tts == "voxtral":
+        voice = args.voice or "casual_male"
+        tts = VoxtralTTSEngine(voice=voice)
+    else:
+        voice = args.voice or "af_bella"
+        tts = TTSEngine(voice=voice, speed=args.speed)
+
     llm = LLMClient(base_url=args.llm_url)
     sentence_buf = SentenceBuffer()
 
@@ -654,8 +719,12 @@ Examples:
         help="Whisper model for ASR (default: mlx-community/whisper-small-mlx)",
     )
     parser.add_argument(
-        "--voice", default="af_bella",
-        help="Kokoro TTS voice (default: af_bella)",
+        "--tts", choices=["kokoro", "voxtral"], default="kokoro",
+        help="TTS backend: kokoro (82M, Apache 2.0) or voxtral (4B, CC BY-NC) (default: kokoro)",
+    )
+    parser.add_argument(
+        "--voice", default=None,
+        help="TTS voice (kokoro: af_bella, voxtral: casual_male). Auto-selected if omitted.",
     )
     parser.add_argument(
         "--speed", type=float, default=1.0,

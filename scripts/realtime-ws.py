@@ -2,13 +2,14 @@
 """
 WebSocket bidirectional realtime API for gemma-realtime.
 
-Two TTS modes:
-    Default:      Kokoro TTS (external, high quality, requires kokoro package)
-    --native-tts: SNAC speech decoder + depth decoder (multi-codebook, on-device)
+Three TTS backends (--tts flag):
+    kokoro  (default): Kokoro TTS (82M, Apache 2.0, requires kokoro package)
+    voxtral:           Voxtral 4B via mlx-audio (CC BY-NC, 20 voices, 9 langs)
+    native:            SNAC speech decoder + depth decoder (multi-codebook)
 
 Features:
     - Whisper ASR (mlx-whisper on Apple Silicon)
-    - Sentence-level streaming LLM → TTS
+    - Sentence-level streaming LLM -> TTS
     - Full-duplex: client can send {"type": "interrupt"} to stop generation
     - VAD: Silero (if onnxruntime installed) or energy-based fallback
 
@@ -36,8 +37,9 @@ Protocol:
         {"type": "error", "message": "..."}
 
 Usage:
-    python3 scripts/realtime-ws.py                          # Kokoro TTS
-    python3 scripts/realtime-ws.py --native-tts             # SNAC decoder
+    python3 scripts/realtime-ws.py                          # Kokoro TTS (default)
+    python3 scripts/realtime-ws.py --tts voxtral            # Voxtral 4B MLX
+    python3 scripts/realtime-ws.py --tts native             # SNAC decoder
     python3 scripts/realtime-ws.py --port 8742 --llm-url http://localhost:8741
 """
 
@@ -172,14 +174,14 @@ class RealtimeServer:
     """WebSocket server implementing the realtime bidirectional protocol."""
 
     def __init__(self, host="0.0.0.0", port=8742, llm_url="http://localhost:8741",
-                 whisper_model="mlx-community/whisper-small-mlx", voice="af_bella",
-                 native_tts=False):
+                 whisper_model="mlx-community/whisper-small-mlx", voice=None,
+                 tts_backend="kokoro"):
         self.host = host
         self.port = port
         self.llm_url = llm_url
         self.whisper_model = whisper_model
+        self.tts_backend = tts_backend
         self.voice = voice
-        self.native_tts = native_tts
         self._sessions = {}
         self._shared_vad = None
         self._shared_asr = None
@@ -199,7 +201,7 @@ class RealtimeServer:
         self._shared_vad = speech.SileroVAD(threshold=VAD_THRESHOLD)
         self._shared_asr = speech.WhisperASR(model_name=self.whisper_model)
 
-        if self.native_tts:
+        if self.tts_backend == "native":
             import mlx.core as mx
             from mlx_lm import load as lm_load
             from speech_decoder import SpeechDecoder
@@ -223,7 +225,7 @@ class RealtimeServer:
             depth_path = Path("adapters/depth-decoder/depth_decoder.safetensors")
             if depth_path.exists():
                 tdd = import_module("train-depth-decoder")
-                depth_decoder = tdd.DepthDecoder()
+                depth_decoder = tdd.DepthDecoder(**tdd.DEPTH_DECODER_CONFIG)
                 dw = mx.load(str(depth_path))
                 depth_decoder.load_weights(list(dw.items()))
                 print("    Depth decoder loaded (3-codebook)", flush=True)
@@ -235,8 +237,13 @@ class RealtimeServer:
             self._shared_tts.load(inner, tokenizer, decoder, depth_decoder, codec)
             self._gemma = gemma
             print("    Native SNAC TTS ready", flush=True)
+        elif self.tts_backend == "voxtral":
+            voice = self.voice or "casual_male"
+            self._shared_tts = speech.VoxtralTTSEngine(voice=voice)
+            self._shared_tts.load()
         else:
-            self._shared_tts = speech.TTSEngine(voice=self.voice)
+            voice = self.voice or "af_bella"
+            self._shared_tts = speech.TTSEngine(voice=voice)
             self._shared_tts.load()
 
         print("  Loading shared models (first connection)...", flush=True)
@@ -546,7 +553,8 @@ class RealtimeServer:
         print(f"{'='*60}", flush=True)
         print(f"  Endpoint: ws://{self.host}:{self.port}/v1/realtime", flush=True)
         print(f"  LLM:      {self.llm_url}", flush=True)
-        tts_mode = "SNAC (native)" if self.native_tts else f"Kokoro ({self.voice})"
+        voice = self.voice or {"kokoro": "af_bella", "voxtral": "casual_male", "native": "SNAC"}.get(self.tts_backend, "?")
+        tts_mode = f"{self.tts_backend} ({voice})"
         print(f"  TTS:      {tts_mode}", flush=True)
         print(f"  ASR:      {self.whisper_model}", flush=True)
         print(f"{'='*60}\n", flush=True)
@@ -571,12 +579,19 @@ def main():
     parser.add_argument("--port", type=int, default=8742)
     parser.add_argument("--llm-url", default="http://localhost:8741")
     parser.add_argument("--whisper-model", default="mlx-community/whisper-small-mlx")
-    parser.add_argument("--voice", default="af_bella")
+    parser.add_argument("--voice", default=None,
+                        help="TTS voice (auto-selected per backend if omitted)")
+    parser.add_argument(
+        "--tts", choices=["kokoro", "voxtral", "native"], default="kokoro",
+        help="TTS backend: kokoro (default), voxtral (4B MLX), or native (SNAC decoder)",
+    )
     parser.add_argument(
         "--native-tts", action="store_true",
-        help="Use SNAC speech decoder instead of Kokoro TTS (multi-codebook audio)",
+        help="Shorthand for --tts native",
     )
     args = parser.parse_args()
+    if args.native_tts:
+        args.tts = "native"
 
     server = RealtimeServer(
         host=args.host,
@@ -584,7 +599,7 @@ def main():
         llm_url=args.llm_url,
         whisper_model=args.whisper_model,
         voice=args.voice,
-        native_tts=args.native_tts,
+        tts_backend=args.tts,
     )
     asyncio.run(server.start())
 
