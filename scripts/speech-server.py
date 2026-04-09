@@ -23,16 +23,12 @@ Requirements:
 
 import argparse
 import asyncio
-import io
 import json
 import queue
 import re
-import struct
 import sys
 import threading
 import time
-import wave
-from pathlib import Path
 
 import numpy as np
 
@@ -239,6 +235,7 @@ class LLMClient:
             self._session = aiohttp.ClientSession()
 
     async def check_health(self) -> dict | None:
+        import aiohttp
         await self._ensure_session()
         try:
             async with self._session.get(f"{self.base_url}/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -249,7 +246,11 @@ class LLMClient:
         return None
 
     async def stream_chat(self, messages: list[dict], max_tokens=256, temperature=0.7):
-        """Yield text deltas from streaming chat completion."""
+        """Yield text deltas from streaming chat completion.
+
+        Filters Gemma 4 thinking tokens: skips content between <|channel>thought
+        and the next <|channel> marker (typically <|channel>response or end).
+        """
         await self._ensure_session()
         import aiohttp
 
@@ -260,6 +261,8 @@ class LLMClient:
             "temperature": temperature,
             "stream": True,
         }
+
+        in_thinking = False
 
         try:
             async with self._session.post(
@@ -278,8 +281,19 @@ class LLMClient:
                         chunk = json.loads(data)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
-                        if content:
-                            yield content
+                        if not content:
+                            continue
+                        if "<|channel>thought" in content:
+                            in_thinking = True
+                            continue
+                        if "<|channel>" in content:
+                            in_thinking = False
+                            continue
+                        if content.startswith("<|"):
+                            continue
+                        if in_thinking:
+                            continue
+                        yield content
                     except json.JSONDecodeError:
                         continue
         except Exception as e:

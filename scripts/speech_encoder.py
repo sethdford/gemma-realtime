@@ -125,7 +125,7 @@ class SpeechEncoder(nn.Module):
     Outputs embeddings in the same space as Gemma's token embeddings.
 
     Args:
-        llm_dim: Gemma's hidden dimension (2048 for E4B, 2560 for E2B, 4096 for 31B)
+        llm_dim: Gemma's hidden dimension (2304 for E2B, 2560 for E4B, 4096 for 31B)
         encoder_dim: Internal encoder dimension
         n_heads: Attention heads in encoder transformer
         n_layers: Number of encoder transformer layers

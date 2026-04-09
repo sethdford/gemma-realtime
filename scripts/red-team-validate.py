@@ -459,8 +459,8 @@ def main():
             phase_fn()
         validator.validate_integration()
 
-    validator.print_summary()
-    sys.exit(0 if validator.print_summary() else 1)
+    all_pass = validator.print_summary()
+    sys.exit(0 if all_pass else 1)
 
 
 if __name__ == "__main__":

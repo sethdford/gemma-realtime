@@ -59,18 +59,18 @@ The `--realtime` flag auto-selects `--kv-bits 4` for the best speed/quality trad
 
 ### Speculative Decoding
 
-Use a small E2B draft model to propose tokens that E4B verifies in parallel:
+Use a small draft model to propose tokens that the target verifies in parallel:
 
 ```bash
 python3 scripts/mlx-server.py \
   --model mlx-community/gemma-4-e4b-it-4bit \
-  --adapter-path ~/.human/training-data/adapters/seth-lora-e4b \
   --speculative-draft mlx-community/gemma-4-e2b-it-4bit \
-  --speculative-draft-adapter ~/.human/training-data/adapters/seth-lora-e2b \
   --realtime
 ```
 
 This can give a ~1.5-2x speedup when the draft model's predictions closely match the target (which is why training both on the same data matters).
+
+**Important:** The draft model must use the same architecture family as the target. Gemma 4's sliding-window attention requires a Gemma 4 draft model (e.g., a future E2B variant). Cross-generation drafting (e.g., Gemma 3 1B draft with Gemma 4 target) will fail due to incompatible cache layouts. The server handles this gracefully and falls back to standard generation.
 
 ### How It Works
 
@@ -79,7 +79,7 @@ The MLX server uses `mlx_lm` for text inference (not `mlx_vlm`). This is critica
 When `--realtime` is set:
 1. KV cache is compressed to 4-bit via TurboQuant+ (`TurboKVCache` from MLX fork)
 2. During prefill, raw FP16 is stored; on first decode, compressed to packed TurboQuant storage
-3. Prompt cache state tracking enabled (cross-turn KV reuse planned, not yet wired)
+3. Cross-turn prompt caching: system prompt KV is preserved and reused across requests (trim-and-reuse)
 4. Generation parameters are optimized for low latency
 
 TurboQuant+ architecture: prefill stores FP16, decode compresses to packed storage and seeds an internal KVCache with decoded FP16. Subsequent decode tokens use pre-allocated buffers (zero-alloc slice-assign). This gives 97-100% baseline decode speed with 3.8x memory savings.

@@ -12,7 +12,7 @@ Features:
     - Uses mlx_lm for text (fast path, no vision overhead) with mlx_vlm fallback for multimodal
     - Speculative decoding: E2B draft model proposes tokens, target verifies in parallel (~2x speedup)
     - TurboQuant KV cache compression (4.6x smaller, ~0.98x FP16 speed)
-    - Prompt cache state tracking (future: cross-turn KV reuse)
+    - Cross-turn prompt caching (system prompt KV reused across requests via cache trim)
     - Apple Silicon hardware detection (M5 TensorOps, Neural Accelerators, Metal version)
     - Real-time voice mode: optimized for low TTFT with aggressive KV compression
     - PLE-safe model validation for Gemma 4 (warns about broken quantizations)
@@ -148,8 +148,11 @@ kv_quant_scheme = "uniform"
 turbo_cache = None
 
 prompt_cache_state = None
+_cached_system_hash = None
+_cached_system_ntokens = 0
 
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
+THINKING_TOKENS = frozenset({"|", "|\n", "\n|", "\n"})
 
 adapter_path_global = None
 hw_info = {}
@@ -375,6 +378,33 @@ def strip_stop_tokens(text):
     return text, False
 
 
+_thinking_mode = False
+_thinking_count = 0
+
+
+def filter_thinking(text):
+    """Filter Gemma 4's thinking tokens (alternating | and newlines at start of response).
+
+    Returns the text if it's substantive content, empty string if it's a thinking token.
+    Automatically exits thinking mode once non-thinking content appears.
+    """
+    global _thinking_mode, _thinking_count
+    stripped = text.strip()
+    if stripped in ("|", "") and _thinking_count < 500:
+        _thinking_mode = True
+        _thinking_count += 1
+        return ""
+    if _thinking_mode:
+        _thinking_mode = False
+    return text
+
+
+def reset_thinking_filter():
+    global _thinking_mode, _thinking_count
+    _thinking_mode = False
+    _thinking_count = 0
+
+
 def _init_turbo_cache():
     """Initialize TurboQuant+ KV cache for the loaded model."""
     global turbo_cache
@@ -427,6 +457,60 @@ def _kv_kwargs():
     return extra
 
 
+def _prepare_cache_for_request(messages):
+    """Trim cache back to system prompt boundary for cross-turn reuse.
+
+    If the system prompt hasn't changed, we keep its KV state and only
+    re-process the new user/assistant tokens. If it changed (or this is
+    the first request), the cache starts empty.
+
+    Only works when turbo_cache is active (prompt_cache is the turbo_cache list).
+    """
+    global _cached_system_hash, _cached_system_ntokens
+
+    if turbo_cache is None:
+        return
+
+    system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
+    sys_hash = hash(tuple(system_parts)) if system_parts else None
+
+    cache_size = turbo_cache[0].offset if turbo_cache else 0
+
+    if sys_hash is not None and sys_hash == _cached_system_hash and _cached_system_ntokens > 0:
+        trim_amount = cache_size - _cached_system_ntokens
+        if trim_amount > 0:
+            for layer_cache in turbo_cache:
+                if hasattr(layer_cache, "trim"):
+                    layer_cache.trim(trim_amount)
+        return
+
+    if cache_size > 0:
+        for layer_cache in turbo_cache:
+            if hasattr(layer_cache, "trim"):
+                layer_cache.trim(cache_size)
+    _cached_system_hash = sys_hash
+    _cached_system_ntokens = 0
+
+
+def _record_system_cache_boundary(messages):
+    """After prefill, record how many tokens the system prompt occupies."""
+    global _cached_system_ntokens
+
+    if turbo_cache is None or _cached_system_ntokens > 0:
+        return
+
+    system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
+    if not system_parts or processor is None:
+        return
+
+    sys_text = "\n".join(system_parts)
+    try:
+        sys_tokens = processor.encode(sys_text, add_special_tokens=False)
+        _cached_system_ntokens = len(sys_tokens) + 6
+    except Exception:
+        pass
+
+
 def generate_response(messages, max_tokens=256, temperature=0.7):
     """Non-streaming: generate the full response at once."""
     has_imgs = _has_images(messages)
@@ -434,6 +518,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
     if use_lm_path and not has_imgs:
         from mlx_lm import stream_generate as lm_stream_generate
         from mlx_lm.sample_utils import make_sampler
+        _prepare_cache_for_request(messages)
         prompt = prepare_prompt_lm(messages)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
@@ -448,6 +533,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
         ):
             if not prefill_done:
                 _compact_turbo_cache()
+                _record_system_cache_boundary(messages)
                 prefill_done = True
             prompt_toks_out = getattr(resp, "prompt_tokens", prompt_toks_out)
             gen_toks_out = getattr(resp, "generation_tokens", gen_toks_out)
@@ -492,6 +578,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
         try:
             from mlx_lm import stream_generate as lm_stream_generate
             from mlx_lm.sample_utils import make_sampler
+            _prepare_cache_for_request(messages)
             prompt = prepare_prompt_lm(messages)
             extra = _kv_kwargs()
             extra["sampler"] = make_sampler(temp=temperature)
@@ -527,12 +614,16 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
             return
         except (ImportError, AttributeError):
             pass
+        except (IndexError, RuntimeError) as e:
+            # Gemma 4's sliding-window cache is incompatible with some draft models
+            print(f"  [spec] Speculative decoding failed ({type(e).__name__}: {e}), falling back to standard generation", flush=True)
 
     # Fast text path via mlx_lm
     if use_lm_path and not has_imgs:
         from mlx_lm import stream_generate as lm_stream_generate
         from mlx_lm.sample_utils import make_sampler
 
+        _prepare_cache_for_request(messages)
         prompt = prepare_prompt_lm(messages)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
@@ -545,6 +636,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
         ):
             if not prefill_done:
                 _compact_turbo_cache()
+                _record_system_cache_boundary(messages)
                 prefill_done = True
             prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
             gen_toks = getattr(resp, "generation_tokens", gen_toks)
@@ -612,7 +704,10 @@ class ChatHandler(BaseHTTPRequestHandler):
                 health["kv_bits"] = kv_bits
                 health["kv_quant_scheme"] = kv_quant_scheme
                 health["turboquant_plus"] = turbo_cache is not None
-            if prompt_cache_state is not None and prompt_cache_state.token_ids is not None:
+            if turbo_cache is not None and _cached_system_ntokens > 0:
+                health["cached_system_tokens"] = _cached_system_ntokens
+                health["prompt_cache"] = "active"
+            elif prompt_cache_state is not None and prompt_cache_state.token_ids is not None:
                 health["cached_tokens"] = len(prompt_cache_state.token_ids)
             if adapter_path_global:
                 health["adapter"] = adapter_path_global
@@ -657,14 +752,20 @@ class ChatHandler(BaseHTTPRequestHandler):
         prompt_toks = 0
         gen_toks = 0
         first_token_time = None
+        reset_thinking_filter()
 
         with model_lock:
             for text, pt, gt in stream_response(messages, max_tokens, temperature):
-                if first_token_time is None:
-                    first_token_time = time.time()
                 prompt_toks = pt
                 gen_toks = gt
-                full_text.append(text)
+
+                filtered = filter_thinking(text)
+                if not filtered:
+                    continue
+
+                if first_token_time is None:
+                    first_token_time = time.time()
+                full_text.append(filtered)
 
                 chunk = {
                     "id": resp_id,
@@ -673,7 +774,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "model": model_id,
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": text},
+                        "delta": {"content": filtered},
                         "finish_reason": None,
                     }],
                 }
@@ -704,7 +805,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         cache_tag = f" [TQ{kv_bits}b]" if kv_bits is not None else ""
         spec_tag = " [spec]" if speculative_enabled else ""
         reused = ""
-        if prompt_cache_state is not None and prompt_cache_state.token_ids is not None:
+        if _cached_system_ntokens > 0:
+            reused = f" [cache:{_cached_system_ntokens} sys toks]"
+        elif prompt_cache_state is not None and prompt_cache_state.token_ids is not None:
             reused = f" [cache:{len(prompt_cache_state.token_ids)} toks]"
 
         perf_stats["total_tokens"] += gen_toks
@@ -887,7 +990,7 @@ Examples:
         try:
             from mlx_vlm.generate import PromptCacheState
             prompt_cache_state = PromptCacheState()
-            print("Prompt cache: state tracking enabled (cross-turn reuse not yet wired)", flush=True)
+            print("Prompt cache: cross-turn system prompt caching enabled (trim-and-reuse)", flush=True)
         except ImportError:
             print("Prompt cache: not available (mlx_vlm.generate.PromptCacheState missing)", flush=True)
 
@@ -912,7 +1015,7 @@ Examples:
     server = MLXHTTPServer((args.host, args.port), ChatHandler)
     tq_label = "TurboQuant+" if turbo_cache is not None else "quantized"
     kv_info = f", KV={kv_bits}b {tq_label}" if kv_bits else ""
-    cache_info = ", prompt-cache=tracking" if prompt_cache_state else ""
+    cache_info = ", prompt-cache=on" if (turbo_cache is not None or prompt_cache_state) else ""
     adapter_info = f", adapter={args.adapter_path}" if args.adapter_path else ""
     spec_info = f", speculative={args.speculative_draft}" if args.speculative_draft else ""
     engine_tag = "mlx_lm" if use_lm_path else "mlx_vlm"

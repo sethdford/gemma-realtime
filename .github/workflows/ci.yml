@@ -32,6 +32,11 @@ jobs:
           bash -n scripts/llamacpp-serve.sh
           bash -n scripts/vllm-metal-serve.sh
 
+      - name: Run unit tests
+        run: |
+          pip install pytest
+          python3 -m pytest tests/test_server.py -v -k "not Integration"
+
   pages:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest

@@ -38,7 +38,6 @@ import asyncio
 import base64
 import json
 import re
-import struct
 import time
 import uuid
 
@@ -115,7 +114,29 @@ class RealtimeServer:
         self.whisper_model = whisper_model
         self.voice = voice
         self._sessions = {}
-        self._shared_models_loaded = False
+        self._shared_vad = None
+        self._shared_asr = None
+        self._shared_tts = None
+
+    async def _ensure_shared_models(self):
+        """Load heavyweight models once, share across all sessions."""
+        if self._shared_vad is not None:
+            return
+
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent))
+        from importlib import import_module
+        speech = import_module("speech-server")
+
+        self._shared_vad = speech.SileroVAD(threshold=VAD_THRESHOLD)
+        self._shared_asr = speech.WhisperASR(model_name=self.whisper_model)
+        self._shared_tts = speech.TTSEngine(voice=self.voice)
+
+        print("  Loading shared models (first connection)...", flush=True)
+        self._shared_vad.load()
+        self._shared_asr.load()
+        self._shared_tts.load()
 
     async def _handle_connection(self, websocket):
         session_id = str(uuid.uuid4())[:12]
@@ -129,12 +150,25 @@ class RealtimeServer:
         self._sessions[session_id] = session
 
         try:
-            if not self._shared_models_loaded:
-                print(f"  [{session_id}] Loading models (first connection)...", flush=True)
-                await session.initialize()
-                self._shared_models_loaded = True
-            else:
-                await session.initialize()
+            await self._ensure_shared_models()
+            session._vad = self._shared_vad
+            session._asr = self._shared_asr
+            session._tts = self._shared_tts
+
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent))
+            from importlib import import_module
+            speech = import_module("speech-server")
+            session._llm = speech.LLMClient(base_url=self.llm_url)
+
+            session.messages.append({
+                "role": "system",
+                "content": (
+                    "You are a helpful voice assistant. Keep responses concise and conversational. "
+                    "Respond naturally as if speaking aloud."
+                ),
+            })
 
             await websocket.send(json.dumps({
                 "type": "session.created",
@@ -200,10 +234,10 @@ class RealtimeServer:
             return
 
         if len(samples) > 0 and SAMPLE_RATE != WHISPER_RATE:
-            ratio = WHISPER_RATE / SAMPLE_RATE
-            n_out = int(len(samples) * ratio)
-            indices = np.linspace(0, len(samples) - 1, n_out).astype(int)
-            samples_16k = samples[indices]
+            n_out = int(len(samples) * WHISPER_RATE / SAMPLE_RATE)
+            x_old = np.linspace(0, 1, len(samples))
+            x_new = np.linspace(0, 1, n_out)
+            samples_16k = np.interp(x_new, x_old, samples).astype(np.float32)
         else:
             samples_16k = samples
 
@@ -272,6 +306,9 @@ class RealtimeServer:
         async for delta in session._llm.stream_chat(
             session.messages, max_tokens=256, temperature=0.7
         ):
+            if delta.startswith("<|channel>") or delta.startswith("<|"):
+                continue
+
             now = time.time()
             if first_token_time is None:
                 first_token_time = now
@@ -308,7 +345,9 @@ class RealtimeServer:
                 if audio is not None:
                     if first_audio_time is None:
                         first_audio_time = time.time()
-                    pcm_s16 = (audio * 32767).astype(np.int16)
+                    peak = np.abs(audio).max()
+                    safe = audio / max(peak, 1.0)
+                    pcm_s16 = (safe * 32767).astype(np.int16)
                     b64 = base64.b64encode(pcm_s16.tobytes()).decode("ascii")
                     await websocket.send(json.dumps({
                         "type": "audio.chunk",
@@ -326,7 +365,9 @@ class RealtimeServer:
             if audio is not None:
                 if first_audio_time is None:
                     first_audio_time = time.time()
-                pcm_s16 = (audio * 32767).astype(np.int16)
+                peak = np.abs(audio).max()
+                safe = audio / max(peak, 1.0)
+                pcm_s16 = (safe * 32767).astype(np.int16)
                 b64 = base64.b64encode(pcm_s16.tobytes()).decode("ascii")
                 await websocket.send(json.dumps({
                     "type": "audio.chunk",

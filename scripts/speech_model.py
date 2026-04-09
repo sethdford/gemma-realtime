@@ -60,19 +60,23 @@ class SpeechModelConfig:
 
     @property
     def total_audio_vocab(self) -> int:
+        """Per-stream audio vocab: n_codebooks * codebook_size."""
         return self.codec_vocab_size * self.n_codebooks
 
     @property
+    def total_audio_tokens(self) -> int:
+        """Total audio embedding slots: user stream + agent stream + specials."""
+        return self.total_audio_vocab * 2 + 10
+
+    @property
     def extended_vocab_size(self) -> int:
-        return self.text_vocab_size + self.total_audio_vocab + 10
+        return self.text_vocab_size + self.total_audio_tokens
 
     AUDIO_TOKEN_OFFSET = 256000
-    USER_STREAM_OFFSET = 256000
-    AGENT_STREAM_OFFSET = 256000 + 4096 * 3
-    TEXT_BOS = 256000 + 4096 * 6
-    TEXT_EOS = 256000 + 4096 * 6 + 1
-    AUDIO_BOS = 256000 + 4096 * 6 + 2
-    AUDIO_EOS = 256000 + 4096 * 6 + 3
+    USER_STREAM_OFFSET = 0
+    AGENT_STREAM_OFFSET = 4096 * 3
+    SPECIAL_BOS = 4096 * 6
+    SPECIAL_EOS = 4096 * 6 + 1
 
 
 class ExtendedEmbedding(nn.Module):
@@ -85,7 +89,7 @@ class ExtendedEmbedding(nn.Module):
     def __init__(self, config: SpeechModelConfig):
         super().__init__()
         self.config = config
-        self.audio_embedding = nn.Embedding(config.total_audio_vocab + 10, config.llm_dim)
+        self.audio_embedding = nn.Embedding(config.total_audio_tokens, config.llm_dim)
         self._text_embedding = None
 
     def set_text_embedding(self, text_embed_weight: mx.array):
@@ -299,16 +303,14 @@ class SpeechToSpeechModel(nn.Module):
         parts = []
 
         if user_audio_tokens is not None:
-            user_offset = mx.array(self.config.USER_STREAM_OFFSET, dtype=mx.int32)
-            user_ids = user_audio_tokens + user_offset
+            user_ids = user_audio_tokens + self.config.AUDIO_TOKEN_OFFSET + self.config.USER_STREAM_OFFSET
             parts.append(self.embedding(user_ids))
 
         if text_tokens is not None:
             parts.append(self.embedding(text_tokens))
 
         if agent_audio_tokens is not None:
-            agent_offset = mx.array(self.config.AGENT_STREAM_OFFSET, dtype=mx.int32)
-            agent_ids = agent_audio_tokens + agent_offset
+            agent_ids = agent_audio_tokens + self.config.AUDIO_TOKEN_OFFSET + self.config.AGENT_STREAM_OFFSET
             parts.append(self.embedding(agent_ids))
 
         if not parts:
