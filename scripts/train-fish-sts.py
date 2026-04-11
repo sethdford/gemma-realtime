@@ -22,29 +22,19 @@ Three-phase training to build a text-free STS system:
         Loss: cb0 generation + inner monologue + turn-state prediction.
 
 Usage:
-    # Phase A only (quick, validates everything works)
-    python3 scripts/train-fish-sts.py phase-a \\
-        --data data/libritts-multicodebook.jsonl \\
-        --iters 2000 --lr 3e-4
+    # SNAC proxy training (existing pipeline)
+    python3 scripts/train-fish-sts.py all --codec snac
 
-    # Phase B (requires Phase A weights)
-    python3 scripts/train-fish-sts.py phase-b \\
-        --data data/libritts-multicodebook.jsonl \\
-        --iters 20000 --lr 1e-4
-
-    # Phase C (requires Phase B weights)
-    python3 scripts/train-fish-sts.py phase-c \\
-        --data data/libritts-multicodebook.jsonl \\
-        --iters 50000 --lr 5e-5
-
-    # Extract Fish codec tokens from existing audio data
+    # Fish DAC training (requires extract step first)
     python3 scripts/train-fish-sts.py extract \\
         --input data/libritts-codec-train-full-eos.jsonl \\
-        --output data/libritts-fish-tokens.jsonl
+        --output data/libritts-fish-dac-tokens.jsonl
+    python3 scripts/train-fish-sts.py all --codec fish
 
-    # All phases sequentially
-    python3 scripts/train-fish-sts.py all \\
-        --data data/libritts-multicodebook.jsonl
+    # Individual phases with Fish DAC
+    python3 scripts/train-fish-sts.py phase-a --codec fish --iters 2000 --lr 3e-4
+    python3 scripts/train-fish-sts.py phase-b --codec fish --iters 20000 --lr 1e-4
+    python3 scripts/train-fish-sts.py phase-c --codec fish --iters 50000 --lr 5e-5
 """
 
 import argparse
@@ -62,8 +52,27 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 FISH_CODEBOOK_SIZE = 1024
+FISH_N_CODEBOOKS = 8
 SNAC_CODEBOOK_SIZE = 4096
+SNAC_N_CODEBOOKS = 3
 OUTPUT_DIR = Path("adapters/fish-sts")
+
+# Default data paths per codec
+DEFAULT_DATA = {
+    "snac": "data/libritts-multicodebook.jsonl",
+    "fish": "data/libritts-fish-dac-tokens.jsonl",
+}
+
+
+def resolve_codec_config(args):
+    """Resolve data path and codec parameters from --codec flag."""
+    codec = getattr(args, "codec", "snac")
+    if args.data is None:
+        args.data = DEFAULT_DATA[codec]
+    if codec == "fish":
+        return FISH_CODEBOOK_SIZE, FISH_N_CODEBOOKS, "fish_cb0"
+    else:
+        return SNAC_CODEBOOK_SIZE, SNAC_N_CODEBOOKS, "cb0"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -214,13 +223,20 @@ def train_phase_a(args):
     """
     from fish_sts import FishSpeechToSpeech, FishSTSConfig, PRESET_CONFIGS
 
+    cb_size, n_cbs, cb0_key = resolve_codec_config(args)
+
     print(f"\n{'='*60}")
     print(f"  Phase A: Projection Warm-up")
-    print(f"  Aligning cb0 token space ↔ Gemma embedding space")
+    print(f"  Codec: {'Fish DAC' if cb0_key == 'fish_cb0' else 'SNAC'} "
+          f"({cb_size} vocab, {n_cbs} codebooks)")
+    print(f"  Data: {args.data}")
     print(f"{'='*60}")
 
-    # Load data (use multicodebook data with SNAC cb0 as semantic proxy)
-    data = load_multicodebook_data(args.data)
+    # Load data
+    if cb0_key == "fish_cb0":
+        data = load_fish_token_data(args.data)
+    else:
+        data = load_multicodebook_data(args.data)
     np.random.shuffle(data)
     n_valid = min(200, len(data) // 10)
     valid_data = data[:n_valid]
@@ -244,8 +260,8 @@ def train_phase_a(args):
     config = PRESET_CONFIGS.get(args.target, PRESET_CONFIGS["e4b"])
     config = FishSTSConfig(
         llm_dim=llm_dim,
-        fish_codebook_size=SNAC_CODEBOOK_SIZE,  # SNAC cb0 as proxy
-        fish_n_codebooks=3,
+        fish_codebook_size=cb_size,
+        fish_n_codebooks=n_cbs,
         speech_adapter_dim=512,
         speech_adapter_heads=8,
         speech_adapter_layers=4,
@@ -282,7 +298,7 @@ def train_phase_a(args):
 
     for step in range(1, args.iters + 1):
         item = train_data[np.random.randint(0, len(train_data))]
-        cb0 = item["cb0"]
+        cb0 = item.get(cb0_key) or item.get("cb0")
         text = item["text"]
 
         max_cb0 = min(len(cb0), 100)
@@ -353,7 +369,7 @@ def train_phase_a(args):
             val_losses = []
             for vi in range(min(50, len(valid_data))):
                 v = valid_data[vi]
-                vcb0 = v["cb0"][:50]
+                vcb0 = (v.get(cb0_key) or v.get("cb0"))[:50]
                 vtext = v["text"]
                 if not vcb0 or not vtext:
                     continue
@@ -402,12 +418,18 @@ def train_phase_b(args):
     """
     from fish_sts import FishSpeechToSpeech, FishSTSConfig, PRESET_CONFIGS
 
+    cb_size, n_cbs, cb0_key = resolve_codec_config(args)
+
     print(f"\n{'='*60}")
     print(f"  Phase B: Speech Layer Pre-training")
-    print(f"  Next-token prediction on cb0 sequences")
+    print(f"  Codec: {'Fish DAC' if cb0_key == 'fish_cb0' else 'SNAC'} "
+          f"({cb_size} vocab, {n_cbs} codebooks)")
     print(f"{'='*60}")
 
-    data = load_multicodebook_data(args.data)
+    if cb0_key == "fish_cb0":
+        data = load_fish_token_data(args.data)
+    else:
+        data = load_multicodebook_data(args.data)
     np.random.shuffle(data)
     n_valid = min(200, len(data) // 10)
     valid_data = data[:n_valid]
@@ -427,8 +449,8 @@ def train_phase_b(args):
 
     config = FishSTSConfig(
         llm_dim=llm_dim,
-        fish_codebook_size=SNAC_CODEBOOK_SIZE,
-        fish_n_codebooks=3,
+        fish_codebook_size=cb_size,
+        fish_n_codebooks=n_cbs,
         speech_adapter_dim=512,
         speech_adapter_heads=8,
         speech_adapter_layers=4,
@@ -474,7 +496,7 @@ def train_phase_b(args):
 
     for step in range(1, args.iters + 1):
         item = train_data[np.random.randint(0, len(train_data))]
-        cb0 = item["cb0"]
+        cb0 = item.get(cb0_key) or item.get("cb0")
         text = item["text"]
 
         max_len = min(len(cb0), 80)
@@ -550,7 +572,7 @@ def train_phase_b(args):
             val_losses = []
             for vi in range(min(50, len(valid_data))):
                 v = valid_data[vi]
-                vcb0 = v["cb0"][:50]
+                vcb0 = (v.get(cb0_key) or v.get("cb0"))[:50]
                 if len(vcb0) < 5:
                     continue
                 vin = mx.array([vcb0[:-1]], dtype=mx.int32)
@@ -593,12 +615,18 @@ def train_phase_c(args):
     """
     from fish_sts import FishSpeechToSpeech, FishSTSConfig
 
+    cb_size, n_cbs, cb0_key = resolve_codec_config(args)
+
     print(f"\n{'='*60}")
     print(f"  Phase C: Joint STS Fine-tuning")
-    print(f"  Full audio-in → audio-out training")
+    print(f"  Codec: {'Fish DAC' if cb0_key == 'fish_cb0' else 'SNAC'} "
+          f"({cb_size} vocab, {n_cbs} codebooks)")
     print(f"{'='*60}")
 
-    data = load_multicodebook_data(args.data)
+    if cb0_key == "fish_cb0":
+        data = load_fish_token_data(args.data)
+    else:
+        data = load_multicodebook_data(args.data)
     np.random.shuffle(data)
     n_valid = min(200, len(data) // 10)
     valid_data = data[:n_valid]
@@ -618,8 +646,8 @@ def train_phase_c(args):
 
     config = FishSTSConfig(
         llm_dim=llm_dim,
-        fish_codebook_size=SNAC_CODEBOOK_SIZE,
-        fish_n_codebooks=3,
+        fish_codebook_size=cb_size,
+        fish_n_codebooks=n_cbs,
         speech_adapter_dim=512,
         speech_adapter_heads=8,
         speech_adapter_layers=4,
@@ -680,8 +708,8 @@ def train_phase_c(args):
         user_item = train_data[idx1]
         resp_item = train_data[idx2]
 
-        user_cb0 = user_item["cb0"][:40]
-        resp_cb0 = resp_item["cb0"][:60]
+        user_cb0 = (user_item.get(cb0_key) or user_item.get("cb0"))[:40]
+        resp_cb0 = (resp_item.get(cb0_key) or resp_item.get("cb0"))[:60]
         resp_text = resp_item["text"]
 
         if len(user_cb0) < 3 or len(resp_cb0) < 3:
@@ -767,7 +795,7 @@ def train_phase_c(args):
             val_losses = []
             for vi in range(min(30, len(valid_data))):
                 v = valid_data[vi]
-                vcb0 = v["cb0"][:40]
+                vcb0 = (v.get(cb0_key) or v.get("cb0"))[:40]
                 if len(vcb0) < 5:
                     continue
                 vin = mx.array([vcb0[:-1]], dtype=mx.int32)
@@ -819,43 +847,39 @@ def main():
     p_ext.add_argument("--input", default="data/libritts-codec-train-full-eos.jsonl")
     p_ext.add_argument("--output", default="data/libritts-fish-tokens.jsonl")
 
+    # Shared args factory for all training phases
+    def _add_train_args(p, lr, iters, report=50, save=500):
+        p.add_argument("--data", default=None,
+                       help="Training data JSONL (auto-detected from --codec if omitted)")
+        p.add_argument("--model", default="mlx-community/gemma-4-26b-a4b-it-4bit")
+        p.add_argument("--target", default="e4b")
+        p.add_argument("--codec", choices=["snac", "fish"], default="snac",
+                       help="Codec: snac (3 CB, 4096 vocab) or fish (8 CB, 1024 vocab)")
+        p.add_argument("--lr", type=float, default=lr)
+        p.add_argument("--iters", type=int, default=iters)
+        p.add_argument("--report-every", type=int, default=report)
+        p.add_argument("--save-every", type=int, default=save)
+
     # Phase A
     p_a = sub.add_parser("phase-a", help="Phase A: projection warm-up")
-    p_a.add_argument("--data", default="data/libritts-multicodebook.jsonl")
-    p_a.add_argument("--model", default="mlx-community/gemma-4-26b-a4b-it-4bit")
-    p_a.add_argument("--target", default="e4b")
-    p_a.add_argument("--lr", type=float, default=3e-4)
-    p_a.add_argument("--iters", type=int, default=2000)
-    p_a.add_argument("--report-every", type=int, default=50)
-    p_a.add_argument("--save-every", type=int, default=500)
+    _add_train_args(p_a, lr=3e-4, iters=2000, report=50, save=500)
 
     # Phase B
     p_b = sub.add_parser("phase-b", help="Phase B: speech layer pre-training")
-    p_b.add_argument("--data", default="data/libritts-multicodebook.jsonl")
-    p_b.add_argument("--model", default="mlx-community/gemma-4-26b-a4b-it-4bit")
-    p_b.add_argument("--target", default="e4b")
-    p_b.add_argument("--lr", type=float, default=1e-4)
-    p_b.add_argument("--iters", type=int, default=20000)
-    p_b.add_argument("--report-every", type=int, default=100)
-    p_b.add_argument("--save-every", type=int, default=2000)
+    _add_train_args(p_b, lr=1e-4, iters=20000, report=100, save=2000)
 
     # Phase C
     p_c = sub.add_parser("phase-c", help="Phase C: joint STS fine-tuning")
-    p_c.add_argument("--data", default="data/libritts-multicodebook.jsonl")
-    p_c.add_argument("--model", default="mlx-community/gemma-4-26b-a4b-it-4bit")
-    p_c.add_argument("--target", default="e4b")
-    p_c.add_argument("--lr", type=float, default=5e-5)
-    p_c.add_argument("--iters", type=int, default=50000)
-    p_c.add_argument("--report-every", type=int, default=200)
-    p_c.add_argument("--save-every", type=int, default=5000)
+    _add_train_args(p_c, lr=5e-5, iters=50000, report=200, save=5000)
     p_c.add_argument("--cleanup-prior", action="store_true",
                      help="Delete Phase B weights after loading to free disk")
 
     # All phases
     p_all = sub.add_parser("all", help="Run all phases sequentially")
-    p_all.add_argument("--data", default="data/libritts-multicodebook.jsonl")
+    p_all.add_argument("--data", default=None)
     p_all.add_argument("--model", default="mlx-community/gemma-4-26b-a4b-it-4bit")
     p_all.add_argument("--target", default="e4b")
+    p_all.add_argument("--codec", choices=["snac", "fish"], default="snac")
 
     args = parser.parse_args()
 

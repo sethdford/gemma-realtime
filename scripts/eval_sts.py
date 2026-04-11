@@ -311,7 +311,7 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         meta = json.load(f)
 
     # Phase 3: Metrics (runs in-process — Whisper small fits easily)
-    print("  Phase 3: Metrics (WER + MOS)...", flush=True)
+    print("  Phase 3: Metrics (WER + MOS + speaker similarity)...", flush=True)
     import soundfile as sf
     for i, text in enumerate(texts):
         key = str(i)
@@ -328,11 +328,21 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         mos = estimate_mos(audio, sr=sr)
         metrics.mos_scores.append(mos)
 
+        ref_path = eval_items[i].get("audio_path") if i < len(eval_items) else None
+        if ref_path and Path(ref_path).exists():
+            ref_audio, ref_sr = sf.read(ref_path)
+            ref_audio = ref_audio.astype(np.float32)
+            if ref_audio.ndim > 1:
+                ref_audio = ref_audio.mean(axis=1)
+            sim = speaker_similarity(ref_audio, audio, sr=sr)
+            metrics.speaker_sims.append(sim)
+
         transcript = whisper_transcribe(audio, sr=sr)
         wer = compute_wer(text, transcript)
         metrics.wer = (metrics.wer * metrics.wer_count + wer) / (metrics.wer_count + 1)
         metrics.wer_count += 1
-        print(f"    [{i+1}] WER={wer:.2f} MOS~{mos:.1f} — \"{transcript[:60]}\"", flush=True)
+        spk_str = f" spk={sim:.3f}" if ref_path and Path(ref_path).exists() else ""
+        print(f"    [{i+1}] WER={wer:.2f} MOS~{mos:.1f}{spk_str} — \"{transcript[:60]}\"", flush=True)
 
     return metrics
 
@@ -412,9 +422,10 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
     with open(meta_path) as f:
         meta = json.load(f)
 
-    # Phase 2: WER + MOS (Whisper + scipy — in-process, small models)
-    print("  Phase 2: Metrics (WER + MOS)...", flush=True)
+    # Phase 2: WER + MOS + voice consistency (Whisper + scipy — in-process, small models)
+    print("  Phase 2: Metrics (WER + MOS + voice consistency)...", flush=True)
     import soundfile as sf
+    prev_audio = None
     for i, text in enumerate(texts):
         key = str(i)
         if key not in meta:
@@ -429,6 +440,11 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
 
         mos = estimate_mos(audio, sr=sr)
         metrics.mos_scores.append(mos)
+
+        if prev_audio is not None:
+            sim = speaker_similarity(prev_audio, audio, sr=sr)
+            metrics.speaker_sims.append(sim)
+        prev_audio = audio
 
         transcript = whisper_transcribe(audio, sr=sr)
         wer = compute_wer(text, transcript)

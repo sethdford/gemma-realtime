@@ -268,8 +268,8 @@ def test_ws_native_tts():
     print(f"{'─'*60}")
 
     ws_mod = import_module("realtime-ws")
-    server = ws_mod.RealtimeServer(host="127.0.0.1", port=18745, native_tts=True)
-    check("Server.native_tts = True", server.native_tts is True)
+    server = ws_mod.RealtimeServer(host="127.0.0.1", port=18745, tts_backend="native")
+    check("Server.tts_backend = native", server.tts_backend == "native")
 
     engine = ws_mod.NativeTTSEngine()
     check("NativeTTSEngine constructible", engine is not None)

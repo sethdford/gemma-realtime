@@ -110,8 +110,14 @@ python3 scripts/speech-server.py --tts kokoro
 
 # ── True Speech-to-Speech (Fish codec, no text bottleneck) ──
 
-# Train the full STS pipeline (Phase A → B → C)
-python3 scripts/train-fish-sts.py all --data data/libritts-multicodebook.jsonl
+# Train STS with SNAC proxy (fast iteration, 3 codebooks)
+python3 scripts/train-fish-sts.py all --codec snac
+
+# Train STS with real Fish DAC (8 codebooks, 44.1kHz, production quality)
+python3 scripts/train-fish-sts.py extract \
+  --input data/libritts-codec-train-full-eos.jsonl \
+  --output data/libritts-fish-dac-tokens.jsonl
+python3 scripts/train-fish-sts.py all --codec fish
 
 # Run the STS WebSocket server (auto-loads trained weights from adapters/fish-sts/)
 python3 scripts/realtime-ws.py --tts fish
@@ -119,8 +125,9 @@ python3 scripts/realtime-ws.py --tts fish
 # Prove the Fish STS pipeline end-to-end
 python3 scripts/prove-fish-sts.py
 
-# Evaluate STS quality: WER, MOS proxy, latency
+# Evaluate STS quality: WER, MOS proxy, speaker similarity, latency
 python3 scripts/eval_sts.py --pipeline fish
+python3 scripts/eval_sts.py --pipeline cascaded  # Voxtral TTS baseline
 ```
 
 ### h-uman Integration
@@ -272,10 +279,14 @@ scripts/
 ├── prepare-training-data.py     # Combine sources → train/valid splits
 ├── finetune-gemma.py            # LoRA pipeline (SFT + DPO + quantize)
 ├── mlx-server.py                # MLX inference server (OpenAI-compatible)
-├── ollama-serve.sh              # Ollama serving script
-├── llamacpp-serve.sh            # llama.cpp Metal server
-├── vllm-metal-serve.sh          # vLLM Metal server
-├── ane-gpu-bridge.py            # ANE+GPU dual-compute bridge
+├── speech-server.py             # Cascaded ASR → LLM → TTS server
+├── realtime-ws.py               # WebSocket realtime API (all TTS backends)
+├── train-fish-sts.py            # True STS training (Phase A/B/C, --codec snac|fish)
+├── fish_sts.py                  # MOSS-Speech architecture + STS pipeline
+├── fish_dac_loader.py           # Standalone Fish Audio DAC codec loader
+├── codec.py                     # Unified codec abstraction (SNAC, Fish DAC, etc.)
+├── eval_sts.py                  # STS evaluation harness (WER, MOS, speaker sim)
+├── voxtral_speculative.py       # Voxtral draft heads + speculative decoding
 ├── voice-bench.py               # Single-backend voice benchmark
 └── bench-all-backends.py        # Head-to-head comparison
 

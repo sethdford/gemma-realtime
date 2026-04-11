@@ -223,17 +223,27 @@ python3 scripts/codec.py --codec fish
 
 **Training:**
 
-```bash
-# Full pipeline (Phase A → B → C)
-python3 scripts/train-fish-sts.py all --data data/libritts-multicodebook.jsonl
+Two codec modes: `snac` (fast iteration, 3 codebooks, 4096 vocab) or `fish` (production quality, 8 codebooks, 1024 vocab).
 
-# Individual phases
-python3 scripts/train-fish-sts.py phase-a --data data/libritts-multicodebook.jsonl --iters 2000
-python3 scripts/train-fish-sts.py phase-b --data data/libritts-multicodebook.jsonl --iters 20000
-python3 scripts/train-fish-sts.py phase-c --data data/libritts-multicodebook.jsonl --iters 50000
+```bash
+# SNAC proxy training (quick, lower-fidelity)
+python3 scripts/train-fish-sts.py all --codec snac
+
+# Fish DAC training (production quality — requires extract step first)
+python3 scripts/train-fish-sts.py extract \
+  --input data/libritts-codec-train-full-eos.jsonl \
+  --output data/libritts-fish-dac-tokens.jsonl
+python3 scripts/train-fish-sts.py all --codec fish
+
+# Individual phases (both codecs)
+python3 scripts/train-fish-sts.py phase-a --codec fish --iters 2000
+python3 scripts/train-fish-sts.py phase-b --codec fish --iters 20000
+python3 scripts/train-fish-sts.py phase-c --codec fish --iters 50000
 ```
 
-Weights are saved to `adapters/fish-sts/{phase-a,phase-b,phase-c}/`. The pipeline auto-resolves weights in order: Phase C → B → A.
+Weights are saved to `adapters/fish-sts/{phase-a,phase-b,phase-c}/`. The pipeline auto-resolves weights in order: Phase C → B → A. `config_from_weights()` infers codec dimensions from saved weights, so switching between SNAC and Fish DAC trained weights is automatic.
+
+**Fish DAC loader (`fish_dac_loader.py`):** Standalone loader that reconstructs Fish Audio's `FireflyArchitecture` (ConvNeXtEncoder + FSQ quantizer + HiFiGAN) from the raw `.pth` checkpoint, enabling full 8-codebook, 44.1kHz encode/decode without installing `fish-speech`.
 
 **Proving and evaluation:**
 
@@ -241,8 +251,9 @@ Weights are saved to `adapters/fish-sts/{phase-a,phase-b,phase-c}/`. The pipelin
 # Comprehensive proof (codec roundtrip, projection alignment, full audio→audio, duplex state)
 python3 scripts/prove-fish-sts.py
 
-# Quantitative evaluation (WER via Whisper re-transcription, MOS proxy, RTF)
+# Quantitative evaluation (WER via Whisper re-transcription, MOS proxy, speaker similarity, RTF)
 python3 scripts/eval_sts.py --pipeline fish
+python3 scripts/eval_sts.py --pipeline cascaded  # Voxtral TTS baseline for comparison
 ```
 
 **What's wired end-to-end in `FishSTSPipeline.process_audio`:**
@@ -356,7 +367,13 @@ scripts/
 ├── train-speech-adapter.py   # Phase 4: 3-stage training pipeline
 ├── speech_model.py           # Phase 5: Full S2S model (inner monologue, dual-stream)
 ├── hw_accel.py               # Phase 6: TurboQuant+, IOSurface, EAGLE
-└── fish_sts.py               # Phase 7: True STS on Fish Audio's codec + MOSS-Speech
+├── fish_sts.py               # Phase 7: True STS on Fish Audio's codec + MOSS-Speech
+├── fish_dac_loader.py        # Phase 7: Standalone Fish Audio DAC codec loader
+├── train-fish-sts.py         # Phase 7: STS training pipeline (--codec snac|fish)
+├── eval_sts.py               # Phase 7: Eval harness (WER, MOS, speaker sim, RTF)
+├── voxtral_speculative.py    # Voxtral draft heads + speculative decoding
+├── draft_heads_resolve.py    # Auto-resolve draft head weights
+└── benchmark-tts.py          # TTS benchmark (standard vs speculative vs denoised)
 
 configs/
 ├── example-training-config.json   # Text fine-tuning config
