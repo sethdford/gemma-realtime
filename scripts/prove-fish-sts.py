@@ -189,12 +189,8 @@ def test_projections():
     probe = inner.embed_tokens(mx.array([[0]]))
     llm_dim = probe.shape[-1]
 
-    config = FishSTSConfig(
-        llm_dim=llm_dim, fish_codebook_size=4096, fish_n_codebooks=3,
-        inner_monologue=True,
-        speech_adapter_dim=512, speech_adapter_heads=8,
-        speech_adapter_layers=4, speech_adapter_ff=2048,
-    )
+    config = FishSTSPipeline.config_from_weights(str(w_path))
+    config.llm_dim = llm_dim
     model = FishSpeechToSpeech(config)
     w = mx.load(str(w_path))
     model.load_weights(list(w.items()), strict=False)

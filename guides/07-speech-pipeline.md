@@ -167,7 +167,13 @@ Research-frontier features from Moshi (Kyutai):
 
 **Layer-Adaptive TurboQuant+**: First/last 4 layers in FP16 (quality-critical), middle layers at 3-bit TurboQuant (4.6x compression). Near-FP16 quality at ~3.5x total memory savings.
 
-**IOSurface Zero-Copy KV**: Shared memory between GPU and ANE for split inference. GPU does prefill, ANE does decode — no memory copies between processors.
+**libgemma_hw + IOSurface (default on macOS)**: Build with `make -C secret-apis libgemma_hw`. `IOSurfaceKVManager` in `hw_accel.py` uses real IOSurface memory when the dylib is present (CPU views stay locked until `release_all`). `native_hw.py` exposes Accelerate SGEMM and a **Metal selftest** (`newBufferWithBytesNoCopy` + compute shader) used by `prove-native-hw.py` and red-team Phase 6.
+
+**mlx-server.py**: `GET /health` includes an `iosurface` object (dylib path, load status). Optional staging: set `GEMMA_IOSURFACE_KV_BYTES` (e.g. `65536`); disable with `GEMMA_IOSURFACE_KV=0`.
+
+**realtime-ws.py**: After shared models load, logs a one-line `native_hw.health_payload_for_http` summary on macOS.
+
+**IOSurface Zero-Copy KV**: Shared memory between GPU and ANE for split inference. GPU does prefill, ANE does decode — no memory copies between processors. Metal wrapping of IOSurface-backed pointers is proven in-library; MLX KV still uses its own buffers unless you bridge explicitly.
 
 **EAGLE Draft Head (research)**: Sketch in `hw_accel.py` — lightweight head for audio-conditioned speculation at the **text-token** level; not the same as the **Voxtral MLP draft heads** (`voxtral_speculative.py`) used for frame-level codec prediction in TTS.
 

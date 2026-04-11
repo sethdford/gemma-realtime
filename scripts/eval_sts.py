@@ -210,13 +210,12 @@ def _phase1_embed(texts: list[str], cache_path: Path) -> None:
 
 
 def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path) -> None:
-    """Subprocess: load STS model + SNAC, generate audio, save wavs."""
+    """Subprocess: load STS model + codec, generate audio, save wavs."""
     import mlx.core as mx
     from fish_sts import FishSpeechToSpeech, FishSTSPipeline
     from codec import AudioCodec, CodecTokens, CodecType
     import soundfile as sf
 
-    print("  Phase 2: Speech generation (STS + SNAC)...", flush=True)
     w_path = FishSTSPipeline._resolve_weights(None)
     if w_path is None:
         print("    [SKIP] No trained STS weights")
@@ -227,8 +226,17 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path) -> None:
     model.load_weights(list(w.items()), strict=False)
     del w
 
-    codec = AudioCodec("snac")
-    codec.load()
+    use_fish_dac = config.fish_n_codebooks > 3
+    if use_fish_dac:
+        print("  Phase 2: Speech generation (STS + Fish DAC)...", flush=True)
+        codec = AudioCodec("fish")
+        codec.load()
+        codec_type = CodecType.FISH_DAC
+    else:
+        print("  Phase 2: Speech generation (STS + SNAC)...", flush=True)
+        codec = AudioCodec("snac")
+        codec.load()
+        codec_type = CodecType.SNAC
     sr = codec.sample_rate
 
     embs = np.load(str(emb_path))
@@ -255,7 +263,7 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path) -> None:
             codes=np.array(all_codes[0].tolist(), dtype=np.int64),
             n_codebooks=config.fish_n_codebooks,
             frame_rate=config.fish_frame_rate,
-            codec_type=CodecType.SNAC,
+            codec_type=codec_type,
         )
         audio_out = codec.decode(out_tokens)
         elapsed = time.time() - t0

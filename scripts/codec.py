@@ -519,7 +519,8 @@ class AudioCodec:
                 z = self._model.quantizer.from_codes(codes)[0]
                 audio = self._model.decode(z)
             elif self._fish_backend == "firefly":
-                # FireflyArchitecture.decode expects (B, n_codebooks, T)
+                fsq_max = 999  # prod([8,5,5,5]) - 1
+                codes = codes.clamp(0, fsq_max)
                 audio = self._model.decode(codes)
             else:
                 if hasattr(self._model, "decode"):
