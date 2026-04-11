@@ -15,39 +15,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Check Python syntax
+      - name: Check Python syntax (all scripts)
         run: |
-          python3 -m py_compile scripts/mlx-server.py
-          python3 -m py_compile scripts/finetune-gemma.py
-          python3 -m py_compile scripts/extract-facebook.py
-          python3 -m py_compile scripts/extract_imessage_pairs.py
-          python3 -m py_compile scripts/prepare-training-data.py
-          python3 -m py_compile scripts/voice-bench.py
-          python3 -m py_compile scripts/bench-all-backends.py
-          python3 -m py_compile scripts/ane-gpu-bridge.py
-          python3 -m py_compile scripts/speech-server.py
-          python3 -m py_compile scripts/realtime-ws.py
-          python3 -m py_compile scripts/streaming_asr.py
-          python3 -m py_compile scripts/codec.py
-          python3 -m py_compile scripts/speech_decoder.py
-          python3 -m py_compile scripts/speech_model.py
-          python3 -m py_compile scripts/voxtral_speculative.py
-          python3 -m py_compile scripts/collect-draft-data.py
-          python3 -m py_compile scripts/benchmark-tts.py
-          python3 -m py_compile scripts/draft_heads_resolve.py
-          python3 -m py_compile scripts/prove-voxtral-speculative-e2e.py
-          python3 -m py_compile scripts/fish_sts.py
-          python3 -m py_compile scripts/train-fish-sts.py
-          python3 -m py_compile scripts/prove-fish-sts.py
-          python3 -m py_compile scripts/eval_sts.py
-          python3 -m py_compile scripts/hw_accel.py
-          python3 -m py_compile scripts/sota_pipeline.py
+          for f in scripts/*.py; do
+            echo "  py_compile $f"
+            python3 -m py_compile "$f"
+          done
 
-      - name: Check shell syntax
+      - name: Check shell syntax (all scripts)
         run: |
-          bash -n scripts/ollama-serve.sh
-          bash -n scripts/llamacpp-serve.sh
-          bash -n scripts/vllm-metal-serve.sh
+          for f in scripts/*.sh; do
+            echo "  bash -n $f"
+            bash -n "$f"
+          done
 
       - name: Run unit tests
         run: |

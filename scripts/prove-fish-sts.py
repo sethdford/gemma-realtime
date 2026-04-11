@@ -478,10 +478,21 @@ def main():
         model = None
         test_generation(None, None, None)
 
-    # Reuse codec from test 2 and model from test 3/4 for tests 5-7
+    # Reuse codec from test 2 and model from test 3/4 for tests 5-7.
+    # If Fish DAC loaded but model was trained on SNAC (3 codebooks), use SNAC for pipeline.
     codec_obj = codec_name = None
     if codec_result and isinstance(codec_result, tuple) and len(codec_result) == 2:
         codec_obj, codec_name = codec_result
+    if model is not None and codec_obj is not None:
+        model_cbs = model.config.fish_n_codebooks
+        codec_cbs = codec_obj.config.n_codebooks
+        if model_cbs != codec_cbs:
+            print(f"\n  Model expects {model_cbs} codebooks but codec has {codec_cbs} — "
+                  f"loading SNAC for pipeline tests", flush=True)
+            from codec import AudioCodec
+            codec_obj = AudioCodec("snac")
+            codec_obj.load()
+            codec_name = "snac"
     test_full_pipeline(model, codec_obj, codec_name)
     test_duplex(model)
     test_eval_metrics(model, codec_obj, codec_name)

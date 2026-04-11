@@ -40,5 +40,8 @@ proof-artifacts/*.npz
 # Downloaded models
 models/
 
+# Scratch/test files
+test_*.wav
+
 # Compiled binaries
 secret-apis/build/

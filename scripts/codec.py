@@ -274,7 +274,36 @@ class AudioCodec:
         except (ImportError, Exception) as e:
             pass
 
-        # Path 3: Standalone PyTorch load from HuggingFace weights
+        # Path 3: Standalone Fish DAC loader (reconstructs FireflyArchitecture)
+        try:
+            from fish_dac_loader import load_fish_dac
+            from huggingface_hub import hf_hub_download
+
+            generator_path = hf_hub_download(
+                repo_id=self._fish_model_id,
+                filename="firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+            )
+            self._model = load_fish_dac(generator_path, device=self.device)
+            self._fish_backend = "firefly"
+            self.config = CodecConfig(
+                codec_type=CodecType.FISH_DAC,
+                sample_rate=44100,
+                frame_rate=21.5,
+                n_codebooks=8,
+                codebook_size=1024,
+                bandwidth_kbps=self.config.bandwidth_kbps,
+                latency_ms=self.config.latency_ms,
+                streaming=True,
+            )
+            self._loaded = True
+            print(f"  Codec: Fish DAC loaded via FireflyArchitecture "
+                  f"({self.config.n_codebooks} codebooks, {self.config.sample_rate}Hz, "
+                  f"~{self.config.frame_rate:.0f} Hz)", flush=True)
+            return
+        except (ImportError, Exception) as e:
+            pass
+
+        # Path 4: Raw state dict fallback (no encode/decode — will trigger SNAC fallback upstream)
         try:
             import torch
             from huggingface_hub import hf_hub_download
@@ -286,17 +315,13 @@ class AudioCodec:
             self._model = torch.load(generator_path, map_location="cpu", weights_only=False)
             if hasattr(self._model, "eval"):
                 self._model.eval()
-            if self.device == "mps" and torch.backends.mps.is_available():
-                self._model = self._model.to("mps") if hasattr(self._model, "to") else self._model
             self._fish_backend = "raw_torch"
             self._loaded = True
-            print(f"  Codec: Fish DAC loaded from raw weights ({self.config.n_codebooks} codebooks)", flush=True)
+            print(f"  Codec: Fish DAC loaded from raw weights ({self.config.n_codebooks} codebooks, no encode/decode)", flush=True)
             return
         except Exception as e:
             print(f"  Codec: Fish DAC failed to load: {e}", flush=True)
-            print("  Install one of:", flush=True)
-            print("    pip install fish-speech               # recommended", flush=True)
-            print("    pip install descript-audio-codec huggingface_hub", flush=True)
+            print("  Install: pip install vector_quantize_pytorch einops torchaudio", flush=True)
             raise RuntimeError(f"Fish DAC codec not available: {e}")
 
     def encode(self, audio: np.ndarray) -> CodecTokens:
@@ -452,6 +477,12 @@ class AudioCodec:
                 x_processed = self._model.preprocess(x, self.config.sample_rate)
                 _, codes, _, _, _ = self._model.encode(x_processed)
                 codes_np = codes.cpu().numpy().squeeze()
+            elif self._fish_backend == "firefly":
+                # FireflyArchitecture.encode expects (B, T) audio
+                if x.ndim == 3:
+                    x = x.squeeze(1)
+                codes = self._model.encode(x)
+                codes_np = codes.cpu().numpy().squeeze()
             else:
                 if hasattr(self._model, "encode"):
                     codes = self._model.encode(x)
@@ -487,6 +518,9 @@ class AudioCodec:
             elif self._fish_backend == "dac":
                 z = self._model.quantizer.from_codes(codes)[0]
                 audio = self._model.decode(z)
+            elif self._fish_backend == "firefly":
+                # FireflyArchitecture.decode expects (B, n_codebooks, T)
+                audio = self._model.decode(codes)
             else:
                 if hasattr(self._model, "decode"):
                     audio = self._model.decode(codes)

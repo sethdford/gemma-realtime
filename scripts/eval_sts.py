@@ -337,6 +337,108 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
     return metrics
 
 
+def _cascaded_generate(texts: list[str], audio_dir_str: str) -> None:
+    """Subprocess: Voxtral TTS for each text prompt."""
+    import soundfile as sf
+    audio_dir = Path(audio_dir_str)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from mlx_audio.tts.utils import load as mlx_audio_load
+    except ImportError:
+        print("    [FAIL] mlx-audio not installed (pip install mlx-audio)", flush=True)
+        return
+
+    model = mlx_audio_load("mlx-community/Voxtral-4B-TTS-2603-mlx-6bit")
+    voice = "cheerful_male"
+    sr = 24000
+
+    meta = {}
+    for i, text in enumerate(texts):
+        n_words = len(text.split())
+        max_tokens = min(max(n_words * 30, 200), 1200)
+        t0 = time.time()
+        try:
+            chunks = []
+            for r in model.generate(text=text, voice=voice, max_tokens=max_tokens):
+                if r.audio is not None:
+                    chunks.append(np.array(r.audio))
+            audio_np = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        except Exception as e:
+            print(f"    [{i+1}] Voxtral failed: {e}", flush=True)
+            continue
+
+        elapsed = time.time() - t0
+        if len(audio_np) < 100:
+            print(f"    [{i+1}] No audio output", flush=True)
+            continue
+
+        dur = len(audio_np) / sr
+        wav_path = audio_dir / f"sample_{i}.wav"
+        sf.write(str(wav_path), audio_np, sr)
+        meta[str(i)] = {"elapsed": elapsed, "dur": dur, "sr": sr}
+        print(f"    [{i+1}] {dur:.1f}s audio in {elapsed:.1f}s (RTF={elapsed/dur:.2f}x): {text[:50]}...",
+              flush=True)
+
+    with open(audio_dir / "meta.json", "w") as f:
+        json.dump(meta, f)
+
+
+def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
+    """Cascaded pipeline: text → Voxtral TTS → Whisper re-transcription → WER + MOS."""
+    import subprocess
+
+    metrics = STSMetrics()
+    texts = [item["text"][:200] for item in eval_items]
+
+    cache_dir = Path("data/.eval_cache_cascaded")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = cache_dir / "audio"
+
+    # Phase 1: Voxtral TTS (subprocess — needs ~4B model in memory)
+    print("  Phase 1: Voxtral TTS generation...", flush=True)
+    texts_json = json.dumps(texts)
+    code = (
+        f"import sys, json; sys.path.insert(0, {str(Path(__file__).parent)!r}); "
+        f"from eval_sts import _cascaded_generate; "
+        f"_cascaded_generate(json.loads({texts_json!r}), {str(audio_dir)!r})"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=False)
+    meta_path = audio_dir / "meta.json"
+    if r.returncode != 0 or not meta_path.exists():
+        print("  [FAIL] Phase 1 (Voxtral TTS) failed or OOM'd")
+        return metrics
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    # Phase 2: WER + MOS (Whisper + scipy — in-process, small models)
+    print("  Phase 2: Metrics (WER + MOS)...", flush=True)
+    import soundfile as sf
+    for i, text in enumerate(texts):
+        key = str(i)
+        if key not in meta:
+            continue
+        m = meta[key]
+        wav_path = audio_dir / f"sample_{i}.wav"
+        audio, sr = sf.read(str(wav_path))
+        audio = audio.astype(np.float32)
+
+        metrics.latencies_ms.append(m["elapsed"] * 1000)
+        metrics.rtfs.append(m["elapsed"] / m["dur"] if m["dur"] > 0 else 0)
+
+        mos = estimate_mos(audio, sr=sr)
+        metrics.mos_scores.append(mos)
+
+        transcript = whisper_transcribe(audio, sr=sr)
+        wer = compute_wer(text, transcript)
+        metrics.wer = (metrics.wer * metrics.wer_count + wer) / (metrics.wer_count + 1)
+        metrics.wer_count += 1
+        print(f"    [{i+1}] WER={wer:.2f} MOS~{mos:.1f} — \"{transcript[:60]}\"", flush=True)
+
+    return metrics
+
+
 def run_eval(args) -> STSMetrics:
     if args.eval_set and Path(args.eval_set).exists():
         eval_items = load_eval_set(args.eval_set)
@@ -353,8 +455,10 @@ def run_eval(args) -> STSMetrics:
 
     if args.pipeline == "fish":
         metrics = _run_fish_eval(eval_items)
+    elif args.pipeline == "cascaded":
+        metrics = _run_cascaded_eval(eval_items)
     else:
-        print("  [cascaded pipeline eval not yet implemented — use --pipeline fish]")
+        print(f"  [unknown pipeline: {args.pipeline}]")
         metrics = STSMetrics()
 
     summary = metrics.summary()
