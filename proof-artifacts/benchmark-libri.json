@@ -1,0 +1,278 @@
+{
+  "standard_8step": [
+    {
+      "text": "Hello there.",
+      "n_words": 2,
+      "audio_s": 4.0,
+      "gen_s": 1.316,
+      "rtf": 0.3291,
+      "max_tokens": 50
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "n_words": 9,
+      "audio_s": 2.88,
+      "gen_s": 0.97,
+      "rtf": 0.3368,
+      "max_tokens": 90
+    },
+    {
+      "text": "How are you doing today? I hope everything is going well for you.",
+      "n_words": 13,
+      "audio_s": 3.28,
+      "gen_s": 1.115,
+      "rtf": 0.3399,
+      "max_tokens": 130
+    },
+    {
+      "text": "Machine learning models can now generate human quality speech in real time on co",
+      "n_words": 15,
+      "audio_s": 8.72,
+      "gen_s": 2.822,
+      "rtf": 0.3236,
+      "max_tokens": 150
+    },
+    {
+      "text": "The weather today is sunny with a high of seventy two degrees Fahrenheit and low",
+      "n_words": 19,
+      "audio_s": 4.96,
+      "gen_s": 1.666,
+      "rtf": 0.3358,
+      "max_tokens": 190
+    },
+    {
+      "text": "To be or not to be, that is the question. Whether tis nobler in the mind to suff",
+      "n_words": 25,
+      "audio_s": 16.32,
+      "gen_s": 5.252,
+      "rtf": 0.3218,
+      "max_tokens": 250
+    },
+    {
+      "text": "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet hole, fill",
+      "n_words": 26,
+      "audio_s": 8.72,
+      "gen_s": 2.883,
+      "rtf": 0.3307,
+      "max_tokens": 260
+    },
+    {
+      "text": "The acoustic transformer uses Euler integration with classifier free guidance, r",
+      "n_words": 17,
+      "audio_s": 13.6,
+      "gen_s": 4.301,
+      "rtf": 0.3162,
+      "max_tokens": 170
+    },
+    {
+      "text": "One, two, three, four, five. Testing numerical pronunciation and short pauses be",
+      "n_words": 16,
+      "audio_s": 7.76,
+      "gen_s": 2.491,
+      "rtf": 0.3211,
+      "max_tokens": 160
+    },
+    {
+      "text": "Can you believe it? This is amazing! I never thought we'd get here so quickly.",
+      "n_words": 15,
+      "audio_s": 4.88,
+      "gen_s": 1.61,
+      "rtf": 0.3298,
+      "max_tokens": 150
+    }
+  ],
+  "reduced_4step": [
+    {
+      "text": "Hello there.",
+      "n_words": 2,
+      "audio_s": 4.0,
+      "gen_s": 0.791,
+      "rtf": 0.1978,
+      "max_tokens": 50
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "n_words": 9,
+      "audio_s": 4.16,
+      "gen_s": 0.827,
+      "rtf": 0.1988,
+      "max_tokens": 90
+    },
+    {
+      "text": "How are you doing today? I hope everything is going well for you.",
+      "n_words": 13,
+      "audio_s": 4.16,
+      "gen_s": 0.823,
+      "rtf": 0.1979,
+      "max_tokens": 130
+    },
+    {
+      "text": "Machine learning models can now generate human quality speech in real time on co",
+      "n_words": 15,
+      "audio_s": 9.12,
+      "gen_s": 1.762,
+      "rtf": 0.1932,
+      "max_tokens": 150
+    },
+    {
+      "text": "The weather today is sunny with a high of seventy two degrees Fahrenheit and low",
+      "n_words": 19,
+      "audio_s": 7.92,
+      "gen_s": 1.55,
+      "rtf": 0.1957,
+      "max_tokens": 190
+    },
+    {
+      "text": "To be or not to be, that is the question. Whether tis nobler in the mind to suff",
+      "n_words": 25,
+      "audio_s": 20.0,
+      "gen_s": 3.875,
+      "rtf": 0.1938,
+      "max_tokens": 250
+    },
+    {
+      "text": "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet hole, fill",
+      "n_words": 26,
+      "audio_s": 6.88,
+      "gen_s": 1.362,
+      "rtf": 0.1979,
+      "max_tokens": 260
+    },
+    {
+      "text": "The acoustic transformer uses Euler integration with classifier free guidance, r",
+      "n_words": 17,
+      "audio_s": 13.6,
+      "gen_s": 2.603,
+      "rtf": 0.1914,
+      "max_tokens": 170
+    },
+    {
+      "text": "One, two, three, four, five. Testing numerical pronunciation and short pauses be",
+      "n_words": 16,
+      "audio_s": 12.8,
+      "gen_s": 2.455,
+      "rtf": 0.1918,
+      "max_tokens": 160
+    },
+    {
+      "text": "Can you believe it? This is amazing! I never thought we'd get here so quickly.",
+      "n_words": 15,
+      "audio_s": 6.56,
+      "gen_s": 1.308,
+      "rtf": 0.1994,
+      "max_tokens": 150
+    }
+  ],
+  "speculative": [
+    {
+      "text": "Hello there.",
+      "n_words": 2,
+      "audio_s": 4.0,
+      "gen_s": 0.89,
+      "rtf": 0.2225,
+      "frames": 50,
+      "lm_steps": 50,
+      "accept_rate": 0.185,
+      "acoustic_sim": 0.761
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "n_words": 9,
+      "audio_s": 7.2,
+      "gen_s": 1.44,
+      "rtf": 0.2,
+      "frames": 90,
+      "lm_steps": 90,
+      "accept_rate": 0.352,
+      "acoustic_sim": 0.777
+    },
+    {
+      "text": "How are you doing today? I hope everything is going well for you.",
+      "n_words": 13,
+      "audio_s": 5.92,
+      "gen_s": 1.19,
+      "rtf": 0.201,
+      "frames": 74,
+      "lm_steps": 74,
+      "accept_rate": 0.378,
+      "acoustic_sim": 0.81
+    },
+    {
+      "text": "Machine learning models can now generate human quality speech in real time on co",
+      "n_words": 15,
+      "audio_s": 6.24,
+      "gen_s": 1.27,
+      "rtf": 0.2035,
+      "frames": 78,
+      "lm_steps": 78,
+      "accept_rate": 0.098,
+      "acoustic_sim": 0.679
+    },
+    {
+      "text": "The weather today is sunny with a high of seventy two degrees Fahrenheit and low",
+      "n_words": 19,
+      "audio_s": 6.72,
+      "gen_s": 1.35,
+      "rtf": 0.2009,
+      "frames": 84,
+      "lm_steps": 84,
+      "accept_rate": 0.136,
+      "acoustic_sim": 0.708
+    },
+    {
+      "text": "To be or not to be, that is the question. Whether tis nobler in the mind to suff",
+      "n_words": 25,
+      "audio_s": 20.0,
+      "gen_s": 3.95,
+      "rtf": 0.1975,
+      "frames": 250,
+      "lm_steps": 250,
+      "accept_rate": 0.641,
+      "acoustic_sim": 0.843
+    },
+    {
+      "text": "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet hole, fill",
+      "n_words": 26,
+      "audio_s": 9.52,
+      "gen_s": 1.91,
+      "rtf": 0.2006,
+      "frames": 119,
+      "lm_steps": 119,
+      "accept_rate": 0.357,
+      "acoustic_sim": 0.846
+    },
+    {
+      "text": "The acoustic transformer uses Euler integration with classifier free guidance, r",
+      "n_words": 17,
+      "audio_s": 13.6,
+      "gen_s": 2.67,
+      "rtf": 0.1963,
+      "frames": 170,
+      "lm_steps": 170,
+      "accept_rate": 0.509,
+      "acoustic_sim": 0.845
+    },
+    {
+      "text": "One, two, three, four, five. Testing numerical pronunciation and short pauses be",
+      "n_words": 16,
+      "audio_s": 12.8,
+      "gen_s": 2.53,
+      "rtf": 0.1977,
+      "frames": 160,
+      "lm_steps": 160,
+      "accept_rate": 0.567,
+      "acoustic_sim": 0.88
+    },
+    {
+      "text": "Can you believe it? This is amazing! I never thought we'd get here so quickly.",
+      "n_words": 15,
+      "audio_s": 12.0,
+      "gen_s": 2.35,
+      "rtf": 0.1958,
+      "frames": 150,
+      "lm_steps": 150,
+      "accept_rate": 0.602,
+      "acoustic_sim": 0.896
+    }
+  ]
+}

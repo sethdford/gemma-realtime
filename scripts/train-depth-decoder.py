@@ -136,6 +136,18 @@ def extract_codebooks(args):
 # Depth Decoder Architecture
 # ══════════════════════════════════════════════════════════════
 
+DEPTH_DECODER_CONFIG = {
+    "codebook_size": 4096,
+    "d_model": 384,
+    "n_heads": 6,
+    "n_layers": 4,
+    "d_ff": 1536,
+    "cb1_ratio": 2,
+    "cb2_ratio": 4,
+    "dropout": 0.1,
+}
+
+
 class DepthDecoder(nn.Module):
     """Small transformer that upsamples cb0 tokens to cb1 + cb2.
 
@@ -216,6 +228,7 @@ class DepthDecoder(nn.Module):
             cb1_tokens: (1, N*cb1_ratio)
             cb2_tokens: (1, N*cb2_ratio)
         """
+        self.eval()
         cb1_logits, cb2_logits = self.__call__(cb0_tokens)
         cb1 = mx.argmax(cb1_logits, axis=-1)
         cb2 = mx.argmax(cb2_logits, axis=-1)

@@ -1,0 +1,10 @@
+{
+  "wer": 1.5185,
+  "mos_mean": 4.89,
+  "mos_std": 0.074,
+  "spk_sim_mean": null,
+  "latency_p50_ms": 1049.8,
+  "latency_p95_ms": 1158.6,
+  "rtf_mean": 0.2024,
+  "n_samples": 3
+}

@@ -29,8 +29,13 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 SAMPLE_RATE = 24000
 WHISPER_RATE = 16000
@@ -74,11 +79,20 @@ class SileroVAD:
             return rms > 0.01
 
         import torch
-        tensor = torch.from_numpy(audio_chunk_16k.astype(np.float32))
-        if tensor.abs().max() > 1.0:
-            tensor = tensor / 32768.0
-        confidence = self._model(tensor, WHISPER_RATE).item()
-        return confidence > self.threshold
+        audio_f32 = audio_chunk_16k.astype(np.float32)
+        if np.abs(audio_f32).max() > 1.0:
+            audio_f32 = audio_f32 / 32768.0
+
+        # Silero expects 512-sample chunks at 16kHz
+        chunk_size = 512
+        max_conf = 0.0
+        for start in range(0, len(audio_f32) - chunk_size + 1, chunk_size):
+            chunk = torch.from_numpy(audio_f32[start:start + chunk_size])
+            conf = self._model(chunk, 16000).item()
+            max_conf = max(max_conf, conf)
+            if conf > self.threshold:
+                return True
+        return max_conf > self.threshold
 
     def reset(self):
         if self._ready and hasattr(self._model, "reset_states"):
@@ -222,11 +236,19 @@ class TTSEngine:
         return self._available
 
 
+VOXTRAL_MODELS = {
+    "4bit": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",       # 2.5GB, ~0.22x RTF
+    "6bit": "mlx-community/Voxtral-4B-TTS-2603-mlx-6bit",       # 3.5GB, ~0.38x RTF
+    "bf16": "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16",       # 8GB,   ~1.06x RTF
+}
+
+
 class VoxtralTTSEngine:
     """Text-to-speech using Voxtral 4B via mlx-audio (CC BY-NC 4.0).
 
-    20 preset voices, 9 languages, 24kHz output, ~0.2-0.3x RTF on Apple Silicon.
-    Uses the 4-bit quantized model (~2.5GB) by default.
+    20 preset voices, 9 languages, 24kHz output.
+    Defaults to 6-bit quantized model (~3.5GB, 0.38x RTF) -- best quality/speed
+    balance for real-time pipelines. Use bf16 for maximum quality with streaming.
     """
 
     VOICES = [
@@ -237,31 +259,63 @@ class VoxtralTTSEngine:
         "pt_male", "pt_female", "ar_male", "hi_male", "hi_female",
     ]
 
-    def __init__(self, voice="casual_male",
-                 model_path="mlx-community/Voxtral-4B-TTS-2603-mlx-4bit"):
+    def __init__(self, voice="cheerful_male", model_path=None, precision="6bit",
+                 denoise_steps=4, draft_heads=None):
         self.voice = voice
-        self.model_path = model_path
+        self.model_path = model_path or VOXTRAL_MODELS.get(precision, VOXTRAL_MODELS["6bit"])
+        self.precision = precision
+        self.denoise_steps = denoise_steps
+        self.draft_heads_path = draft_heads
         self._model = None
+        self._draft_heads = None
         self._available = False
 
     def load(self):
         try:
             from mlx_audio.tts.utils import load as mlx_audio_load
-            print(f"  TTS: Loading Voxtral 4-bit from {self.model_path}...", flush=True)
+            print(f"  TTS: Loading Voxtral {self.precision} from {self.model_path}...", flush=True)
             self._model = mlx_audio_load(self.model_path)
+            if self.denoise_steps != 8:
+                self._model.acoustic_transformer.args.n_denoising_steps = self.denoise_steps
+            if self.draft_heads_path:
+                from voxtral_speculative import DraftHeadSet
+                self._draft_heads = DraftHeadSet.load(self.draft_heads_path)
+                print(f"  TTS: Draft heads loaded from {self.draft_heads_path}", flush=True)
             self._available = True
-            print(f"  TTS: Voxtral loaded (voice={self.voice}, model={self.model_path})", flush=True)
+            mode = "speculative" if self._draft_heads else "standard"
+            print(f"  TTS: Voxtral loaded (voice={self.voice}, precision={self.precision}, "
+                  f"denoise_steps={self.denoise_steps}, mode={mode})", flush=True)
         except Exception as e:
             print(f"  TTS: Voxtral not available — {e}", flush=True)
             print("    Install: pip install mlx-audio", flush=True)
             self._available = False
 
-    def synthesize(self, text: str) -> np.ndarray | None:
+    @staticmethod
+    def _estimate_max_frames(text, headroom=2.0):
+        """Duration-proportional frame cap to prevent runaway generation."""
+        n_words = len(text.split())
+        est_seconds = n_words / 2.5  # ~150 WPM = 2.5 WPS
+        max_frames = int(est_seconds * 12.5 * headroom)
+        return max(50, min(max_frames, 500))
+
+    def synthesize(self, text: str, max_tokens: int | None = None) -> np.ndarray | None:
+        """Blocking synthesis -- uses speculative decoding when draft heads are loaded."""
         if not self._available or not text.strip():
             return None
+        if max_tokens is None:
+            max_tokens = self._estimate_max_frames(text)
         try:
+            if self._draft_heads:
+                from voxtral_speculative import speculative_generate
+                audio, stats = speculative_generate(
+                    self._model, text, self.voice, self._draft_heads,
+                    max_tokens=max_tokens, verbose=True,
+                )
+                return audio if len(audio) > 0 else None
             chunks = []
-            for result in self._model.generate(text=text, voice=self.voice):
+            for result in self._model.generate(
+                text=text, voice=self.voice, max_tokens=max_tokens,
+            ):
                 if result.audio is not None:
                     chunks.append(np.array(result.audio))
             if not chunks:
@@ -270,6 +324,27 @@ class VoxtralTTSEngine:
         except Exception as e:
             print(f"  TTS error: {e}", flush=True)
             return None
+
+    def synthesize_stream(self, text: str, max_tokens: int | None = None):
+        """Streaming synthesis -- yields audio chunks as they're generated.
+
+        Each chunk is ~2s of audio, allowing playback to start before the full
+        sentence is synthesized. Critical for bf16 where RTF >= 1.0.
+        """
+        if not self._available or not text.strip():
+            return
+        if max_tokens is None:
+            max_tokens = self._estimate_max_frames(text)
+        try:
+            for result in self._model.generate(
+                text=text, voice=self.voice,
+                stream=True, streaming_interval=1.5,
+                max_tokens=max_tokens,
+            ):
+                if result.audio is not None:
+                    yield np.array(result.audio)
+        except Exception as e:
+            print(f"  TTS stream error: {e}", flush=True)
 
     @property
     def sample_rate(self) -> int:
@@ -465,8 +540,10 @@ async def run_speech_pipeline(args):
     asr = WhisperASR(model_name=args.whisper_model)
 
     if args.tts == "voxtral":
-        voice = args.voice or "casual_male"
-        tts = VoxtralTTSEngine(voice=voice)
+        voice = args.voice or "cheerful_male"
+        tts = VoxtralTTSEngine(voice=voice, precision=args.tts_precision,
+                               denoise_steps=args.denoise_steps,
+                               draft_heads=args.draft_heads)
     else:
         voice = args.voice or "af_bella"
         tts = TTSEngine(voice=voice, speed=args.speed)
@@ -531,6 +608,23 @@ async def run_speech_pipeline(args):
         await llm.close()
 
 
+def _play_tts_blocking(tts, text):
+    """Play TTS audio. Uses streaming for bf16 Voxtral (RTF > 1.0) to overlap
+    generation with playback; uses blocking synthesis for everything else."""
+    import sounddevice as sd
+    use_stream = (
+        hasattr(tts, 'synthesize_stream')
+        and getattr(tts, 'precision', None) == 'bf16'
+    )
+    if use_stream:
+        for chunk in tts.synthesize_stream(text):
+            sd.play(chunk, tts.sample_rate, blocking=True)
+    else:
+        audio = tts.synthesize(text)
+        if audio is not None:
+            sd.play(audio, tts.sample_rate, blocking=True)
+
+
 async def _text_loop(llm, tts, sentence_buf, conversation, args):
     """Text-only interactive loop (no microphone)."""
     while True:
@@ -566,17 +660,15 @@ async def _text_loop(llm, tts, sentence_buf, conversation, args):
             if tts.available:
                 sentences = sentence_buf.add(delta)
                 for s in sentences:
-                    audio = tts.synthesize(s)
-                    if audio is not None:
-                        import sounddevice as sd
-                        sd.play(audio, tts.sample_rate)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _play_tts_blocking, tts, s
+                    )
 
         remainder = sentence_buf.flush()
         if remainder and tts.available:
-            audio = tts.synthesize(remainder)
-            if audio is not None:
-                import sounddevice as sd
-                sd.play(audio, tts.sample_rate, blocking=True)
+            await asyncio.get_event_loop().run_in_executor(
+                None, _play_tts_blocking, tts, remainder
+            )
 
         elapsed = time.time() - t0
         ttft = (first_token - t0) if first_token else elapsed
@@ -652,6 +744,19 @@ async def _audio_loop(vad, asr, llm, tts, sentence_buf, conversation, audio_io, 
                 first_token = None
                 tts_threads = []
 
+                def _synth_and_play(text):
+                    use_stream = (
+                        hasattr(tts, 'synthesize_stream')
+                        and getattr(tts, 'precision', None) == 'bf16'
+                    )
+                    if use_stream:
+                        for chunk in tts.synthesize_stream(text):
+                            audio_io.play_audio(chunk)
+                    else:
+                        audio = tts.synthesize(text)
+                        if audio is not None:
+                            audio_io.play_audio(audio)
+
                 async for delta in llm.stream_chat(
                     conversation.get_messages(),
                     max_tokens=args.max_tokens,
@@ -664,24 +769,15 @@ async def _audio_loop(vad, asr, llm, tts, sentence_buf, conversation, audio_io, 
 
                     sentences = sentence_buf.add(delta)
                     for s in sentences:
-                        audio = await asyncio.get_event_loop().run_in_executor(
-                            None, tts.synthesize, s
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, _synth_and_play, s
                         )
-                        if audio is not None:
-                            t = audio_io.play_audio_async(audio)
-                            tts_threads.append(t)
 
                 remainder = sentence_buf.flush()
                 if remainder:
-                    audio = await asyncio.get_event_loop().run_in_executor(
-                        None, tts.synthesize, remainder
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _synth_and_play, remainder
                     )
-                    if audio is not None:
-                        t = audio_io.play_audio_async(audio)
-                        tts_threads.append(t)
-
-                for t in tts_threads:
-                    t.join()
 
                 elapsed = time.time() - t0
                 ttft = (first_token - t0) if first_token else elapsed
@@ -723,8 +819,27 @@ Examples:
         help="TTS backend: kokoro (82M, Apache 2.0) or voxtral (4B, CC BY-NC) (default: kokoro)",
     )
     parser.add_argument(
+        "--tts-precision", choices=["4bit", "6bit", "bf16"], default="6bit",
+        help="Voxtral model precision (default: 6bit, best speed/quality for real-time)",
+    )
+    parser.add_argument(
+        "--denoise-steps", type=int, default=4, choices=[2, 4, 6, 8],
+        help="Voxtral acoustic flow-matching denoising steps (default: 4, original: 8). "
+             "Lower = faster but may reduce quality. 4 gives ~1.9x speedup.",
+    )
+    parser.add_argument(
+        "--draft-heads", default=None,
+        help="Draft heads .safetensors for speculative decoding. If omitted with --tts voxtral, "
+        "uses VOXTRAL_DRAFT_HEADS or auto-detects heads-libri.safetensors / heads.safetensors.",
+    )
+    parser.add_argument(
+        "--no-draft-heads",
+        action="store_true",
+        help="Disable draft heads for Voxtral even if default weights exist",
+    )
+    parser.add_argument(
         "--voice", default=None,
-        help="TTS voice (kokoro: af_bella, voxtral: casual_male). Auto-selected if omitted.",
+        help="TTS voice (kokoro: af_bella, voxtral: cheerful_male). Auto-selected if omitted.",
     )
     parser.add_argument(
         "--speed", type=float, default=1.0,
@@ -761,6 +876,13 @@ Examples:
     args = parser.parse_args()
     if args.no_mic:
         args.text_only = True
+
+    from draft_heads_resolve import resolve_draft_heads_path
+
+    if args.tts == "voxtral":
+        args.draft_heads = None if args.no_draft_heads else resolve_draft_heads_path(args.draft_heads)
+    else:
+        args.draft_heads = None
 
     asyncio.run(run_speech_pipeline(args))
 

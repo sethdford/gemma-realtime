@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 """
-SOTA Real-Time Speech Pipeline for gemma-realtime.
-
-Integrates all improvements:
-    1. Streaming ASR with chunked Whisper (<150ms incremental)
-    2. Contextual speech decoder (conversation history conditioning)
-    3. Multi-codebook SNAC audio (depth decoder: cb0 → cb1+cb2)
-    4. Full-duplex with VAD + duplex state predictor
-    5. Sentence-level streaming TTS with audio chunk output
+Cascaded Real-Time Speech Pipeline for gemma-realtime.
 
 Architecture:
-    Audio In → StreamingASR+VAD → Gemma LLM (streaming) →
-    ContextualSpeechDecoder → DepthDecoder → SNAC 3-codebook → Audio Out
+    Audio In → Whisper ASR (streaming, mlx-whisper)
+    → Gemma LLM (streaming, multi-turn context)
+    → SpeechDecoder (embed_tokens → SNAC cb0 tokens)
+    → DepthDecoder (cb0 → cb1+cb2, multi-codebook)
+    → SNAC decode → Audio Out
 
-    Parallel: DuplexStatePredictor monitors for interruptions
+Components:
+    - StreamingASR+VAD: Whisper + Silero VAD, <150ms incremental
+    - SpeechDecoder: maps Gemma embeddings to SNAC cb0 tokens
+    - DepthDecoder: upsamples cb0 to 3-codebook for higher quality
+    - DuplexStatePredictor: LISTEN/SPEAK/INTERRUPT from embeddings
+    - SentenceBuffer: streams LLM output sentence-by-sentence to TTS
 
-Usage:
-    from sota_pipeline import SOTAPipeline
-    pipeline = SOTAPipeline()
-    pipeline.load()
-
-    # Text mode
-    for audio_chunk in pipeline.process_text("Hello, how are you?"):
-        play(audio_chunk)
-
-    # Full streaming mode
-    for event in pipeline.process_audio_stream(mic_chunks):
-        handle(event)
+Honest limitations:
+    - SpeechDecoder uses embed_tokens only (not transformer hidden states)
+    - First-audio latency ~500ms (dominated by LLM time-to-first-sentence)
+    - Depth decoder is early-stage (~0.6 nats/codebook above random)
 """
 
 import base64
@@ -105,7 +98,7 @@ class SOTAPipeline:
             try:
                 from importlib import import_module
                 tdd = import_module("train-depth-decoder")
-                self._depth_decoder = tdd.DepthDecoder()
+                self._depth_decoder = tdd.DepthDecoder(**tdd.DEPTH_DECODER_CONFIG)
                 weights = mx.load(self.depth_decoder_path)
                 self._depth_decoder.load_weights(list(weights.items()))
                 print(f"    Depth decoder loaded (3-codebook audio)", flush=True)
@@ -134,8 +127,9 @@ class SOTAPipeline:
         print(f"{'='*60}\n")
 
     def text_to_audio(self, text: str, max_tokens: int = 60) -> tuple[np.ndarray, dict]:
-        """Convert text response to audio using the full pipeline.
+        """Convert text input to LLM response audio.
 
+        Uses full conversation history for multi-turn context.
         Returns: (audio_np, metrics_dict)
         """
         import mlx.core as mx
@@ -146,10 +140,15 @@ class SOTAPipeline:
         metrics = {}
         t_start = time.time()
 
-        # LLM generation
+        # Build messages from conversation history (same as stream_response)
+        messages = [{"role": "system", "content": "You are a helpful voice assistant. Keep responses concise."}]
+        for hist_text, turn_type in self._conversation_history:
+            role = "assistant" if turn_type == 1 else "user"
+            messages.append({"role": role, "content": hist_text})
+        messages.append({"role": "user", "content": text})
+
         prompt = self._tokenizer.apply_chat_template(
-            [{"role": "user", "content": text}],
-            tokenize=False, add_generation_prompt=True,
+            messages, tokenize=False, add_generation_prompt=True,
         )
         parts = []
         t_llm = time.time()
@@ -166,8 +165,13 @@ class SOTAPipeline:
         metrics["llm_ms"] = (time.time() - t_llm) * 1000
         metrics["response"] = response
 
-        # Speech decoder
-        first_sentence = response.split('.')[0] + '.' if '.' in response else response
+        # Extract first sentence — cap at 120 chars for decoder
+        import re
+        match = re.search(r'[.!?]', response)
+        if match:
+            first_sentence = response[:match.end()]
+        else:
+            first_sentence = response[:120]
         return self._sentence_to_audio(first_sentence, metrics)
 
     def _sentence_to_audio(self, sentence: str, metrics: dict = None) -> tuple[np.ndarray, dict]:
@@ -222,21 +226,6 @@ class SOTAPipeline:
 
         return audio_np, metrics
 
-    def _get_context_history(self) -> list:
-        """Get recent conversation history as embeddings for contextual decoder."""
-        import mlx.core as mx
-
-        if not self._conversation_history:
-            return []
-
-        history = []
-        for turn_text, turn_type in self._conversation_history[-3:]:
-            ids = self._tokenizer.encode(turn_text[:100], add_special_tokens=False)
-            if ids:
-                emb = self._inner.embed_tokens(mx.array([ids]))
-                history.append((emb, turn_type))
-        return history
-
     def add_to_history(self, text: str, is_assistant: bool = False):
         """Add a turn to conversation history."""
         turn_type = 1 if is_assistant else 0
@@ -276,8 +265,14 @@ class SOTAPipeline:
 
         self.add_to_history(user_text, is_assistant=False)
 
+        # Build messages from full conversation history
+        messages = [{"role": "system", "content": "You are a helpful voice assistant. Keep responses concise."}]
+        for text, turn_type in self._conversation_history:
+            role = "assistant" if turn_type == 1 else "user"
+            messages.append({"role": role, "content": text})
+
         prompt = self._tokenizer.apply_chat_template(
-            [{"role": "user", "content": f"Respond concisely: {user_text}"}],
+            messages,
             tokenize=False, add_generation_prompt=True,
         )
 
@@ -330,6 +325,62 @@ class SOTAPipeline:
             }
         }
 
+    def process_audio(self, audio_16k: np.ndarray, max_tokens: int = 80):
+        """Full speech-to-speech: audio in → ASR → LLM → TTS → audio out.
+
+        This is the true STS entry point. Takes raw 16kHz audio of a user
+        utterance and yields streaming events including audio of the response.
+
+        Args:
+            audio_16k: float32 numpy array at 16kHz sample rate
+            max_tokens: max LLM generation tokens
+
+        Yields:
+            {"type": "transcript", "text": "..."} — ASR result
+            {"type": "text.delta", "text": "..."} — LLM token
+            {"type": "audio.chunk", "audio": np.ndarray, ...} — TTS audio
+            {"type": "done", "full_text": "...", "metrics": {...}}
+        """
+        t_start = time.time()
+
+        # Step 1: ASR — transcribe the audio
+        text, asr_ms = self._streaming_asr.asr.transcribe_full(audio_16k)
+        if not text or not text.strip():
+            yield {"type": "transcript", "text": ""}
+            yield {"type": "done", "full_text": "", "metrics": {"asr_ms": asr_ms, "error": "empty transcript"}}
+            return
+
+        yield {"type": "transcript", "text": text}
+
+        # Step 2+3: LLM → TTS via stream_response
+        for event in self.stream_response(text, max_tokens=max_tokens):
+            event_copy = dict(event)
+            if event_copy["type"] == "done":
+                event_copy["metrics"]["asr_ms"] = asr_ms
+                event_copy["metrics"]["total_sts_ms"] = (time.time() - t_start) * 1000
+            yield event_copy
+
+    def process_audio_full(self, audio_16k: np.ndarray, max_tokens: int = 80) -> tuple[str, np.ndarray, dict]:
+        """Convenience: full STS in one call, returns (transcript, audio_out, metrics)."""
+        transcript = ""
+        audio_chunks = []
+        full_text = ""
+        metrics = {}
+
+        for event in self.process_audio(audio_16k, max_tokens=max_tokens):
+            if event["type"] == "transcript":
+                transcript = event["text"]
+            elif event["type"] == "audio.chunk":
+                audio_chunks.append(event["audio"])
+            elif event["type"] == "done":
+                full_text = event["full_text"]
+                metrics = event["metrics"]
+
+        audio_out = np.concatenate(audio_chunks) if audio_chunks else np.zeros(2400, dtype=np.float32)
+        metrics["transcript"] = transcript
+        metrics["response"] = full_text
+        return transcript, audio_out, metrics
+
     @property
     def loaded(self) -> bool:
         return self._loaded
@@ -341,3 +392,125 @@ class SOTAPipeline:
     @property
     def has_duplex(self) -> bool:
         return self._duplex is not None
+
+
+class FishSTSWrapper:
+    """Wraps the Fish true STS pipeline with the same interface as SOTAPipeline.
+
+    Drop-in replacement that uses Fish codec + MOSS-Speech layer splitting
+    instead of the cascaded ASR → LLM → TTS pipeline.
+
+    For text input, falls back to the cascaded path (Gemma → speech decoder).
+    For audio input, uses the true STS path (no text intermediate).
+    """
+
+    def __init__(
+        self,
+        gemma_model: str = "mlx-community/gemma-4-26b-a4b-it-4bit",
+        fish_sts_weights: str = "adapters/fish-sts/phase-c/fish_sts_final.safetensors",
+        fish_model: str = "fishaudio/fish-speech-1.5",
+        sample_rate: int = 44100,
+    ):
+        self.gemma_model = gemma_model
+        self.fish_sts_weights = fish_sts_weights
+        self.fish_model = fish_model
+        self.sample_rate = sample_rate
+        self._fish_pipeline = None
+        self._cascaded = None
+        self._loaded = False
+
+    def load(self):
+        """Load Fish STS pipeline + fallback cascaded pipeline."""
+        from fish_sts import FishSTSPipeline
+
+        print(f"\n{'='*60}")
+        print("  Fish STS Wrapper: Loading")
+        print(f"{'='*60}")
+
+        self._fish_pipeline = FishSTSPipeline(
+            target="e4b",
+            gemma_model=self.gemma_model,
+            fish_model=self.fish_model,
+        )
+
+        # Try loading — if Fish codec isn't available, fall back
+        try:
+            self._fish_pipeline.load()
+
+            # Load trained weights if available
+            weights_path = Path(self.fish_sts_weights)
+            if weights_path.exists():
+                import mlx.core as mx
+                w = mx.load(str(weights_path))
+                self._fish_pipeline._model.load_weights(list(w.items()), strict=False)
+                print(f"  Loaded Fish STS weights from {weights_path}", flush=True)
+
+            self._loaded = True
+            print("  Fish STS pipeline ready (true STS mode)", flush=True)
+        except Exception as e:
+            print(f"  Fish STS load failed ({e}), falling back to cascaded", flush=True)
+            self._fish_pipeline = None
+            self._cascaded = SOTAPipeline(gemma_model=self.gemma_model)
+            self._cascaded.load()
+            self._loaded = True
+
+        print(f"{'='*60}\n")
+
+    def process_audio(self, audio_input: np.ndarray, max_tokens: int = 80):
+        """True STS: audio in → audio out (no text intermediate).
+
+        If Fish pipeline is loaded, bypasses ASR entirely.
+        Falls back to cascaded pipeline if Fish isn't available.
+        """
+        if self._fish_pipeline is not None:
+            audio_out, metrics = self._fish_pipeline.process_audio(audio_input)
+            yield {"type": "transcript", "text": "[direct STS — no transcript]"}
+            yield {"type": "audio.chunk", "audio": audio_out, "metrics": metrics}
+            yield {"type": "done", "full_text": "[true STS]", "metrics": metrics}
+        elif self._cascaded is not None:
+            # Resample to 16kHz for Whisper ASR
+            if self.sample_rate != 16000:
+                n_out = int(len(audio_input) * 16000 / self.sample_rate)
+                audio_16k = np.interp(
+                    np.linspace(0, 1, n_out),
+                    np.linspace(0, 1, len(audio_input)),
+                    audio_input,
+                ).astype(np.float32)
+            else:
+                audio_16k = audio_input
+            yield from self._cascaded.process_audio(audio_16k, max_tokens=max_tokens)
+
+    def process_audio_full(self, audio_input: np.ndarray, max_tokens: int = 80):
+        """Convenience: full STS in one call."""
+        if self._fish_pipeline is not None:
+            audio_out, metrics = self._fish_pipeline.process_audio(audio_input)
+            return "[direct STS]", audio_out, metrics
+
+        # Fallback to cascaded
+        if self._cascaded is not None:
+            if self.sample_rate != 16000:
+                n_out = int(len(audio_input) * 16000 / self.sample_rate)
+                audio_16k = np.interp(
+                    np.linspace(0, 1, n_out),
+                    np.linspace(0, 1, len(audio_input)),
+                    audio_input,
+                ).astype(np.float32)
+            else:
+                audio_16k = audio_input
+            return self._cascaded.process_audio_full(audio_16k, max_tokens)
+
+        return "", np.zeros(4410, dtype=np.float32), {"error": "not loaded"}
+
+    def text_to_audio(self, text: str, max_tokens: int = 60):
+        """Text → audio (uses cascaded path even with Fish loaded)."""
+        if self._cascaded is not None:
+            return self._cascaded.text_to_audio(text, max_tokens)
+        return np.zeros(4410, dtype=np.float32), {"error": "cascaded not loaded"}
+
+    @property
+    def loaded(self) -> bool:
+        return self._loaded
+
+    @property
+    def is_true_sts(self) -> bool:
+        return self._fish_pipeline is not None

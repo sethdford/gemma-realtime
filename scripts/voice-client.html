@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gemma Realtime Voice</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:#0a0a12;color:#e0e0ee;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.container{max-width:540px;width:100%;padding:24px}
+h1{font-size:1.4rem;font-weight:600;margin-bottom:4px;color:#fff}
+.sub{font-size:.85rem;color:#666;margin-bottom:24px}
+.status{font-size:.8rem;padding:6px 12px;border-radius:6px;margin-bottom:20px;background:#111;border:1px solid #222}
+.status.connected{border-color:#2a5;color:#4d8}
+.status.error{border-color:#a33;color:#e66}
+.chat{flex:1;max-height:50vh;overflow-y:auto;margin-bottom:20px;display:flex;flex-direction:column;gap:10px}
+.msg{padding:10px 14px;border-radius:12px;max-width:85%;font-size:.9rem;line-height:1.45;word-wrap:break-word}
+.msg.user{align-self:flex-end;background:#1a3a6a;color:#cde;border-bottom-right-radius:4px}
+.msg.assistant{align-self:flex-start;background:#1a1a28;color:#ddd;border-bottom-left-radius:4px}
+.msg .label{font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;color:#888;margin-bottom:3px}
+.msg .transcript{font-style:italic;color:#aab;font-size:.82rem;margin-bottom:3px}
+.controls{display:flex;gap:12px;align-items:center;justify-content:center}
+button{border:none;border-radius:50%;cursor:pointer;transition:all .15s}
+.mic-btn{width:72px;height:72px;background:linear-gradient(135deg,#2255cc,#3366ee);color:#fff;font-size:1.6rem;box-shadow:0 4px 20px rgba(40,80,200,.35)}
+.mic-btn:hover{transform:scale(1.05);box-shadow:0 6px 28px rgba(40,80,200,.5)}
+.mic-btn.recording{background:linear-gradient(135deg,#cc2233,#ee3344);box-shadow:0 4px 20px rgba(200,40,50,.45);animation:pulse 1.2s infinite}
+.mic-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.int-btn{width:42px;height:42px;background:#333;color:#ccc;font-size:.9rem}
+.int-btn:hover{background:#555}
+@keyframes pulse{0%,100%{box-shadow:0 4px 20px rgba(200,40,50,.45)}50%{box-shadow:0 4px 30px rgba(200,40,50,.7)}}
+.metrics{font-size:.72rem;color:#555;margin-top:16px;text-align:center}
+.text-input-row{display:flex;gap:8px;margin-bottom:16px}
+.text-input-row input{flex:1;background:#111;border:1px solid #333;color:#ddd;padding:8px 12px;border-radius:8px;font-size:.85rem}
+.text-input-row input:focus{outline:none;border-color:#44a}
+.text-input-row button{border-radius:8px;padding:8px 16px;background:#2255cc;color:#fff;font-size:.85rem}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Gemma Realtime Voice</h1>
+  <p class="sub">Speech-to-speech on Apple Silicon</p>
+  <div class="status" id="status">Connecting...</div>
+  <div class="chat" id="chat"></div>
+  <div class="text-input-row">
+    <input id="textInput" placeholder="Or type a message..." onkeydown="if(event.key==='Enter')sendText()">
+    <button onclick="sendText()">Send</button>
+  </div>
+  <div class="controls">
+    <button class="int-btn" onclick="interrupt()" title="Interrupt">Stop</button>
+    <button class="mic-btn" id="micBtn" onclick="toggleMic()" disabled>Mic</button>
+  </div>
+  <div class="metrics" id="metrics"></div>
+</div>
+
+<script>
+const WS_URL = `ws://${location.hostname || 'localhost'}:8742`;
+let ws, mediaStream, audioCtx, recorder, isRecording = false;
+const chat = document.getElementById('chat');
+const statusEl = document.getElementById('status');
+const micBtn = document.getElementById('micBtn');
+const metricsEl = document.getElementById('metrics');
+let currentAssistant = null;
+let audioQueue = [];
+let isPlaying = false;
+
+function connect() {
+  statusEl.textContent = 'Connecting...';
+  statusEl.className = 'status';
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {};
+  ws.onclose = () => { statusEl.textContent = 'Disconnected'; statusEl.className = 'status error'; micBtn.disabled = true; setTimeout(connect, 3000); };
+  ws.onerror = () => { statusEl.textContent = 'Connection error'; statusEl.className = 'status error'; };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    switch (msg.type) {
+      case 'session.created':
+        statusEl.textContent = `Connected (${msg.session_id})`;
+        statusEl.className = 'status connected';
+        micBtn.disabled = false;
+        break;
+      case 'transcript.final':
+        if (msg.text) addMessage('user', msg.text, true);
+        break;
+      case 'response.start':
+        currentAssistant = addMessage('assistant', '');
+        break;
+      case 'text.delta':
+        if (currentAssistant) currentAssistant.querySelector('.text').textContent += msg.text;
+        chat.scrollTop = chat.scrollHeight;
+        break;
+      case 'text.done':
+        break;
+      case 'audio.chunk':
+        if (msg.data) playAudioChunk(msg.data);
+        break;
+      case 'audio.done':
+        break;
+      case 'response.done':
+        if (msg.latency) metricsEl.textContent = `ASR: ${msg.latency.asr_ms||0}ms | TTFT: ${msg.latency.llm_ttft_ms||0}ms | First audio: ${msg.latency.first_audio_ms||0}ms | Total: ${msg.latency.total_ms||0}ms | Chunks: ${msg.latency.audio_chunks||0}`;
+        currentAssistant = null;
+        break;
+      case 'state.change':
+        if (msg.state === 'INTERRUPT') metricsEl.textContent = 'Interrupted';
+        break;
+      case 'error':
+        console.error('Server error:', msg.message);
+        break;
+    }
+  };
+}
+
+function addMessage(role, text, isTranscript) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.innerHTML = `<div class="label">${role}</div>${isTranscript ? `<div class="transcript">${text}</div>` : ''}<span class="text">${isTranscript ? '' : text}</span>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function sendText() {
+  const input = document.getElementById('textInput');
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== 1) return;
+  addMessage('user', text);
+  ws.send(JSON.stringify({ type: 'text.input', text }));
+  input.value = '';
+}
+
+function interrupt() {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'interrupt' }));
+  audioQueue = [];
+}
+
+async function toggleMic() {
+  if (isRecording) { stopRecording(); return; }
+  try {
+    if (!audioCtx) audioCtx = new AudioContext({ sampleRate: 24000 });
+    if (!mediaStream) mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 24000, channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    startRecording();
+  } catch (e) { alert('Microphone access denied: ' + e.message); }
+}
+
+function startRecording() {
+  isRecording = true;
+  micBtn.classList.add('recording');
+  micBtn.textContent = 'Stop';
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    if (!isRecording) return;
+    const float32 = e.inputBuffer.getChannelData(0);
+    // Resample to 24kHz if needed, then convert to s16le
+    const s16 = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) s16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(s16.buffer)));
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'audio.chunk', data: b64 }));
+  };
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+  recorder = { source, processor };
+}
+
+function stopRecording() {
+  isRecording = false;
+  micBtn.classList.remove('recording');
+  micBtn.textContent = 'Mic';
+  if (recorder) {
+    recorder.processor.disconnect();
+    recorder.source.disconnect();
+    recorder = null;
+  }
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'audio.commit' }));
+}
+
+function playAudioChunk(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const s16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(s16.length);
+  for (let i = 0; i < s16.length; i++) float32[i] = s16[i] / 32768;
+  audioQueue.push(float32);
+  if (!isPlaying) playNext();
+}
+
+function playNext() {
+  if (audioQueue.length === 0) { isPlaying = false; return; }
+  isPlaying = true;
+  if (!audioCtx) audioCtx = new AudioContext({ sampleRate: 24000 });
+  const samples = audioQueue.shift();
+  const buf = audioCtx.createBuffer(1, samples.length, 24000);
+  buf.getChannelData(0).set(samples);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  src.onended = playNext;
+  src.start();
+}
+
+connect();
+</script>
+</body>
+</html>

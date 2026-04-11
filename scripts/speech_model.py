@@ -6,6 +6,11 @@ Phase 5 implementation: extends the Freeze-Omni adapter architecture with
 Moshi-style inner monologue (joint text+audio token prediction) and
 dual-stream modeling (simultaneous user/agent audio processing).
 
+Supports two codec backends:
+    - SNAC (3 codebooks, 24kHz, 12 Hz) — original implementation
+    - Fish DAC (10 codebooks, 44.1kHz, ~21 Hz) — SOTA quality, true STS path
+      See fish_sts.py for the complete Fish-based true STS pipeline.
+
 Architecture:
     User Audio Stream ----> [Codec Encode] ---> [User Tokens]
                                                       |
@@ -21,14 +26,21 @@ Architecture:
                                   Inner Monologue  Agent Audio   Speak/Listen
                                    (not spoken)    Codec Tokens
 
+    MOSS-Speech Layer Splitting (Phase 7 / Fish path):
+        Gemma layers 0..K     → shared (text + speech, frozen)
+        Gemma layers K..N     → text branch (frozen, inner monologue)
+        Speech layers 0..M    → speech branch (trainable, audio generation)
+
 Key innovations from research:
     - Inner Monologue (Moshi): Text tokens predicted alongside audio improve
       linguistic quality dramatically. The model "thinks in text" while speaking.
     - Dual-Stream (Moshi): User and agent audio modeled in parallel streams,
       enabling full-duplex conversation with natural overlap handling.
-    - Vocabulary Extension: SNAC codec tokens added to Gemma's vocabulary with
+    - Vocabulary Extension: Codec tokens added to Gemma's vocabulary with
       frozen original embeddings + trainable audio embeddings.
-    - Interleaved Token Schedule: Each 80ms frame generates
+    - Layer Splitting (MOSS-Speech): Shared lower layers + split upper layers
+      preserves text reasoning while adding native speech capability.
+    - Interleaved Token Schedule: Each frame generates
       [user_semantic, user_acoustic..., text_token, agent_semantic, agent_acoustic...]
 """
 
@@ -43,7 +55,12 @@ import numpy as np
 
 @dataclass
 class SpeechModelConfig:
-    """Configuration for the full speech-to-speech model."""
+    """Configuration for the full speech-to-speech model.
+
+    Supports two codec backends:
+        codec="snac": 3 codebooks × 4096, 12 Hz, 24kHz (original)
+        codec="fish": 10 codebooks × 1024, ~21 Hz, 44.1kHz (SOTA, true STS)
+    """
     llm_dim: int = 2560
     text_vocab_size: int = 256000
     codec_vocab_size: int = 4096
@@ -58,6 +75,12 @@ class SpeechModelConfig:
     depth_transformer_layers: int = 2
     depth_transformer_heads: int = 4
 
+    # MOSS-Speech layer splitting (Phase 7)
+    codec_backend: str = "snac"
+    layer_split: bool = False
+    n_llm_layers: int = 42
+    split_layer: int = 28
+
     @property
     def total_audio_vocab(self) -> int:
         """Per-stream audio vocab: n_codebooks * codebook_size."""
@@ -71,6 +94,14 @@ class SpeechModelConfig:
     @property
     def extended_vocab_size(self) -> int:
         return self.text_vocab_size + self.total_audio_tokens
+
+    @property
+    def n_shared_layers(self) -> int:
+        return self.split_layer if self.layer_split else self.n_llm_layers
+
+    @property
+    def n_split_layers(self) -> int:
+        return self.n_llm_layers - self.split_layer if self.layer_split else 0
 
     AUDIO_TOKEN_OFFSET = 256000
     USER_STREAM_OFFSET = 0
@@ -368,9 +399,36 @@ class SpeechToSpeechModel(nn.Module):
 
 
 PRESET_CONFIGS = {
+    # SNAC-based (original)
     "e2b": SpeechModelConfig(llm_dim=2304, text_vocab_size=256000),
     "e4b": SpeechModelConfig(llm_dim=2560, text_vocab_size=256000),
     "31b": SpeechModelConfig(llm_dim=4096, text_vocab_size=256000),
+
+    # Fish DAC-based (true STS path)
+    "e2b-fish": SpeechModelConfig(
+        llm_dim=2304, text_vocab_size=256000,
+        codec_vocab_size=1024, n_codebooks=10, frame_rate_hz=21.53,
+        codec_backend="fish", layer_split=True,
+        n_llm_layers=26, split_layer=18,
+        depth_transformer_dim=512, depth_transformer_layers=4,
+        depth_transformer_heads=8,
+    ),
+    "e4b-fish": SpeechModelConfig(
+        llm_dim=2560, text_vocab_size=256000,
+        codec_vocab_size=1024, n_codebooks=10, frame_rate_hz=21.53,
+        codec_backend="fish", layer_split=True,
+        n_llm_layers=42, split_layer=28,
+        depth_transformer_dim=512, depth_transformer_layers=4,
+        depth_transformer_heads=8,
+    ),
+    "27b-fish": SpeechModelConfig(
+        llm_dim=4608, text_vocab_size=256000,
+        codec_vocab_size=1024, n_codebooks=10, frame_rate_hz=21.53,
+        codec_backend="fish", layer_split=True,
+        n_llm_layers=62, split_layer=42,
+        depth_transformer_dim=512, depth_transformer_layers=4,
+        depth_transformer_heads=8,
+    ),
 }
 
 
@@ -378,16 +436,20 @@ def main():
     """Architecture validation test."""
     import time
 
-    for target in ["e2b", "e4b"]:
+    for target in ["e2b", "e4b", "e4b-fish"]:
         config = PRESET_CONFIGS[target]
         model = SpeechToSpeechModel(config)
         n_params = model.num_params()
 
+        codec_label = f"Fish DAC ({config.n_codebooks}cb)" if config.codec_backend == "fish" else f"SNAC ({config.n_codebooks}cb)"
         print(f"\n  {target.upper()} Speech-to-Speech Model:", flush=True)
         print(f"    Parameters: {n_params/1e6:.1f}M (adapter only, LLM frozen)", flush=True)
+        print(f"    Codec: {codec_label}, {config.frame_rate_hz:.1f} Hz", flush=True)
         print(f"    Extended vocab: {config.extended_vocab_size} ({config.text_vocab_size} text + {config.total_audio_vocab} audio)", flush=True)
         print(f"    Inner monologue: {config.inner_monologue}", flush=True)
         print(f"    Dual stream: {config.dual_stream}", flush=True)
+        if config.layer_split:
+            print(f"    Layer split: {config.n_shared_layers} shared + {config.n_split_layers} speech-specific (MOSS-Speech)", flush=True)
         print(f"    Depth transformer: {config.depth_transformer_layers} layers, {config.depth_transformer_dim}d", flush=True)
 
         B = 1

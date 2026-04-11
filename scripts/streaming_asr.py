@@ -30,17 +30,20 @@ class StreamingASR:
     """
 
     SAMPLE_RATE = 16000
-    CHUNK_DURATION_S = 1.0
-    OVERLAP_S = 0.5
+    WINDOW_S = 5.0
+    STRIDE_S = 1.0
     MIN_AUDIO_S = 0.3
 
     def __init__(self, model_name: str = "mlx-community/whisper-small-mlx"):
         self.model_name = model_name
         self._transcribe = None
         self._buffer = np.array([], dtype=np.float32)
+        self._committed = np.array([], dtype=np.float32)
+        self._committed_text = ""
         self._partial_text = ""
         self._final_text = ""
         self._backend = None
+        self._samples_since_transcribe = 0
 
     def load(self):
         """Load the best available Whisper backend."""
@@ -89,6 +92,10 @@ class StreamingASR:
     def feed_chunk(self, audio_chunk: np.ndarray) -> Optional[str]:
         """Feed an audio chunk and get partial transcription if available.
 
+        Uses a fixed-size sliding window (WINDOW_S seconds) so cost is O(1)
+        per call regardless of total utterance length. Only re-transcribes
+        after STRIDE_S seconds of new audio accumulate.
+
         Args:
             audio_chunk: float32 audio at 16kHz
 
@@ -96,36 +103,40 @@ class StreamingASR:
             Partial transcription string, or None if not enough audio yet
         """
         self._buffer = np.concatenate([self._buffer, audio_chunk])
+        self._samples_since_transcribe += len(audio_chunk)
 
-        chunk_samples = int(self.CHUNK_DURATION_S * self.SAMPLE_RATE)
-        if len(self._buffer) < chunk_samples:
+        stride_samples = int(self.STRIDE_S * self.SAMPLE_RATE)
+        if self._samples_since_transcribe < stride_samples:
             return None
 
-        # Transcribe the current buffer
-        audio_to_transcribe = self._buffer.copy()
-        text = self._transcribe(audio_to_transcribe)
+        # Transcribe only the last WINDOW_S seconds (fixed cost)
+        window_samples = int(self.WINDOW_S * self.SAMPLE_RATE)
+        audio_window = self._buffer[-window_samples:]
+        text = self._transcribe(audio_window)
+        self._samples_since_transcribe = 0
 
-        # Keep overlap for next chunk
-        overlap_samples = int(self.OVERLAP_S * self.SAMPLE_RATE)
-        if len(self._buffer) > overlap_samples:
-            self._buffer = self._buffer[-overlap_samples:]
-        else:
-            self._buffer = np.array([], dtype=np.float32)
+        # Trim buffer to keep only the window
+        if len(self._buffer) > window_samples:
+            overflow = len(self._buffer) - window_samples
+            self._committed = np.concatenate([self._committed, self._buffer[:overflow]])
+            self._buffer = self._buffer[-window_samples:]
 
         if text and text != self._partial_text:
             self._partial_text = text
-            return text
+            return self._committed_text + text if self._committed_text else text
 
         return None
 
     def finalize(self) -> str:
-        """Transcribe any remaining audio and return final result."""
-        if len(self._buffer) > int(self.MIN_AUDIO_S * self.SAMPLE_RATE):
-            text = self._transcribe(self._buffer)
+        """Transcribe remaining audio and return final result."""
+        # Final pass: transcribe all remaining audio
+        all_audio = np.concatenate([self._committed, self._buffer]) if len(self._committed) > 0 else self._buffer
+        if len(all_audio) > int(self.MIN_AUDIO_S * self.SAMPLE_RATE):
+            text = self._transcribe(all_audio)
             if text:
                 self._final_text = text
         elif self._partial_text:
-            self._final_text = self._partial_text
+            self._final_text = self._committed_text + self._partial_text if self._committed_text else self._partial_text
 
         result = self._final_text
         self.reset()
@@ -134,8 +145,11 @@ class StreamingASR:
     def reset(self):
         """Reset state for next utterance."""
         self._buffer = np.array([], dtype=np.float32)
+        self._committed = np.array([], dtype=np.float32)
+        self._committed_text = ""
         self._partial_text = ""
         self._final_text = ""
+        self._samples_since_transcribe = 0
 
     @property
     def backend(self) -> str:
@@ -183,11 +197,21 @@ class StreamingASRWithVAD:
     def is_speech(self, audio_16k: np.ndarray) -> bool:
         if self._vad is not None:
             import torch
-            tensor = torch.from_numpy(audio_16k.astype(np.float32))
-            if tensor.abs().max() > 1.0:
-                tensor = tensor / 32768.0
-            conf = self._vad(tensor, 16000).item()
-            return conf > self.vad_threshold
+            audio_f32 = audio_16k.astype(np.float32)
+            if np.abs(audio_f32).max() > 1.0:
+                audio_f32 = audio_f32 / 32768.0
+
+            # Silero expects 512-sample chunks at 16kHz
+            chunk_size = 512
+            max_conf = 0.0
+            for start in range(0, len(audio_f32) - chunk_size + 1, chunk_size):
+                chunk = torch.from_numpy(audio_f32[start:start + chunk_size])
+                conf = self._vad(chunk, 16000).item()
+                max_conf = max(max_conf, conf)
+                if conf > self.vad_threshold:
+                    return True
+
+            return max_conf > self.vad_threshold
 
         rms = np.sqrt(np.mean(audio_16k.astype(np.float32) ** 2))
         return rms > 0.01

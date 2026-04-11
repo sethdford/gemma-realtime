@@ -94,11 +94,33 @@ python3 scripts/mlx-server.py \
 # Prove it works
 python3 scripts/voice-bench.py
 
-# Voice pipeline with Voxtral TTS (4B, 20 voices, 9 languages)
-python3 scripts/speech-server.py --tts voxtral --voice casual_male
+# Voice pipeline with Voxtral TTS (4B, 20 voices, 9 languages).
+# With --tts voxtral, draft heads load automatically from adapters/draft-heads/
+# (heads-libri.safetensors or heads.safetensors) when present; use --no-draft-heads to disable.
+python3 scripts/speech-server.py --tts voxtral --voice cheerful_male
+
+# WebSocket realtime API (same auto draft-head resolution for Voxtral)
+python3 scripts/realtime-ws.py --tts voxtral
+
+# Prove Voxtral + speculative draft heads (requires trained weights under adapters/)
+python3 scripts/prove-voxtral-speculative-e2e.py
 
 # Or with Kokoro TTS (lighter, Apache 2.0)
 python3 scripts/speech-server.py --tts kokoro
+
+# ── True Speech-to-Speech (Fish codec, no text bottleneck) ──
+
+# Train the full STS pipeline (Phase A → B → C)
+python3 scripts/train-fish-sts.py all --data data/libritts-multicodebook.jsonl
+
+# Run the STS WebSocket server (auto-loads trained weights from adapters/fish-sts/)
+python3 scripts/realtime-ws.py --tts fish
+
+# Prove the Fish STS pipeline end-to-end
+python3 scripts/prove-fish-sts.py
+
+# Evaluate STS quality: WER, MOS proxy, latency
+python3 scripts/eval_sts.py --pipeline fish
 ```
 
 ### h-uman Integration

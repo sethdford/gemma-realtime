@@ -33,5 +33,12 @@ Thumbs.db
 bench-*.json
 benchmark-report.txt
 
+# Proof artifacts (large wav files from validation runs)
+proof-artifacts/*.wav
+proof-artifacts/*.npz
+
+# Downloaded models
+models/
+
 # Compiled binaries
 secret-apis/build/

@@ -25,6 +25,23 @@ jobs:
           python3 -m py_compile scripts/voice-bench.py
           python3 -m py_compile scripts/bench-all-backends.py
           python3 -m py_compile scripts/ane-gpu-bridge.py
+          python3 -m py_compile scripts/speech-server.py
+          python3 -m py_compile scripts/realtime-ws.py
+          python3 -m py_compile scripts/streaming_asr.py
+          python3 -m py_compile scripts/codec.py
+          python3 -m py_compile scripts/speech_decoder.py
+          python3 -m py_compile scripts/speech_model.py
+          python3 -m py_compile scripts/voxtral_speculative.py
+          python3 -m py_compile scripts/collect-draft-data.py
+          python3 -m py_compile scripts/benchmark-tts.py
+          python3 -m py_compile scripts/draft_heads_resolve.py
+          python3 -m py_compile scripts/prove-voxtral-speculative-e2e.py
+          python3 -m py_compile scripts/fish_sts.py
+          python3 -m py_compile scripts/train-fish-sts.py
+          python3 -m py_compile scripts/prove-fish-sts.py
+          python3 -m py_compile scripts/eval_sts.py
+          python3 -m py_compile scripts/hw_accel.py
+          python3 -m py_compile scripts/sota_pipeline.py
 
       - name: Check shell syntax
         run: |

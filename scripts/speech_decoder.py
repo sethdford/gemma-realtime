@@ -2,21 +2,23 @@
 """
 Speech decoder adapter for Freeze-Omni style architecture on MLX.
 
-Converts Gemma's hidden states into discrete audio codec tokens using an
-autoregressive decoder. Produces streaming audio output via neural codec.
+Maps Gemma's token embeddings (from embed_tokens, NOT transformer hidden
+states) into discrete SNAC audio codec tokens via an autoregressive decoder.
 
-Architecture (from Freeze-Omni, adapted for MLX):
-    Gemma hidden states (llm_dim)
-    -> Linear adapter (llm_dim -> decoder_dim)
-    -> AR Transformer decoder (causal, generates codec tokens one at a time)
-    -> Codebook projection head (decoder_dim -> codebook_size)
-    -> [Feed tokens to SNAC/Mimi decoder for audio waveform]
+NOTE: Despite parameter names like "llm_dim" and "llm_hidden", this decoder
+is trained on and expects raw embedding vectors from Gemma's embedding layer,
+not outputs from the transformer stack. This is because MLX cannot
+backpropagate through the quantized Gemma transformer (GatherMM VJP error).
 
-The decoder uses a single codebook for lowest latency (Freeze-Omni finding).
-Multi-codebook depth decoding is available for higher quality (Phase 5).
+Architecture:
+    Text token IDs → Gemma embed_tokens (frozen, no transformer forward pass)
+    → Linear adapter (embed_dim → decoder_dim)
+    → AR Transformer decoder (causal, cross-attends to embeddings)
+    → Codebook projection head (decoder_dim → codebook_size)
+    → [Feed tokens to SNAC decoder for audio waveform]
 
-Duplex state predictor is integrated: after each LLM hidden state,
-predict whether the model should speak, listen, or handle an interruption.
+The decoder uses a single codebook (cb0). Multi-codebook depth decoding
+(cb0 → cb1+cb2) via DepthDecoder is available for higher quality.
 """
 
 import math
@@ -135,15 +137,15 @@ class SpeechDecoderLayer(nn.Module):
 class SpeechDecoder(nn.Module):
     """Autoregressive speech token decoder.
 
-    Takes Gemma's hidden states and generates codec tokens autoregressively.
-    Uses a single codebook for minimum latency (Freeze-Omni approach).
+    Takes Gemma embedding vectors (from embed_tokens layer, not transformer
+    output) and generates SNAC cb0 codec tokens autoregressively.
 
     Args:
-        llm_dim: Gemma hidden dimension
+        llm_dim: Gemma embedding dimension (e.g. 2816 for gemma-4-26b)
         decoder_dim: Internal decoder dimension
         n_heads: Attention heads
         n_layers: Decoder transformer layers
-        codebook_size: Size of the codec vocabulary (e.g. 4096 for SNAC)
+        codebook_size: Size of the codec vocabulary (4096 for SNAC)
         max_tokens: Maximum audio tokens to generate
     """
 
@@ -188,7 +190,7 @@ class SpeechDecoder(nn.Module):
         """Forward pass for training (teacher-forced).
 
         Args:
-            llm_hidden: (batch, seq, llm_dim) hidden states from frozen Gemma
+            llm_hidden: (batch, seq, llm_dim) embeddings from Gemma embed_tokens
             target_tokens: (batch, audio_len) ground-truth codec tokens
 
         Returns:
@@ -213,7 +215,7 @@ class SpeechDecoder(nn.Module):
         """Autoregressive generation of codec tokens.
 
         Args:
-            llm_hidden: (1, seq, llm_dim) hidden states from frozen Gemma
+            llm_hidden: (1, seq, llm_dim) embeddings from Gemma embed_tokens
 
         Returns:
             tokens: (1, generated_len) codec token IDs
@@ -308,14 +310,14 @@ class SpeechDecoder(nn.Module):
 
 
 class DuplexStatePredictor(nn.Module):
-    """Predicts conversation state from LLM hidden states.
+    """Predicts conversation state from Gemma embeddings.
 
     At each chunk boundary, predicts:
         0 = LISTEN (user is speaking, agent should be quiet)
         1 = SPEAK  (agent should generate speech)
         2 = INTERRUPT (user interrupted, stop generating)
 
-    Attached after the last LLM layer, trained in Stage 3.
+    Operates on embed_tokens output, same as SpeechDecoder.
     """
 
     LISTEN = 0

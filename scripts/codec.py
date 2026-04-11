@@ -3,22 +3,31 @@
 Neural audio codec abstraction for gemma-realtime.
 
 Provides a unified interface for encoding/decoding audio using neural codecs
-(SNAC, Mimi, or EnCodec). These codecs convert raw audio waveforms to discrete
-token sequences that can be consumed by language models for native speech generation.
+(SNAC, Mimi, EnCodec, or Fish DAC). These codecs convert raw audio waveforms
+to discrete token sequences for language model speech generation.
 
 Supported codecs:
-    - SNAC: Multi-scale RVQ (12/23/47 Hz), MIT license, best quality/bitrate
-    - Mimi: Kyutai's codec from Moshi (12.5 Hz, 1.1 kbps, 80ms latency)
-    - EnCodec: Meta's baseline codec (75 Hz, higher bitrate)
+    - SNAC:     Multi-scale RVQ (12/23/47 Hz), MIT license, 3 codebooks
+    - Mimi:     Kyutai's codec from Moshi (12.5 Hz, 1.1 kbps, 80ms latency)
+    - EnCodec:  Meta's baseline codec (75 Hz, higher bitrate)
+    - Fish DAC: Fish Audio's S2 codec (10 codebooks, ~21 Hz, 44.1kHz, SOTA quality)
+                Standing on Fish Audio's shoulders for true speech-to-speech.
 
 Usage:
     from codec import AudioCodec
 
-    codec = AudioCodec("snac")
+    codec = AudioCodec("snac")    # or "fish" for Fish DAC
     codec.load()
 
     tokens = codec.encode(audio_np)
     audio_out = codec.decode(tokens)
+
+    # Fish DAC: 10 codebooks, cb0 = semantic, cb1-9 = acoustic detail
+    # cb0 feeds Gemma for reasoning, Fish's Fast AR fills cb1-9
+    fish = AudioCodec("fish")
+    fish.load()
+    tokens = fish.encode(audio_44k)  # -> (10, T) codes at ~21 Hz
+    cb0_semantic = tokens.codes[0]    # primary semantic codebook
 
     # Streaming
     for chunk in audio_chunks:
@@ -37,6 +46,7 @@ class CodecType(Enum):
     SNAC = "snac"
     MIMI = "mimi"
     ENCODEC = "encodec"
+    FISH_DAC = "fish"
 
 
 @dataclass
@@ -82,6 +92,16 @@ CODEC_CONFIGS = {
         bandwidth_kbps=6.0,
         latency_ms=13.3,
         streaming=False,
+    ),
+    CodecType.FISH_DAC: CodecConfig(
+        codec_type=CodecType.FISH_DAC,
+        sample_rate=44100,
+        frame_rate=21.53,       # 44100 / 2048 downsampling ratio
+        n_codebooks=10,
+        codebook_size=1024,     # FSQ codebook entries
+        bandwidth_kbps=2.5,
+        latency_ms=46.4,        # 2048 / 44100 * 1000
+        streaming=True,
     ),
 }
 
@@ -137,7 +157,8 @@ class CodecTokens:
 class AudioCodec:
     """Unified neural audio codec interface."""
 
-    def __init__(self, codec_type: str = "snac", device: str = "mps"):
+    def __init__(self, codec_type: str = "snac", device: str = "mps",
+                 fish_model: str = "fishaudio/fish-speech-1.5"):
         self.codec_type = CodecType(codec_type)
         self.device = device
         self.config = CODEC_CONFIGS[self.codec_type]
@@ -145,6 +166,7 @@ class AudioCodec:
         self._loaded = False
         self._encode_buffer = np.array([], dtype=np.float32)
         self._chunk_samples = int(self.config.sample_rate / self.config.frame_rate)
+        self._fish_model_id = fish_model
 
     def load(self):
         """Load the codec model."""
@@ -154,6 +176,8 @@ class AudioCodec:
             self._load_mimi()
         elif self.codec_type == CodecType.ENCODEC:
             self._load_encodec()
+        elif self.codec_type == CodecType.FISH_DAC:
+            self._load_fish_dac()
 
     def _load_snac(self):
         try:
@@ -192,6 +216,89 @@ class AudioCodec:
             print("  Codec: EnCodec not available — install: pip install transformers", flush=True)
             raise
 
+    def _load_fish_dac(self):
+        """Load Fish Audio's DAC-based codec (10-codebook RVQ, 44.1kHz, ~21 Hz).
+
+        Tries two loading paths:
+          1. fish_speech package (pip install fish-speech)
+          2. descript-audio-codec with Fish's pretrained weights from HuggingFace
+        """
+        # Path 1: fish_speech native package
+        try:
+            from fish_speech.models.dac.modded_dac import DACModel
+            self._model = DACModel.from_pretrained(self._fish_model_id)
+            self._model.eval()
+            self._fish_backend = "fish_speech"
+            self._loaded = True
+            print(f"  Codec: Fish DAC loaded via fish_speech ({self.config.n_codebooks} codebooks, "
+                  f"{self.config.sample_rate}Hz, ~{self.config.frame_rate:.0f} Hz frame rate)", flush=True)
+            return
+        except ImportError:
+            pass
+
+        # Path 2: HuggingFace + descript-audio-codec
+        try:
+            import torch
+            import dac
+            from huggingface_hub import hf_hub_download
+
+            generator_path = hf_hub_download(
+                repo_id=self._fish_model_id,
+                filename="firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+            )
+            model = dac.DAC.load(generator_path)
+            model.eval()
+            if self.device == "mps" and torch.backends.mps.is_available():
+                model = model.to("mps")
+            elif self.device == "cuda" and torch.cuda.is_available():
+                model = model.to("cuda")
+
+            self._model = model
+            self._fish_backend = "dac"
+            n_cb = getattr(model, "n_codebooks", self.config.n_codebooks)
+            cb_size = getattr(model, "codebook_size", self.config.codebook_size)
+            self.config = CodecConfig(
+                codec_type=CodecType.FISH_DAC,
+                sample_rate=self.config.sample_rate,
+                frame_rate=self.config.frame_rate,
+                n_codebooks=n_cb,
+                codebook_size=cb_size,
+                bandwidth_kbps=self.config.bandwidth_kbps,
+                latency_ms=self.config.latency_ms,
+                streaming=True,
+            )
+            self._loaded = True
+            print(f"  Codec: Fish DAC loaded via descript-audio-codec ({n_cb} codebooks, "
+                  f"{self.config.sample_rate}Hz)", flush=True)
+            return
+        except (ImportError, Exception) as e:
+            pass
+
+        # Path 3: Standalone PyTorch load from HuggingFace weights
+        try:
+            import torch
+            from huggingface_hub import hf_hub_download
+
+            generator_path = hf_hub_download(
+                repo_id=self._fish_model_id,
+                filename="firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+            )
+            self._model = torch.load(generator_path, map_location="cpu", weights_only=False)
+            if hasattr(self._model, "eval"):
+                self._model.eval()
+            if self.device == "mps" and torch.backends.mps.is_available():
+                self._model = self._model.to("mps") if hasattr(self._model, "to") else self._model
+            self._fish_backend = "raw_torch"
+            self._loaded = True
+            print(f"  Codec: Fish DAC loaded from raw weights ({self.config.n_codebooks} codebooks)", flush=True)
+            return
+        except Exception as e:
+            print(f"  Codec: Fish DAC failed to load: {e}", flush=True)
+            print("  Install one of:", flush=True)
+            print("    pip install fish-speech               # recommended", flush=True)
+            print("    pip install descript-audio-codec huggingface_hub", flush=True)
+            raise RuntimeError(f"Fish DAC codec not available: {e}")
+
     def encode(self, audio: np.ndarray) -> CodecTokens:
         """Encode a complete audio waveform to discrete tokens."""
         if not self._loaded:
@@ -217,6 +324,8 @@ class AudioCodec:
             return self._encode_mimi(audio)
         elif self.codec_type == CodecType.ENCODEC:
             return self._encode_encodec(audio)
+        elif self.codec_type == CodecType.FISH_DAC:
+            return self._encode_fish_dac(audio)
 
     def decode(self, tokens: CodecTokens) -> np.ndarray:
         """Decode discrete tokens back to audio waveform."""
@@ -229,6 +338,8 @@ class AudioCodec:
             return self._decode_mimi(tokens)
         elif self.codec_type == CodecType.ENCODEC:
             return self._decode_encodec(tokens)
+        elif self.codec_type == CodecType.FISH_DAC:
+            return self._decode_fish_dac(tokens)
 
     def encode_chunk(self, audio_chunk: np.ndarray) -> Optional[CodecTokens]:
         """Streaming encode: buffer audio and encode when enough samples collected."""
@@ -307,10 +418,81 @@ class AudioCodec:
                 codes_list = [torch.from_numpy(tokens.codes[i]).unsqueeze(0).long()
                               for i in range(tokens.n_codebooks)]
 
+            # SNAC 24kHz expects hierarchical temporal resolution (1:2:4).
+            # If all codebooks are the same length (e.g. from depth decoder),
+            # upsample cb1 by 2x and cb2 by 4x via repeat_interleave.
+            if (len(codes_list) == 3
+                    and codes_list[0].shape[-1] == codes_list[1].shape[-1]
+                    and codes_list[0].shape[-1] == codes_list[2].shape[-1]):
+                T = codes_list[0].shape[-1]
+                codes_list[1] = codes_list[1].repeat_interleave(2, dim=-1)
+                codes_list[2] = codes_list[2].repeat_interleave(4, dim=-1)
+
             if self.device == "mps" and torch.backends.mps.is_available():
                 codes_list = [c.to("mps") for c in codes_list]
 
             audio = self._model.decode(codes_list)
+            return audio.cpu().numpy().squeeze()
+
+    def _encode_fish_dac(self, audio: np.ndarray) -> CodecTokens:
+        import torch
+        with torch.no_grad():
+            x = torch.from_numpy(audio).unsqueeze(0).unsqueeze(0).float()
+            if self.device == "mps" and torch.backends.mps.is_available():
+                x = x.to("mps")
+            elif self.device == "cuda" and torch.cuda.is_available():
+                x = x.to("cuda")
+
+            if self._fish_backend == "fish_speech":
+                codes = self._model.encode(x)
+                if isinstance(codes, tuple):
+                    codes = codes[0]
+                codes_np = codes.cpu().numpy().squeeze()
+            elif self._fish_backend == "dac":
+                x_processed = self._model.preprocess(x, self.config.sample_rate)
+                _, codes, _, _, _ = self._model.encode(x_processed)
+                codes_np = codes.cpu().numpy().squeeze()
+            else:
+                if hasattr(self._model, "encode"):
+                    codes = self._model.encode(x)
+                    if isinstance(codes, tuple):
+                        codes = codes[0]
+                    codes_np = codes.cpu().numpy().squeeze()
+                else:
+                    raise RuntimeError("Fish DAC model has no encode method")
+
+            if codes_np.ndim == 1:
+                codes_np = codes_np.reshape(1, -1)
+
+            self._fish_codes_raw = codes_np
+
+            return CodecTokens(
+                codes=codes_np.astype(np.int64),
+                n_codebooks=codes_np.shape[0],
+                frame_rate=self.config.frame_rate,
+                codec_type=self.codec_type,
+            )
+
+    def _decode_fish_dac(self, tokens: CodecTokens) -> np.ndarray:
+        import torch
+        with torch.no_grad():
+            codes = torch.from_numpy(tokens.codes).long().unsqueeze(0)
+            if self.device == "mps" and torch.backends.mps.is_available():
+                codes = codes.to("mps")
+            elif self.device == "cuda" and torch.cuda.is_available():
+                codes = codes.to("cuda")
+
+            if self._fish_backend == "fish_speech":
+                audio = self._model.decode(codes)
+            elif self._fish_backend == "dac":
+                z = self._model.quantizer.from_codes(codes)[0]
+                audio = self._model.decode(z)
+            else:
+                if hasattr(self._model, "decode"):
+                    audio = self._model.decode(codes)
+                else:
+                    raise RuntimeError("Fish DAC model has no decode method")
+
             return audio.cpu().numpy().squeeze()
 
     def _encode_mimi(self, audio: np.ndarray) -> CodecTokens:
@@ -387,7 +569,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Test neural audio codec")
-    parser.add_argument("--codec", default="snac", choices=["snac", "mimi", "encodec"])
+    parser.add_argument("--codec", default="snac", choices=["snac", "mimi", "encodec", "fish"])
     parser.add_argument("--duration", type=float, default=2.0)
     args = parser.parse_args()
 
