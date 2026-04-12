@@ -1,10 +1,10 @@
 {
-  "wer": 7.6479,
-  "mos_mean": 4.999,
-  "mos_std": 0.001,
-  "spk_sim_mean": null,
-  "latency_p50_ms": 1461.6,
-  "latency_p95_ms": 1555.6,
-  "rtf_mean": 0.4632,
-  "n_samples": 5
+  "wer": 1.058,
+  "audio_quality_mean": 4.992,
+  "audio_quality_std": 0.027,
+  "spk_sim_mean": 0.617,
+  "latency_p50_ms": 2375.4,
+  "latency_p95_ms": 5889.6,
+  "rtf_mean": 0.9823,
+  "n_samples": 20
 }

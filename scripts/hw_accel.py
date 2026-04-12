@@ -4,11 +4,13 @@ Hardware acceleration integration for gemma-realtime speech pipeline.
 
 Phase 6: Wires proven secret-apis work into the speech pipeline for maximum
 Apple Silicon utilization. Provides layer-adaptive TurboQuant+, IOSurface
-zero-copy KV cache management, and EAGLE-style speculative decoding upgrades.
+zero-copy KV cache management (via libgemma_hw when built), and EAGLE-style
+speculative decoding upgrades.
 
 Components:
     1. LayerAdaptiveTurboCache: FP16 for sensitive first/last layers, TQ3 for middle
-    2. IOSurfaceKVManager: Zero-copy shared memory for GPU+ANE KV cache split
+    2. IOSurfaceKVManager: Zero-copy shared memory (on by default on macOS when
+       ``libgemma_hw.dylib`` is built; set ``HWAccelConfig(iosurface_enabled=False)`` to disable)
     3. EAGLEDraftHead: Online-distilled draft model for audio-conditioned speculation
 
 Usage:
@@ -16,13 +18,24 @@ Usage:
 """
 
 import math
+import platform
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+try:
+    import native_hw
+except ImportError:
+    native_hw = None  # type: ignore
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+
+def _iosurface_enabled_default() -> bool:
+    """Enable IOSurfaceKVManager probing on macOS; off elsewhere (no IOSurface framework)."""
+    return platform.system() == "Darwin"
 
 
 @dataclass
@@ -30,7 +43,7 @@ class HWAccelConfig:
     """Hardware acceleration configuration."""
     turbo_bits: int = 3
     turbo_fp16_layers: int = 4
-    iosurface_enabled: bool = False
+    iosurface_enabled: bool = field(default_factory=_iosurface_enabled_default)
     eagle_enabled: bool = False
     eagle_draft_layers: int = 2
     eagle_draft_dim: int = 256
@@ -158,16 +171,11 @@ class _TurboKVCache:
 class IOSurfaceKVManager:
     """Zero-copy KV cache sharing via IOSurface for GPU+ANE split inference.
 
-    Uses Apple's IOSurface framework for shared memory between:
-    - GPU (Metal): Prefill computation
-    - ANE (CoreML): Decode step computation
-    - CPU: Sampling and control flow
+    When ``secret-apis/build/libgemma_hw.dylib`` is built (``make -C secret-apis
+    libgemma_hw``), allocations use real IOSurface memory — the same layout as
+    ``iosurface_bridge.m`` — so Metal can wrap it with ``newBufferWithBytesNoCopy``.
 
-    The KV cache lives in IOSurface-backed memory that all three processors
-    can access without copying.
-
-    NOTE: Requires macOS and the IOSurface framework. Falls back to standard
-    Metal buffers if IOSurface is not available.
+    Otherwise falls back to a NumPy staging buffer (still useful for tests).
     """
 
     def __init__(self, config: HWAccelConfig = None):
@@ -175,6 +183,8 @@ class IOSurfaceKVManager:
         self.config = config
         self._surfaces = {}
         self._available = False
+        self._use_native_surfaces = False
+        self._framework = None
 
         if config.iosurface_enabled:
             self._check_availability()
@@ -186,6 +196,20 @@ class IOSurfaceKVManager:
             print("  IOSurface: Not available (macOS only)", flush=True)
             return
 
+        if native_hw is not None:
+            native_hw.load_library()
+            cap = native_hw.capabilities()
+            if native_hw.load_library() is not None and cap.iosurface_create_ok:
+                self._use_native_surfaces = True
+                self._available = True
+                print(
+                    "  IOSurface: libgemma_hw active "
+                    f"(ANE runtime classes ~{cap.ane_named_class_hits}, "
+                    f"private symbols loaded {cap.ane_known_private_loaded})",
+                    flush=True,
+                )
+                return
+
         try:
             import ctypes
             framework = ctypes.cdll.LoadLibrary(
@@ -193,33 +217,75 @@ class IOSurfaceKVManager:
             )
             self._framework = framework
             self._available = True
-            print("  IOSurface: Available for zero-copy KV sharing", flush=True)
+            print(
+                "  IOSurface: framework present; build libgemma_hw for native buffers",
+                flush=True,
+            )
         except OSError:
             print("  IOSurface: Framework not found", flush=True)
 
+    def _release_surface_entry(self, name: str) -> None:
+        ent = self._surfaces.pop(name, None)
+        if not ent:
+            return
+        if ent.get("kind") == "native":
+            ent["surf"].release()
+
     def allocate_kv_surface(self, name: str, size_bytes: int) -> bool:
-        """Allocate an IOSurface-backed buffer for KV cache.
+        """Allocate KV storage. Returns True if backed by IOSurface, else False."""
+        self._release_surface_entry(name)
 
-        In production, this would create a real IOSurface via the C API
-        (IOSurfaceCreate with kIOSurfaceBytesPerRow, etc.) and wrap it
-        in a Metal buffer via newBufferWithBytesNoCopy.
+        if self._use_native_surfaces and native_hw is not None:
+            try:
+                w, h, bpe, _padded = native_hw.iosurface_dims_for_bytes(size_bytes)
+                surf = native_hw.NativeIOSurface.create_packed(w, h, bpe)
+                surf.lock(0)
+                view = surf.logical_view(size_bytes)
+                self._surfaces[name] = {
+                    "kind": "native",
+                    "surf": surf,
+                    "view": view,
+                }
+                return True
+            except Exception as e:
+                print(f"  IOSurface native alloc failed ({e}); using NumPy", flush=True)
 
-        For now, allocates standard memory with the intent to upgrade
-        to true IOSurface when the ObjC bridge is wired.
-        """
         if not self._available:
-            self._surfaces[name] = np.zeros(size_bytes, dtype=np.uint8)
+            self._surfaces[name] = {
+                "kind": "numpy",
+                "arr": np.zeros(size_bytes, dtype=np.uint8),
+            }
             return False
 
-        self._surfaces[name] = np.zeros(size_bytes, dtype=np.uint8)
-        return True
+        self._surfaces[name] = {
+            "kind": "numpy",
+            "arr": np.zeros(size_bytes, dtype=np.uint8),
+        }
+        return False
 
     def get_surface(self, name: str) -> Optional[np.ndarray]:
-        return self._surfaces.get(name)
+        ent = self._surfaces.get(name)
+        if not ent:
+            return None
+        if ent.get("kind") == "native":
+            return ent.get("view")
+        return ent.get("arr")
+
+    def release_all(self) -> None:
+        for name in list(self._surfaces.keys()):
+            self._release_surface_entry(name)
 
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def native_zero_copy(self) -> bool:
+        return self._use_native_surfaces
+
+    @property
+    def surface_count(self) -> int:
+        return len(self._surfaces)
 
 
 class EAGLEDraftHead(nn.Module):
@@ -329,9 +395,13 @@ def main():
     cache = LayerAdaptiveTurboCache(mock, config)
     print(f"  Memory estimate: ~{cache.memory_estimate_mb:.1f} MB per 1K context", flush=True)
 
-    io_mgr = IOSurfaceKVManager(HWAccelConfig(iosurface_enabled=True))
+    io_mgr = IOSurfaceKVManager()
     io_mgr.allocate_kv_surface("kv_main", 1024 * 1024)
-    print(f"  IOSurface available: {io_mgr.available}", flush=True)
+    print(
+        f"  IOSurface available: {io_mgr.available} "
+        f"native_zero_copy: {io_mgr.native_zero_copy}",
+        flush=True,
+    )
 
     eagle = EAGLEDraftHead(config, llm_dim=2560)
     n_params = eagle.num_params()

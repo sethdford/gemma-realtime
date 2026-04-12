@@ -51,7 +51,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-FISH_CODEBOOK_SIZE = 1024
+FISH_CODEBOOK_SIZE = 1000  # prod([8,5,5,5]) — matches Fish DAC's FSQ exactly
 FISH_N_CODEBOOKS = 8
 SNAC_CODEBOOK_SIZE = 4096
 SNAC_N_CODEBOOKS = 3
@@ -117,7 +117,7 @@ def load_audio_text_data(path: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_fish_tokens(args):
-    """Re-encode training audio with Fish DAC to get 10-codebook tokens."""
+    """Re-encode training audio with Fish DAC to get 8-group FSQ tokens."""
     import soundfile as sf
     from codec import AudioCodec
 
@@ -474,7 +474,7 @@ def train_phase_b(args):
     model.fast_ar.unfreeze()
     model.state_head.unfreeze()
     model.audio_input.unfreeze()
-    model.audio_embed.unfreeze()
+    model.audio_input.unfreeze()
 
     trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
     print(f"  Trainable: {trainable/1e6:.2f}M", flush=True)
@@ -677,7 +677,7 @@ def train_phase_c(args):
     # Unfreeze all speech components
     model.freeze()
     model.audio_input.unfreeze()
-    model.audio_embed.unfreeze()
+    model.audio_input.unfreeze()
     model.layer_split.unfreeze()
     model.fast_ar.unfreeze()
     model.state_head.unfreeze()
@@ -701,16 +701,34 @@ def train_phase_c(args):
     t0 = time.time()
 
     for step in range(1, args.iters + 1):
-        # STS training: simulate user audio → response audio
-        # Use two random utterances: first = "user audio", second = "response audio"
-        idx1 = np.random.randint(0, len(train_data))
-        idx2 = np.random.randint(0, len(train_data))
-        user_item = train_data[idx1]
-        resp_item = train_data[idx2]
+        # Continuation objective: split a single utterance into context + target.
+        # 90% continuation (coherent next-segment), 10% cross-utterance (diversity).
+        # Also include echo training (input=output) for phoneme grounding.
+        idx = np.random.randint(0, len(train_data))
+        item = train_data[idx]
+        full_cb0 = item.get(cb0_key) or item.get("cb0")
+        resp_text = item["text"]
 
-        user_cb0 = (user_item.get(cb0_key) or user_item.get("cb0"))[:40]
-        resp_cb0 = (resp_item.get(cb0_key) or resp_item.get("cb0"))[:60]
-        resp_text = resp_item["text"]
+        roll = np.random.random()
+        if roll < 0.6 and len(full_cb0) >= 12:
+            # Continuation: split utterance into context → target
+            split = max(4, int(len(full_cb0) * (0.3 + np.random.random() * 0.3)))
+            user_cb0 = full_cb0[:split][:40]
+            resp_cb0 = full_cb0[split:][:60]
+            words = resp_text.split()
+            word_split = max(1, int(len(words) * split / len(full_cb0)))
+            resp_text = " ".join(words[word_split:])
+        elif roll < 0.9 and len(full_cb0) >= 8:
+            # Echo: input = short prefix, target = same or overlapping tokens
+            prefix_len = max(4, int(len(full_cb0) * 0.3))
+            user_cb0 = full_cb0[:prefix_len][:40]
+            resp_cb0 = full_cb0[:min(len(full_cb0), prefix_len + 40)][:60]
+        else:
+            idx2 = np.random.randint(0, len(train_data))
+            resp_item = train_data[idx2]
+            user_cb0 = full_cb0[:40]
+            resp_cb0 = (resp_item.get(cb0_key) or resp_item.get("cb0"))[:60]
+            resp_text = resp_item["text"]
 
         if len(user_cb0) < 3 or len(resp_cb0) < 3:
             continue
@@ -723,20 +741,14 @@ def train_phase_c(args):
         text_emb = mx.stop_gradient(inner.embed_tokens(mx.array([text_ids]))) if text_ids else None
 
         def loss_step(model):
-            # Encode user audio
             user_emb = model.audio_input(user_arr)
-
-            # Encode response prefix (teacher forcing)
             resp_emb = model.audio_input(resp_input)
-
-            # Concatenate: [user_audio, response_prefix]
             combined = mx.concatenate([user_emb, resp_emb], axis=1)
 
             T = combined.shape[1]
             mask = nn.MultiHeadAttention.create_additive_causal_mask(T)
             speech_logits = model.layer_split.forward_speech_branch(combined, mask=mask)
 
-            # Only compute loss on response portion
             resp_logits = speech_logits[:, user_emb.shape[1]:, :]
             logits_flat = resp_logits.reshape(-1, resp_logits.shape[-1])
             targets_flat = resp_target.reshape(-1)
@@ -749,7 +761,6 @@ def train_phase_c(args):
             ce = nn.losses.cross_entropy(logits_flat, targets_safe, reduction="none")
             ce_loss = mx.sum(ce * mask_float) / mx.maximum(mx.sum(mask_float), 1.0)
 
-            # Inner monologue supervision
             mono_loss = mx.array(0.0)
             if text_emb is not None:
                 resp_mean = mx.mean(resp_emb, axis=1)
@@ -760,9 +771,8 @@ def train_phase_c(args):
                 )
                 mono_loss = 1.0 - mx.mean(cos_sim)
 
-            # State prediction: after user audio → should be SPEAK(1)
             state_logits = model.state_head(user_emb[:, -1:, :]).squeeze(1)
-            state_target = mx.array([1], dtype=mx.int32)  # SPEAK
+            state_target = mx.array([1], dtype=mx.int32)
             state_loss = mx.mean(nn.losses.cross_entropy(state_logits, state_target))
 
             return 0.7 * ce_loss + 0.2 * mono_loss + 0.1 * state_loss

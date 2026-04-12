@@ -8,7 +8,7 @@ dual-stream modeling (simultaneous user/agent audio processing).
 
 Supports two codec backends:
     - SNAC (3 codebooks, 24kHz, 12 Hz) — original implementation
-    - Fish DAC (10 codebooks, 44.1kHz, ~21 Hz) — SOTA quality, true STS path
+    - Fish DAC (8 FSQ groups × 1000 codes, 44.1kHz, ~21 Hz) — SOTA quality, true STS path
       See fish_sts.py for the complete Fish-based true STS pipeline.
 
 Architecture:
@@ -59,7 +59,7 @@ class SpeechModelConfig:
 
     Supports two codec backends:
         codec="snac": 3 codebooks × 4096, 12 Hz, 24kHz (original)
-        codec="fish": 10 codebooks × 1024, ~21 Hz, 44.1kHz (SOTA, true STS)
+        codec="fish": 8 FSQ groups × 1000, ~21 Hz, 44.1kHz (SOTA, true STS)
     """
     llm_dim: int = 2560
     text_vocab_size: int = 256000
@@ -407,7 +407,7 @@ PRESET_CONFIGS = {
     # Fish DAC-based (true STS path)
     "e2b-fish": SpeechModelConfig(
         llm_dim=2304, text_vocab_size=256000,
-        codec_vocab_size=1024, n_codebooks=10, frame_rate_hz=21.53,
+        codec_vocab_size=1000, n_codebooks=8, frame_rate_hz=21.53,
         codec_backend="fish", layer_split=True,
         n_llm_layers=26, split_layer=18,
         depth_transformer_dim=512, depth_transformer_layers=4,
@@ -415,7 +415,7 @@ PRESET_CONFIGS = {
     ),
     "e4b-fish": SpeechModelConfig(
         llm_dim=2560, text_vocab_size=256000,
-        codec_vocab_size=1024, n_codebooks=10, frame_rate_hz=21.53,
+        codec_vocab_size=1000, n_codebooks=8, frame_rate_hz=21.53,
         codec_backend="fish", layer_split=True,
         n_llm_layers=42, split_layer=28,
         depth_transformer_dim=512, depth_transformer_layers=4,
@@ -423,7 +423,7 @@ PRESET_CONFIGS = {
     ),
     "27b-fish": SpeechModelConfig(
         llm_dim=4608, text_vocab_size=256000,
-        codec_vocab_size=1024, n_codebooks=10, frame_rate_hz=21.53,
+        codec_vocab_size=1000, n_codebooks=8, frame_rate_hz=21.53,
         codec_backend="fish", layer_split=True,
         n_llm_layers=62, split_layer=42,
         depth_transformer_dim=512, depth_transformer_layers=4,

@@ -133,6 +133,10 @@ python3 scripts/bench-all-backends.py --rounds 20 --json > bench-$(date +%Y%m%d)
 
 You can track these metrics across fine-tuning iterations to see if adapter changes affect inference speed.
 
+### MLX speculative draft snapshot
+
+After starting `mlx-server.py`, `python3 scripts/bench-speculative-sweep.py` reads `/health` (including `inference_tuning`) and reports median streaming TTFT and tok/s. To sweep `GEMMA_SPECULATIVE_TOKENS`, restart the server per value; see [Guide 08](08-inference-sota-roadmap.md).
+
 ## Hardware Scaling
 
 Expected performance by hardware tier:

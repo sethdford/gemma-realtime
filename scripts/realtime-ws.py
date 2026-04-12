@@ -11,7 +11,7 @@ Five TTS backends (--tts flag):
                            no separate mlx-server.py needed.
     fish:                  Fish Audio DAC codec + Fast AR depth decoder (true STS path)
                            SELF-CONTAINED: loads Gemma + Fish codec locally.
-                           10 codebooks, 44.1kHz, MOSS-Speech layer splitting.
+                           8 FSQ groups, 44.1kHz, MOSS-Speech layer splitting.
                            pip install fish-speech (or descript-audio-codec)
 
 Features:
@@ -48,12 +48,16 @@ Usage:
     python3 scripts/realtime-ws.py --tts voxtral            # Voxtral 4B MLX
     python3 scripts/realtime-ws.py --tts native             # SNAC decoder
     python3 scripts/realtime-ws.py --port 8742 --llm-url http://localhost:8741
+
+    Tuning (env, read at import): GEMMA_MIN_FLUSH_CHARS, GEMMA_MAX_BUFFER_CHARS — guides/08-inference-sota-roadmap.md
 """
 
 import argparse
 import asyncio
 import base64
 import json
+import os
+import platform
 import re
 import sys
 import time
@@ -72,8 +76,8 @@ BYTES_PER_SAMPLE = 2
 VAD_THRESHOLD = 0.4
 SILENCE_TIMEOUT_S = 0.8
 SENTENCE_BOUNDARY = re.compile(r"[.!?]\s*$|[.!?][\"']\s*$")
-MIN_FLUSH_CHARS = 12
-MAX_BUFFER_CHARS = 120
+MIN_FLUSH_CHARS = int(os.environ.get("GEMMA_MIN_FLUSH_CHARS", "12"))
+MAX_BUFFER_CHARS = int(os.environ.get("GEMMA_MAX_BUFFER_CHARS", "120"))
 
 
 class RealtimeSession:
@@ -330,7 +334,7 @@ class FishTTSEngine:
             import mlx.core as mx
             probe = inner_model.embed_tokens(mx.array([[0]]))
             llm_dim = probe.shape[-1]
-            config = FishSTSConfig(llm_dim=llm_dim, fish_codebook_size=4096, fish_n_codebooks=3)
+            config = FishSTSConfig(llm_dim=llm_dim)
             self._sts_model = FishSpeechToSpeech(config)
             print("  Fish TTS: WARNING — no trained weights, random init", flush=True)
 
@@ -349,7 +353,7 @@ class FishTTSEngine:
         emb = self._inner.embed_tokens(mx.array([ids]))
 
         cb0_out, speech_hidden = self._sts_model.generate_cb0(
-            emb, temperature=0.8, top_k=50
+            emb, temperature=0.5, top_k=30
         )
         mx.eval(cb0_out, speech_hidden)
 
@@ -496,6 +500,20 @@ class RealtimeServer:
         self._shared_vad = None
         self._shared_asr = None
         self._shared_tts = None
+        self._iosurface_health_logged = False
+
+    def _maybe_log_iosurface_health(self):
+        if self._iosurface_health_logged or platform.system() != "Darwin":
+            return
+        self._iosurface_health_logged = True
+        try:
+            from native_hw import health_payload_for_http
+
+            h = health_payload_for_http(None)
+            if h:
+                print(f"  libgemma_hw / IOSurface: {h}", flush=True)
+        except Exception as e:
+            print(f"  libgemma_hw health probe: {e}", flush=True)
 
     async def _ensure_shared_models(self):
         """Load heavyweight models once at startup, share across all sessions."""
@@ -566,7 +584,7 @@ class RealtimeServer:
             self._gemma = gemma
             self._gemma_tokenizer = tokenizer
             self._local_llm = LocalLLMClient(gemma, tokenizer)
-            print("    Fish TTS ready (10-codebook, 44.1kHz, self-contained)", flush=True)
+            print("    Fish TTS ready (8-group FSQ, 44.1kHz, self-contained)", flush=True)
         elif self.tts_backend == "kokoro-onnx":
             voice = self.voice or "af_bella"
             self._shared_tts = KokoroOnnxTTSEngine(voice=voice)
@@ -610,6 +628,7 @@ class RealtimeServer:
 
         self._shared_vad.load()
         self._shared_asr.load()
+        self._maybe_log_iosurface_health()
 
     async def _handle_connection(self, websocket):
         session_id = str(uuid.uuid4())[:12]
@@ -941,7 +960,7 @@ def main():
         help="TTS backend: kokoro-onnx (default, 82M, 4.5 MOS, fast), "
              "f5 (voice cloning, flow-matching DiT), "
              "kokoro (needs Python <3.13), voxtral (4B MLX), native (SNAC decoder), "
-             "fish (Fish DAC 10-codebook, true STS path)",
+             "fish (Fish DAC 8-group FSQ, true STS path)",
     )
     parser.add_argument(
         "--ref-audio", default=None,

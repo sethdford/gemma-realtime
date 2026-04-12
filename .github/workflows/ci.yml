@@ -34,6 +34,45 @@ jobs:
           pip install pytest
           python3 -m pytest tests/test_server.py -v -k "not Integration"
 
+      - name: Verify Fish STS architecture (no GPU needed)
+        run: |
+          pip install mlx numpy safetensors
+          python3 -c "
+          import sys; sys.path.insert(0, 'scripts')
+          from fish_sts import FishSpeechToSpeech, FishSTSConfig
+          cfg = FishSTSConfig(llm_dim=256, fish_codebook_size=1000, fish_n_codebooks=8,
+                              speech_adapter_dim=64, speech_adapter_heads=4,
+                              speech_adapter_layers=2, speech_adapter_ff=128,
+                              fast_ar_dim=64, fast_ar_layers=2, fast_ar_heads=4)
+          m = FishSpeechToSpeech(cfg)
+          import mlx.core as mx
+          x = mx.zeros((1, 5), dtype=mx.int32)
+          out = m.audio_input(x)
+          assert out.shape == (1, 5, 256), f'Bad projection: {out.shape}'
+          print('Fish STS architecture OK: projection (1,5) -> (1,5,256)')
+          "
+
+  native-hw-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build libgemma_hw
+        run: make -C secret-apis libgemma_hw
+
+      - name: Prove native HW (IOSurface + Metal + SGEMM)
+        run: |
+          pip install numpy mlx
+          python3 scripts/prove-native-hw.py
+
+      - name: Unit tests (native_hw)
+        run: |
+          pip install numpy mlx
+          python3 -m unittest discover -s tests -p 'test_native_hw.py' -v
+
   pages:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest

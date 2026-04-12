@@ -196,9 +196,16 @@ def test_projections():
     model.load_weights(list(w.items()), strict=False)
     print(f"  Loaded weights from {w_path}", flush=True)
 
-    data_path = Path("data/libritts-multicodebook.jsonl")
-    if not data_path.exists():
-        skip("Projection alignment", "No multicodebook data")
+    fish_data = Path("data/libritts-fish-dac-tokens.jsonl")
+    snac_data = Path("data/libritts-multicodebook.jsonl")
+    if fish_data.exists():
+        data_path = fish_data
+        cb0_key = "fish_cb0"
+    elif snac_data.exists():
+        data_path = snac_data
+        cb0_key = "cb0"
+    else:
+        skip("Projection alignment", "No tokenized data found")
         return
 
     with open(data_path) as f:
@@ -206,7 +213,7 @@ def test_projections():
 
     cosine_sims = []
     for item in items:
-        cb0 = item["cb0"][:50]
+        cb0 = (item.get(cb0_key) or item.get("cb0", []))[:50]
         text = item["text"]
         if not cb0 or not text:
             continue
@@ -251,15 +258,22 @@ def test_generation(model, inner, tokenizer):
     import mlx.core as mx
     import mlx.nn as nn
 
-    data_path = Path("data/libritts-multicodebook.jsonl")
-    if not data_path.exists():
-        skip("Generation", "No multicodebook data")
+    fish_data = Path("data/libritts-fish-dac-tokens.jsonl")
+    snac_data = Path("data/libritts-multicodebook.jsonl")
+    if fish_data.exists():
+        data_path = fish_data
+        cb0_key = "fish_cb0"
+    elif snac_data.exists():
+        data_path = snac_data
+        cb0_key = "cb0"
+    else:
+        skip("Generation", "No tokenized data found")
         return
 
     with open(data_path) as f:
         item = json.loads(f.readline())
 
-    cb0 = item["cb0"][:30]
+    cb0 = (item.get(cb0_key) or item.get("cb0", []))[:30]
     cb0_arr = mx.array([cb0], dtype=mx.int32)
 
     t0 = time.time()
@@ -277,14 +291,15 @@ def test_generation(model, inner, tokenizer):
 
     check("Produces logits", logits.shape[1] == len(cb0) and logits.shape[2] > 100,
           f"shape={logits.shape}, {gen_ms:.1f}ms")
-    check("Non-uniform", entropy < np.log(4096),
-          f"entropy={entropy:.2f} vs random={np.log(4096):.2f}")
-    check("Has confidence", top_prob > 1.0 / 4096,
+    vocab = model.config.fish_codebook_size + 1
+    check("Non-uniform", entropy < np.log(vocab),
+          f"entropy={entropy:.2f} vs random={np.log(vocab):.2f}")
+    check("Has confidence", top_prob > 1.0 / vocab,
           f"top_prob={top_prob:.4f}")
 
     # Autoregressive generation test
     t0 = time.time()
-    cb0_gen, hidden_gen = model.generate_cb0(audio_emb, temperature=0.8, top_k=50, max_frames=50)
+    cb0_gen, hidden_gen = model.generate_cb0(audio_emb, temperature=0.5, top_k=30, max_frames=50)
     mx.eval(cb0_gen, hidden_gen)
     ar_ms = (time.time() - t0) * 1000
     n_generated = cb0_gen.shape[-1] if cb0_gen.size > 0 else 0
@@ -333,7 +348,7 @@ def test_full_pipeline(model, codec, codec_name):
 
     # Step 4: Generate cb0
     t0 = time.time()
-    cb0_out, speech_hidden = model.generate_cb0(audio_emb, temperature=0.8, top_k=50, max_frames=80)
+    cb0_out, speech_hidden = model.generate_cb0(audio_emb, temperature=0.5, top_k=30, max_frames=80)
     mx.eval(cb0_out, speech_hidden)
     gen_ms = (time.time() - t0) * 1000
     n_frames = cb0_out.shape[-1] if cb0_out.size > 0 else 0
@@ -413,9 +428,9 @@ def test_duplex(model):
 # ══════════════════════════════════════════════════════════
 
 def test_eval_metrics(model, codec, codec_name):
-    """Compute MOS proxy on model-generated audio."""
+    """Compute audio quality on model-generated audio."""
     print(f"\n{'─'*60}")
-    print(f"  Test 7: Eval Metrics (MOS proxy)")
+    print(f"  Test 7: Eval Metrics (audio quality score)")
     print(f"{'─'*60}")
 
     if model is None or codec is None:
@@ -423,12 +438,11 @@ def test_eval_metrics(model, codec, codec_name):
         return
 
     import mlx.core as mx
-    from eval_sts import estimate_mos
+    from eval_sts import estimate_audio_quality
     from codec import CodecTokens, CodecType
 
-    # Generate from random embedding
     rand_emb = mx.random.normal((1, 20, model.config.llm_dim)) * 0.1
-    cb0_out, speech_hidden = model.generate_cb0(rand_emb, temperature=0.8, max_frames=50)
+    cb0_out, speech_hidden = model.generate_cb0(rand_emb, temperature=0.5, max_frames=50)
     mx.eval(cb0_out, speech_hidden)
 
     if cb0_out.size == 0:
@@ -448,9 +462,9 @@ def test_eval_metrics(model, codec, codec_name):
     audio_out = codec.decode(out_tokens)
     sr = codec.sample_rate
 
-    mos = estimate_mos(audio_out, sr=sr)
-    check("MOS proxy computable", mos > 0, f"MOS~{mos:.1f}")
-    check("MOS > noise floor", mos > 1.0, f"MOS~{mos:.1f}")
+    aq = estimate_audio_quality(audio_out, sr=sr)
+    check("Audio quality computable", aq > 0, f"AQ={aq:.1f}")
+    check("Above noise floor", aq > 1.0, f"AQ={aq:.1f}")
 
 
 # ══════════════════════════════════════════════════════════

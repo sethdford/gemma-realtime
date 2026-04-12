@@ -3,24 +3,24 @@
 True Speech-to-Speech on Fish Audio's Shoulders.
 
 No text bottleneck. Audio tokens in, reasoning happens, audio tokens out.
-Uses Fish Audio's pre-trained DAC codec (10-codebook RVQ, 44.1kHz, ~21 Hz)
+Uses Fish Audio's pre-trained DAC codec (8 FSQ groups, 44.1kHz, ~21 Hz)
 and Fast AR depth model as the audio backbone, with Gemma providing reasoning
 via MOSS-Speech-style modality-based layer splitting.
 
 Architecture:
     User Audio (44.1kHz)
-        → Fish DAC Encode → [cb0..cb9] tokens (~21 Hz, 10 codebooks)
+        → Fish DAC Encode → [cb0..cb7] tokens (~21 Hz, 8 groups)
         → Extract cb0 (semantic) → AudioInputProjection → Gemma embedding space
         → Gemma (frozen text weights, layer-split speech layers):
             Lower N layers: shared (text + speech)
             Upper M layers: split into text branch + speech branch
             Text branch → inner monologue (never spoken, grounds reasoning)
             Speech branch → agent cb0 tokens (semantic content)
-        → Fish Fast AR: agent cb0 → cb1..cb9 (acoustic reconstruction)
+        → Fish Fast AR: agent cb0 → cb1..cb7 (acoustic reconstruction)
         → Fish DAC Decode → Agent Audio (44.1kHz)
 
 Why this works:
-    1. Fish's codec is SOTA (10 codebooks, 10M+ hours training, GRPO-aligned)
+    1. Fish's codec is SOTA (8 FSQ groups × 1000 codes, 10M+ hours training, GRPO-aligned)
     2. Fish's Fast AR (400M) replaces our hand-trained depth decoder
     3. MOSS-Speech layer splitting preserves Gemma's text reasoning intact
     4. Frozen pre-training: Gemma's text weights never change → no forgetting
@@ -78,13 +78,13 @@ class FishSTSConfig:
     n_llm_layers: int = 42             # total Gemma transformer layers
     split_layer: int = 28              # shared layers before split (MOSS-Speech)
 
-    # Fish DAC codec
-    fish_codebook_size: int = 1024     # FSQ entries per codebook
-    fish_n_codebooks: int = 10         # total RVQ codebooks
+    # Fish DAC codec (8 FSQ groups, levels=[8,5,5,5] → 1000 codes each)
+    fish_codebook_size: int = 1000     # prod([8,5,5,5]) per FSQ group
+    fish_n_codebooks: int = 8          # FSQ groups (not RVQ codebooks)
     fish_frame_rate: float = 21.53     # ~21 Hz (44100 / 2048)
     fish_sample_rate: int = 44100
 
-    # Fast AR depth model (Fish's cb0 → cb1..cb9)
+    # Fast AR depth model (cb0 → cb1..cb7)
     fast_ar_dim: int = 512             # Fish Fast AR hidden dim
     fast_ar_layers: int = 4            # depth transformer layers
     fast_ar_heads: int = 8
@@ -287,18 +287,18 @@ class LayerSplitAdapter(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Fish Fast AR Depth Decoder (cb0 → cb1..cb9)
+# Fish Fast AR Depth Decoder (cb0 → cb1..cb7)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FishFastAR(nn.Module):
-    """Depth transformer generating cb1..cb9 from cb0 at each timestep.
+    """Depth transformer generating cb1..cb7 from cb0 at each timestep.
 
     This is the MLX equivalent of Fish's 400M Fast AR model. It can be:
       1. Initialized randomly and trained on Fish's codec data
       2. Loaded from Fish's pre-trained Fast AR weights (recommended)
 
     For each time frame, given cb0 and the temporal hidden state, it
-    autoregressively generates cb1, cb2, ..., cb9 (9 residual codebooks).
+    autoregressively generates cb1, cb2, ..., cb7 (7 depth codebooks).
     """
 
     def __init__(self, config: FishSTSConfig):
@@ -325,7 +325,7 @@ class FishFastAR(nn.Module):
             cb0_token: (batch,) cb0 token for this frame
 
         Returns:
-            depth_tokens: (batch, 9) cb1..cb9 tokens
+            depth_tokens: (batch, n_depth) cb1..cb_N tokens
         """
         context = self.context_proj(temporal_hidden)     # (B, 1, dim)
         cb0_emb = self.cb_embed(cb0_token)[:, None, :]  # (B, 1, dim)
@@ -412,7 +412,7 @@ class FishSpeechToSpeech(nn.Module):
     Components:
         audio_input:    Fish cb0 tokens → Gemma embedding space
         layer_split:    Speech-specific upper layers (trainable)
-        fast_ar:        Fish Fast AR for cb0 → cb1..cb9 depth decoding
+        fast_ar:        Fish Fast AR for cb0 → cb1..cb7 depth decoding
         state_head:     LISTEN/SPEAK/INTERRUPT turn-taking prediction
 
     The frozen Gemma backbone is NOT stored here — it's loaded separately
@@ -423,9 +423,8 @@ class FishSpeechToSpeech(nn.Module):
         super().__init__()
         self.config = config
 
-        # Audio ↔ Gemma projections
+        # Audio ↔ Gemma projection (trained in Phase A, used for all token embeddings)
         self.audio_input = AudioInputProjection(config)
-        self.audio_embed = nn.Embedding(config.audio_vocab_size, config.llm_dim)
 
         # MOSS-Speech layer splitting
         self.layer_split = LayerSplitAdapter(config)
@@ -492,7 +491,7 @@ class FishSpeechToSpeech(nn.Module):
 
     def decode_depth(self, cb0_tokens: mx.array, speech_hidden: mx.array,
                      temperature: float = 0.6) -> mx.array:
-        """Run Fish Fast AR to get full 10-codebook frame from cb0.
+        """Run Fish Fast AR to get full N-codebook frame from cb0.
 
         Args:
             cb0_tokens: (batch, T) generated cb0 tokens
@@ -512,7 +511,7 @@ class FishSpeechToSpeech(nn.Module):
 
         depth_all = mx.stack(depth_tokens, axis=1)  # (B, T, 9)
 
-        # Combine: cb0 (B, T, 1) + cb1..cb9 (B, T, 9) → (B, 10, T)
+        # Combine: cb0 (B, T, 1) + cb1..cbN (B, T, N-1) → (B, N, T)
         cb0_expanded = cb0_tokens.reshape(B, T, 1)
         all_codes = mx.concatenate([cb0_expanded, depth_all], axis=-1)  # (B, T, 10)
         return all_codes.transpose(0, 2, 1)  # (B, 10, T)
@@ -527,8 +526,13 @@ class FishSpeechToSpeech(nn.Module):
                      max_frames: int = 500) -> tuple[mx.array, mx.array]:
         """Autoregressive cb0 generation from shared hidden states.
 
-        This is the main generation loop for the speech branch.
-        Produces semantic audio tokens frame-by-frame.
+        Uses self.audio_input (the trained projection) for token embeddings,
+        matching Phase C training where all tokens flow through audio_input.
+
+        IMPORTANT: We store raw embeddings and do a full forward pass through
+        speech layers at each step. This matches training, where raw embeddings
+        pass through layers exactly once. A KV-cache optimization can be added
+        later — correctness first.
 
         Returns:
             cb0_tokens: (1, T) generated cb0 tokens
@@ -538,15 +542,14 @@ class FishSpeechToSpeech(nn.Module):
         tokens = []
         hiddens = []
 
-        bos = mx.full((B, 1), self.config.AUDIO_BOS - self.config.AUDIO_TOKEN_OFFSET,
-                       dtype=mx.int32)
-        prev_emb = self.audio_embed(bos)
-
-        x = mx.concatenate([shared_hidden, prev_emb], axis=1)
+        bos_token = mx.zeros((B, 1), dtype=mx.int32)
+        bos_emb = self.audio_input(bos_token)
+        raw_embs = mx.concatenate([shared_hidden, bos_emb], axis=1)
 
         for step in range(max_frames):
-            T = x.shape[1]
+            T = raw_embs.shape[1]
             mask = nn.MultiHeadAttention.create_additive_causal_mask(T)
+            x = raw_embs
             for layer in self.layer_split.speech_layers:
                 x = layer(x, mask=mask)
 
@@ -570,10 +573,11 @@ class FishSpeechToSpeech(nn.Module):
                 break
 
             tokens.append(next_token)
-            next_emb = self.audio_embed(
-                mx.clip(next_token, 0, self.config.audio_vocab_size - 1).reshape(B, 1)
+            next_emb = self.audio_input(
+                mx.clip(next_token, 0, self.config.fish_codebook_size - 1).reshape(B, 1)
             )
-            x = mx.concatenate([x, next_emb], axis=1)
+            raw_embs = mx.concatenate([raw_embs, next_emb], axis=1)
+            mx.eval(raw_embs)
 
         if not tokens:
             return mx.zeros((B, 0), dtype=mx.int32), mx.zeros((B, 0, self.config.llm_dim))

@@ -211,11 +211,12 @@ class SpeechDecoder(nn.Module):
         return self.output_head(x)
 
     def generate(self, llm_hidden: mx.array, temperature: float = 0.8,
-                 top_k: int = 50) -> mx.array:
+                 top_k: int = 50, max_tokens: Optional[int] = None) -> mx.array:
         """Autoregressive generation of codec tokens.
 
         Args:
             llm_hidden: (1, seq, llm_dim) embeddings from Gemma embed_tokens
+            max_tokens: cap steps (default: self.max_tokens from config)
 
         Returns:
             tokens: (1, generated_len) codec token IDs
@@ -224,8 +225,9 @@ class SpeechDecoder(nn.Module):
 
         tokens = [self.BOS_TOKEN]
         kv_caches = [None] * len(self.layers)
+        step_limit = self.max_tokens if max_tokens is None else min(max_tokens, self.max_tokens)
 
-        for step in range(self.max_tokens):
+        for step in range(step_limit):
             token_id = mx.array([[tokens[-1]]], dtype=mx.int32)
             x = self.token_embedding(token_id)
             x = self.pos_encoding(x, offset=step)
@@ -257,7 +259,8 @@ class SpeechDecoder(nn.Module):
         return mx.array([tokens[1:]], dtype=mx.int32)
 
     def generate_streaming(self, llm_hidden: mx.array, chunk_size: int = 12,
-                           temperature: float = 0.8, top_k: int = 50):
+                           temperature: float = 0.8, top_k: int = 50,
+                           max_tokens: Optional[int] = None):
         """Streaming generation: yield chunks of codec tokens.
 
         Yields every `chunk_size` tokens for incremental decoding.
@@ -267,8 +270,9 @@ class SpeechDecoder(nn.Module):
         tokens = [self.BOS_TOKEN]
         kv_caches = [None] * len(self.layers)
         chunk_buffer = []
+        step_limit = self.max_tokens if max_tokens is None else min(max_tokens, self.max_tokens)
 
-        for step in range(self.max_tokens):
+        for step in range(step_limit):
             token_id = mx.array([[tokens[-1]]], dtype=mx.int32)
             x = self.token_embedding(token_id)
             x = self.pos_encoding(x, offset=step)
@@ -463,14 +467,16 @@ class ContextualSpeechDecoder(nn.Module):
 
     def generate(self, llm_hidden: mx.array, temperature: float = 0.8,
                  top_k: int = 50,
-                 history: list[tuple[mx.array, int]] = None) -> mx.array:
+                 history: list[tuple[mx.array, int]] = None,
+                 max_tokens: Optional[int] = None) -> mx.array:
         """Autoregressive generation with conversation context."""
         context = self._build_context(llm_hidden, history)
 
         tokens = [self.BOS_TOKEN]
         kv_caches = [None] * len(self.layers)
+        step_limit = self.max_tokens if max_tokens is None else min(max_tokens, self.max_tokens)
 
-        for step in range(self.max_tokens):
+        for step in range(step_limit):
             token_id = mx.array([[tokens[-1]]], dtype=mx.int32)
             x = self.token_embedding(token_id)
             x = self.pos_encoding(x, offset=step)

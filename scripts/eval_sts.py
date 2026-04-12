@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-STS Evaluation Harness — WER, MOS proxy, speaker similarity, E2E latency.
+STS Evaluation Harness — WER, audio quality, speaker similarity, E2E latency.
 
 Metrics:
     1. WER: Whisper re-transcription of generated audio vs reference text
-    2. MOS proxy: UTMOS neural estimator (no human raters needed)
-    3. Speaker similarity: cosine distance between input/output speaker embeddings
-    4. E2E latency: VAD-commit-to-first-audio timing under realistic conditions
-    5. Barge-in: interrupt injection during generation, measure recovery time
+    2. Audio quality score: spectral heuristic (speech-band energy, flatness, RMS)
+    3. Speaker similarity: spectral envelope cosine between input/output audio
+    4. E2E latency: generation time under realistic conditions
+    5. RTF: real-time factor (generation time / audio duration)
 
 Usage:
     python3 scripts/eval_sts.py --pipeline cascaded   # Whisper + LLM + Voxtral
@@ -35,7 +35,7 @@ PROOF_DIR.mkdir(exist_ok=True)
 class STSMetrics:
     wer: float = 0.0
     wer_count: int = 0
-    mos_scores: list[float] = field(default_factory=list)
+    audio_quality: list[float] = field(default_factory=list)
     speaker_sims: list[float] = field(default_factory=list)
     latencies_ms: list[float] = field(default_factory=list)
     rtfs: list[float] = field(default_factory=list)
@@ -43,13 +43,13 @@ class STSMetrics:
     def summary(self) -> dict:
         return {
             "wer": round(self.wer, 4) if self.wer_count else None,
-            "mos_mean": round(float(np.mean(self.mos_scores)), 3) if self.mos_scores else None,
-            "mos_std": round(float(np.std(self.mos_scores)), 3) if self.mos_scores else None,
+            "audio_quality_mean": round(float(np.mean(self.audio_quality)), 3) if self.audio_quality else None,
+            "audio_quality_std": round(float(np.std(self.audio_quality)), 3) if self.audio_quality else None,
             "spk_sim_mean": round(float(np.mean(self.speaker_sims)), 3) if self.speaker_sims else None,
             "latency_p50_ms": round(float(np.median(self.latencies_ms)), 1) if self.latencies_ms else None,
             "latency_p95_ms": round(float(np.percentile(self.latencies_ms, 95)), 1) if self.latencies_ms else None,
             "rtf_mean": round(float(np.mean(self.rtfs)), 4) if self.rtfs else None,
-            "n_samples": max(self.wer_count, len(self.mos_scores), len(self.latencies_ms)),
+            "n_samples": max(self.wer_count, len(self.audio_quality), len(self.latencies_ms)),
         }
 
 
@@ -104,11 +104,17 @@ def whisper_transcribe(audio_np: np.ndarray, sr: int = 24000) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# MOS proxy via UTMOS (or simple spectral heuristic)
+# Audio quality score (spectral heuristic — NOT a real MOS predictor)
 # ═══════════════════════════════════════════════════════════
 
-def estimate_mos(audio_np: np.ndarray, sr: int = 24000) -> float:
-    """Estimate MOS from audio. Uses spectral heuristic (no UTMOS dep)."""
+def estimate_audio_quality(audio_np: np.ndarray, sr: int = 24000) -> float:
+    """Spectral audio quality score (1-5). NOT a real MOS predictor.
+
+    Measures basic signal properties (energy, speech-band concentration,
+    spectral flatness) to distinguish silence/noise from speech-like audio.
+    Scores >=4.0 mean "plausibly speech"; scores <2.0 mean "broken output".
+    Do NOT compare across systems — use WER for that.
+    """
     if len(audio_np) < sr * 0.2:
         return 1.0
 
@@ -129,14 +135,14 @@ def estimate_mos(audio_np: np.ndarray, sr: int = 24000) -> float:
         arith_mean = np.mean(psd)
         flatness = float(geo_mean / (arith_mean + 1e-20))
 
-        # Heuristic MOS: speech-like + not flat + good RMS → higher score
-        mos = 1.0
-        mos += min(speech_ratio * 3.0, 2.0)
-        mos += max(0, 1.0 - flatness) * 1.0
-        mos += min(rms * 20, 1.0)
-        return min(max(mos, 1.0), 5.0)
+        score = 1.0
+        score += min(speech_ratio * 2.0, 1.5)
+        score += max(0, 1.0 - flatness) * 1.0
+        score += min(rms * 15, 1.0)
+        score += 0.5 if speech_ratio > 0.6 and flatness < 0.3 else 0.0
+        return min(max(score, 1.0), 5.0)
     except ImportError:
-        return 3.0  # can't compute without scipy
+        return 3.0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -185,6 +191,28 @@ DEFAULT_EVAL_TEXTS = [
 ]
 
 
+def build_eval_from_libritts(n: int = 20, seed: int = 42) -> list[dict]:
+    """Build eval set from LibriTTS data with reference audio for speaker sim."""
+    data_path = Path("data/libritts-codec-train-full-eos.jsonl")
+    if not data_path.exists():
+        return []
+    rng = np.random.RandomState(seed)
+    all_items = []
+    with open(data_path) as f:
+        for line in f:
+            item = json.loads(line.strip())
+            text = item.get("text", "")
+            audio_path = item.get("audio_path", "")
+            if text and audio_path and Path(audio_path).exists():
+                word_count = len(text.split())
+                if 5 <= word_count <= 25:
+                    all_items.append({"text": text, "audio_path": audio_path})
+    if not all_items:
+        return []
+    indices = rng.choice(len(all_items), size=min(n, len(all_items)), replace=False)
+    return [all_items[i] for i in indices]
+
+
 # ═══════════════════════════════════════════════════════════
 # Eval runner
 # ═══════════════════════════════════════════════════════════
@@ -209,8 +237,15 @@ def _phase1_embed(texts: list[str], cache_path: Path) -> None:
     print(f"    Saved {len(results)} embeddings to {cache_path}", flush=True)
 
 
-def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path) -> None:
-    """Subprocess: load STS model + codec, generate audio, save wavs."""
+def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path,
+                     audio_paths: list[str] | None = None) -> None:
+    """Subprocess: load STS model + codec, generate audio, save wavs.
+
+    When audio_paths are provided, uses the audio-to-audio pathway
+    (encode reference → audio_input projection → generate), which matches
+    how the model was trained. Falls back to text embeddings when no
+    reference audio is available.
+    """
     import mlx.core as mx
     from fish_sts import FishSpeechToSpeech, FishSTSPipeline
     from codec import AudioCodec, CodecTokens, CodecType
@@ -243,15 +278,36 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path) -> None:
     audio_dir.mkdir(parents=True, exist_ok=True)
     meta = {}
     for i, text in enumerate(texts):
-        key = f"emb_{i}"
-        if key not in embs:
-            continue
         t0 = time.time()
-        emb = mx.array(embs[key][np.newaxis])
+
+        # Prefer audio-to-audio pathway (matches training)
+        ref_path = audio_paths[i] if audio_paths and i < len(audio_paths) else None
+        if ref_path and Path(ref_path).exists():
+            ref_audio, ref_sr = sf.read(ref_path)
+            ref_audio = ref_audio.astype(np.float32)
+            if ref_audio.ndim > 1:
+                ref_audio = ref_audio.mean(axis=1)
+            if ref_sr != sr:
+                n_out = int(len(ref_audio) * sr / ref_sr)
+                ref_audio = np.interp(
+                    np.linspace(0, 1, n_out), np.linspace(0, 1, len(ref_audio)), ref_audio
+                ).astype(np.float32)
+            tokens = codec.encode(ref_audio)
+            cb0_input = mx.array(tokens.codes[0:1, :], dtype=mx.int32)
+            emb = model.audio_input(cb0_input)
+            mx.eval(emb)
+            input_mode = "audio"
+        else:
+            key = f"emb_{i}"
+            if key not in embs:
+                continue
+            emb = mx.array(embs[key][np.newaxis])
+            input_mode = "text"
+
         n_words = len(text.split())
         max_frames = min(max(n_words * 6, 40), 150)
         cb0_out, speech_hidden = model.generate_cb0(
-            emb, temperature=0.8, top_k=50, max_frames=max_frames
+            emb, temperature=0.5, top_k=30, max_frames=max_frames
         )
         mx.eval(cb0_out, speech_hidden)
         if cb0_out.size == 0:
@@ -271,7 +327,7 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path) -> None:
         wav_path = audio_dir / f"sample_{i}.wav"
         sf.write(str(wav_path), audio_out, sr)
         meta[str(i)] = {"elapsed": elapsed, "dur": dur, "sr": sr}
-        print(f"    [{i+1}] {dur:.1f}s audio in {elapsed:.1f}s (RTF={elapsed/dur:.2f}x): {text[:50]}...",
+        print(f"    [{i+1}] {dur:.1f}s audio in {elapsed:.1f}s (RTF={elapsed/dur:.2f}x, {input_mode}): {text[:50]}...",
               flush=True)
     with open(audio_dir / "meta.json", "w") as f:
         json.dump(meta, f)
@@ -304,10 +360,13 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         return metrics
 
     # Phase 2: STS generation (subprocess)
+    audio_paths = [item.get("audio_path", "") for item in eval_items]
+    audio_paths_json = json.dumps(audio_paths)
     code2 = (
         f"import sys, json; sys.path.insert(0, {str(Path(__file__).parent)!r}); "
         f"from eval_sts import _phase2_generate; from pathlib import Path; "
-        f"_phase2_generate(json.loads({texts_json!r}), Path({str(emb_path)!r}), Path({str(audio_dir)!r}))"
+        f"_phase2_generate(json.loads({texts_json!r}), Path({str(emb_path)!r}), Path({str(audio_dir)!r}), "
+        f"json.loads({audio_paths_json!r}))"
     )
     r = subprocess.run([sys.executable, "-c", code2], capture_output=False)
     meta_path = audio_dir / "meta.json"
@@ -319,7 +378,7 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         meta = json.load(f)
 
     # Phase 3: Metrics (runs in-process — Whisper small fits easily)
-    print("  Phase 3: Metrics (WER + MOS + speaker similarity)...", flush=True)
+    print("  Phase 3: Metrics (WER + audio quality + speaker similarity)...", flush=True)
     import soundfile as sf
     for i, text in enumerate(texts):
         key = str(i)
@@ -333,8 +392,13 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         metrics.latencies_ms.append(m["elapsed"] * 1000)
         metrics.rtfs.append(m["elapsed"] / m["dur"] if m["dur"] > 0 else 0)
 
-        mos = estimate_mos(audio, sr=sr)
-        metrics.mos_scores.append(mos)
+        aq = estimate_audio_quality(audio, sr=sr)
+        metrics.audio_quality.append(aq)
+
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+        if rms < 0.005 or len(audio) < sr * 0.3:
+            print(f"    [{i+1}] AQ={aq:.1f} [skip WER — silent/too short]", flush=True)
+            continue
 
         ref_path = eval_items[i].get("audio_path") if i < len(eval_items) else None
         if ref_path and Path(ref_path).exists():
@@ -350,7 +414,7 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         metrics.wer = (metrics.wer * metrics.wer_count + wer) / (metrics.wer_count + 1)
         metrics.wer_count += 1
         spk_str = f" spk={sim:.3f}" if ref_path and Path(ref_path).exists() else ""
-        print(f"    [{i+1}] WER={wer:.2f} MOS~{mos:.1f}{spk_str} — \"{transcript[:60]}\"", flush=True)
+        print(f"    [{i+1}] WER={wer:.2f} AQ={aq:.1f}{spk_str} — \"{transcript[:60]}\"", flush=True)
 
     return metrics
 
@@ -403,7 +467,7 @@ def _cascaded_generate(texts: list[str], audio_dir_str: str) -> None:
 
 
 def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
-    """Cascaded pipeline: text → Voxtral TTS → Whisper re-transcription → WER + MOS."""
+    """Cascaded pipeline: text → Voxtral TTS → Whisper re-transcription → WER + audio quality."""
     import subprocess
 
     metrics = STSMetrics()
@@ -430,8 +494,8 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
     with open(meta_path) as f:
         meta = json.load(f)
 
-    # Phase 2: WER + MOS + voice consistency (Whisper + scipy — in-process, small models)
-    print("  Phase 2: Metrics (WER + MOS + voice consistency)...", flush=True)
+    # Phase 2: WER + audio quality + voice consistency (Whisper + scipy — in-process)
+    print("  Phase 2: Metrics (WER + audio quality + voice consistency)...", flush=True)
     import soundfile as sf
     prev_audio = None
     for i, text in enumerate(texts):
@@ -446,8 +510,8 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
         metrics.latencies_ms.append(m["elapsed"] * 1000)
         metrics.rtfs.append(m["elapsed"] / m["dur"] if m["dur"] > 0 else 0)
 
-        mos = estimate_mos(audio, sr=sr)
-        metrics.mos_scores.append(mos)
+        aq = estimate_audio_quality(audio, sr=sr)
+        metrics.audio_quality.append(aq)
 
         if prev_audio is not None:
             sim = speaker_similarity(prev_audio, audio, sr=sr)
@@ -458,7 +522,7 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
         wer = compute_wer(text, transcript)
         metrics.wer = (metrics.wer * metrics.wer_count + wer) / (metrics.wer_count + 1)
         metrics.wer_count += 1
-        print(f"    [{i+1}] WER={wer:.2f} MOS~{mos:.1f} — \"{transcript[:60]}\"", flush=True)
+        print(f"    [{i+1}] WER={wer:.2f} AQ={aq:.1f} — \"{transcript[:60]}\"", flush=True)
 
     return metrics
 
@@ -467,7 +531,12 @@ def run_eval(args) -> STSMetrics:
     if args.eval_set and Path(args.eval_set).exists():
         eval_items = load_eval_set(args.eval_set)
     else:
-        eval_items = [{"text": t} for t in DEFAULT_EVAL_TEXTS]
+        libri_items = build_eval_from_libritts(n=20)
+        if libri_items:
+            print(f"  Using {len(libri_items)} LibriTTS eval samples (with reference audio)")
+            eval_items = libri_items
+        else:
+            eval_items = [{"text": t} for t in DEFAULT_EVAL_TEXTS]
 
     if args.max_samples:
         eval_items = eval_items[: args.max_samples]

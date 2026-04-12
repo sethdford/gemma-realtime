@@ -26,11 +26,12 @@ FW_IOSURFACE = -framework Foundation -framework Metal -framework IOSurface -fram
 
 BUILDDIR = build
 
-.PHONY: all clean bench amx sme2 ane iosurface metal hybrid metal4 ane_direct
+.PHONY: all clean bench amx sme2 ane iosurface metal hybrid metal4 ane_direct libgemma_hw
 
 all: $(BUILDDIR)/amx_matmul $(BUILDDIR)/sme2_matmul $(BUILDDIR)/ane_probe \
      $(BUILDDIR)/iosurface_bridge $(BUILDDIR)/metal_dynamic $(BUILDDIR)/hybrid_pipeline \
-     $(BUILDDIR)/metal4_tensor $(BUILDDIR)/ane_direct
+     $(BUILDDIR)/metal4_tensor $(BUILDDIR)/ane_direct \
+     $(BUILDDIR)/libgemma_hw.dylib
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
@@ -79,6 +80,15 @@ $(BUILDDIR)/metal4_tensor: metal4_tensor.m | $(BUILDDIR)
 ane_direct: $(BUILDDIR)/ane_direct
 $(BUILDDIR)/ane_direct: ane_direct.m | $(BUILDDIR)
 	$(OBJC) $(OBJCFLAGS) $(FW_IOSURFACE) $(FW_COREML) -ldl $< -o $@
+
+# Shared library for Python (ctypes) — IOSurface, Accelerate SGEMM, capability probe
+libgemma_hw: $(BUILDDIR)/libgemma_hw.dylib
+$(BUILDDIR)/libgemma_hw.dylib: gemma_hw.c gemma_hw_apple.m gemma_hw.h | $(BUILDDIR)
+	$(CC) -dynamiclib -O2 -fPIC $(CFLAGS) -fobjc-arc -DACCELERATE_NEW_LAPACK \
+		gemma_hw.c gemma_hw_apple.m -o $@ \
+		-framework Foundation -framework CoreML -framework CoreGraphics -framework Accelerate \
+		-framework IOSurface -framework Metal \
+		-install_name @rpath/libgemma_hw.dylib
 
 # Build and run all benchmarks
 bench: all

@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import importlib
+import platform
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,9 @@ PASS = "PASS"
 FAIL = "FAIL"
 WARN = "WARN"
 SKIP = "SKIP"
+
+# Decoder autoregressive steps during validation (full 500 is slow; API still supports 500 in prod).
+RED_TEAM_DECODER_MAX_TOKENS = 128
 
 
 class ValidationResult:
@@ -194,7 +198,10 @@ class RedTeamValidator:
                 hidden = mx.random.normal((1, 10, config["llm_dim"]))
 
                 t0 = time.time()
-                tokens = decoder.generate(hidden, temperature=0.8, top_k=50)
+                tokens = decoder.generate(
+                    hidden, temperature=0.8, top_k=50,
+                    max_tokens=RED_TEAM_DECODER_MAX_TOKENS,
+                )
                 mx.eval(tokens)
                 lat = (time.time() - t0) * 1000
 
@@ -289,13 +296,74 @@ class RedTeamValidator:
                 f"{len(cache)} layers, ~{cache.memory_estimate_mb:.1f}MB/1K ctx",
             ))
 
-            io_config = HWAccelConfig(iosurface_enabled=True)
-            io_mgr = IOSurfaceKVManager(io_config)
-            io_mgr.allocate_kv_surface("test_kv", 1024)
+            io_mgr = IOSurfaceKVManager()
+            ok_native_alloc = io_mgr.allocate_kv_surface("test_kv", 4096)
+            kv = io_mgr.get_surface("test_kv")
+            if kv is None:
+                raise RuntimeError("IOSurfaceKVManager.get_surface returned None after allocate")
+            kv.fill(0)
+            kv[0] = 0x5A
+            kv[-1] = 0xA5
+            if int(io_mgr.get_surface("test_kv")[0]) != 0x5A:
+                raise RuntimeError("IOSurface KV read-back failed at byte 0")
+            if int(io_mgr.get_surface("test_kv")[-1]) != 0xA5:
+                raise RuntimeError("IOSurface KV read-back failed at last byte")
+            io_mgr.release_all()
+
+            try:
+                import native_hw as _nh
+            except ImportError:
+                _nh = None
+            darwin = platform.system() == "Darwin"
+            dylib_here = _nh.libgemma_hw_present() if _nh else False
+            load_err = _nh.library_load_error() if _nh else "native_hw not importable"
+
+            if not darwin:
+                io_status = PASS
+                io_detail = (
+                    "non-macOS: IOSurface off by default; KV staging path not exercised for ANE"
+                )
+            elif dylib_here and not io_mgr.native_zero_copy:
+                io_status = FAIL
+                io_detail = (
+                    "libgemma_hw.dylib is on disk but the native IOSurface path did not activate — "
+                    f"{load_err}. Rebuild: make -C secret-apis libgemma_hw"
+                )
+            elif dylib_here and io_mgr.native_zero_copy:
+                io_status = PASS if ok_native_alloc else WARN
+                io_detail = (
+                    f"native_zero_copy=True IOSurface_alloc_ok={ok_native_alloc} "
+                    f"lib_load={load_err or 'ok'}"
+                )
+            else:
+                io_status = WARN
+                hint = _nh.libgemma_hw_dylib_path() if _nh else Path("secret-apis/build/libgemma_hw.dylib")
+                io_detail = (
+                    f"macOS but no dylib at {hint} — IOSurface available={io_mgr.available} "
+                    f"native_zero_copy={io_mgr.native_zero_copy}. "
+                    "Run: make -C secret-apis libgemma_hw"
+                )
+
             self.log(ValidationResult(
                 "Phase 6: IOSurfaceKVManager",
-                PASS if io_mgr.available else WARN,
-                f"IOSurface available={io_mgr.available}",
+                io_status,
+                io_detail,
+            ))
+
+            if not darwin:
+                m_st, m_det = PASS, "non-macOS skip"
+            elif not dylib_here:
+                m_st, m_det = PASS, "no libgemma_hw.dylib — Metal GPU selftest skipped"
+            elif _nh is None or _nh.load_library() is None:
+                m_st, m_det = FAIL, (_nh.library_load_error() if _nh else "native_hw missing")
+            elif _nh.metal_iosurface_selftest():
+                m_st, m_det = PASS, "vec_mul OK (IOSurface + newBufferWithBytesNoCopy)"
+            else:
+                m_st, m_det = FAIL, "gemma_hw_iosurface_metal_vec_mul_selftest failed"
+            self.log(ValidationResult(
+                "Phase 6: Metal IOSurface GPU selftest",
+                m_st,
+                m_det,
             ))
 
             eagle_config = HWAccelConfig(eagle_enabled=True)
@@ -347,7 +415,10 @@ class RedTeamValidator:
             audio = mx.random.normal((1, 1, encoder.chunk_samples))
             t0 = time.time()
             embeddings = encoder(audio)
-            tokens = decoder.generate(embeddings, temperature=0.8)
+            tokens = decoder.generate(
+                embeddings, temperature=0.8,
+                max_tokens=RED_TEAM_DECODER_MAX_TOKENS,
+            )
             mx.eval(tokens)
             e2e_ms = (time.time() - t0) * 1000
 

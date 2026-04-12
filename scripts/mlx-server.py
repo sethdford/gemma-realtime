@@ -13,6 +13,7 @@ Features:
     - Speculative decoding: E2B draft model proposes tokens, target verifies in parallel (~2x speedup)
     - TurboQuant KV cache compression (4.6x smaller, ~0.98x FP16 speed)
     - Cross-turn prompt caching (system prompt KV reused across requests via cache trim)
+    - Optional IOSurface staging via libgemma_hw (see GEMMA_IOSURFACE_KV_* env vars, /health)
     - Apple Silicon hardware detection (M5 TensorOps, Neural Accelerators, Metal version)
     - Real-time voice mode: optimized for low TTFT with aggressive KV compression
     - PLE-safe model validation for Gemma 4 (warns about broken quantizations)
@@ -21,6 +22,12 @@ The server exposes:
     POST /v1/chat/completions  — OpenAI-compatible chat endpoint (supports stream:true)
     GET  /v1/models            — list available models
     GET  /health               — health check (includes hardware info + tok/s stats)
+
+Environment (see guides/08-inference-sota-roadmap.md):
+  MLX_SPECULATIVE_TOKENS, GEMMA_SPECULATIVE_TOKENS — draft tokens per speculative step (default 4)
+  GEMMA_KV_ASYMMETRIC=1 — enable asymmetric KV (same as --kv-asymmetric)
+  GEMMA_IOSURFACE_KV, GEMMA_IOSURFACE_KV_BYTES — IOSurface staging for /health
+  MLX_MODEL, MLX_PORT, MLX_ADAPTER_PATH — server defaults
 """
 
 import argparse
@@ -65,9 +72,54 @@ def _load_human_config():
             defaults["speculative_draft_adapter"] = os.path.expanduser(
                 mlx["speculative_draft_adapter"]
             )
+        if mlx.get("speculative_tokens") is not None:
+            try:
+                defaults["speculative_tokens"] = max(1, int(mlx["speculative_tokens"]))
+            except (TypeError, ValueError):
+                pass
+        if "prompt_cache" in mlx:
+            defaults["prompt_cache"] = bool(mlx["prompt_cache"])
+        if "iosurface_kv" in mlx:
+            defaults["iosurface_kv"] = bool(mlx["iosurface_kv"])
+        if mlx.get("iosurface_kv_bytes") is not None:
+            try:
+                defaults["iosurface_kv_bytes"] = int(mlx["iosurface_kv_bytes"])
+            except (TypeError, ValueError):
+                pass
         return defaults
     except Exception:
         return {}
+
+
+def _apply_mlx_local_env_from_hc(hc: dict) -> None:
+    """Set GEMMA_IOSURFACE_* from ~/.human mlx_local before IOSurface init."""
+    if not hc:
+        return
+    if hc.get("iosurface_kv") is False:
+        os.environ["GEMMA_IOSURFACE_KV"] = "0"
+    elif hc.get("iosurface_kv") is True:
+        os.environ.setdefault("GEMMA_IOSURFACE_KV", "1")
+    if hc.get("iosurface_kv_bytes") is not None:
+        try:
+            os.environ["GEMMA_IOSURFACE_KV_BYTES"] = str(int(hc["iosurface_kv_bytes"]))
+        except (TypeError, ValueError):
+            pass
+
+
+def _speculative_tokens_default(hc: dict) -> int:
+    for key in ("MLX_SPECULATIVE_TOKENS", "GEMMA_SPECULATIVE_TOKENS"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                break
+    if hc.get("speculative_tokens") is not None:
+        try:
+            return max(1, int(hc["speculative_tokens"]))
+        except (TypeError, ValueError):
+            pass
+    return 4
 
 # ── Hardware Detection ─────────────────────────────────────────────
 
@@ -146,6 +198,7 @@ speculative_draft_tokens = 4
 kv_bits = None
 kv_quant_scheme = "uniform"
 turbo_cache = None
+iosurface_kv_manager = None
 
 prompt_cache_state = None
 _cached_system_hash = None
@@ -153,10 +206,44 @@ _cached_system_ntokens = 0
 
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
 THINKING_TOKENS = frozenset({"|", "|\n", "\n|", "\n"})
+_THOUGHT_CHANNEL_RE = None
 
 adapter_path_global = None
 hw_info = {}
 perf_stats = {"total_tokens": 0, "total_time": 0.0, "requests": 0}
+# Set in main() for /health (inference_tuning)
+server_realtime_mode = False
+
+
+def _iosurface_http_health():
+    try:
+        import native_hw as nh
+        return nh.health_payload_for_http(iosurface_kv_manager)
+    except Exception as e:
+        return {"iosurface_probe_error": str(e)}
+
+
+def _init_iosurface_kv_staging():
+    global iosurface_kv_manager
+    if platform.system() != "Darwin":
+        return
+    if os.environ.get("GEMMA_IOSURFACE_KV", "1") == "0":
+        return
+    nbytes = int(os.environ.get("GEMMA_IOSURFACE_KV_BYTES", "0"))
+    if nbytes <= 0:
+        return
+    try:
+        from hw_accel import IOSurfaceKVManager
+
+        iosurface_kv_manager = IOSurfaceKVManager()
+        iosurface_kv_manager.allocate_kv_surface("mlx_staging", nbytes)
+        print(
+            f"  IOSurface KV staging: {nbytes} bytes (GEMMA_IOSURFACE_KV_BYTES)",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"  IOSurface KV staging skipped: {e}", flush=True)
+
 
 # PLE-safe model IDs — these quantize Gemma 4 correctly (skip ScaledLinear/PLE layers)
 PLE_SAFE_MODELS = {
@@ -378,6 +465,20 @@ def strip_stop_tokens(text):
     return text, False
 
 
+def strip_thought_channels(text):
+    """Strip Gemma 4's <|channel>thought ... <channel|> blocks from output.
+
+    Handles both closed blocks (thought + response) and unclosed blocks
+    (model exhausted tokens mid-thought before producing a response).
+    """
+    import re
+    # Closed: <|channel>thought ... <channel|> actual_response
+    text = re.sub(r"<\|channel>thought.*?<channel\|>", "", text, flags=re.DOTALL)
+    # Unclosed: model ran out of tokens mid-thought
+    text = re.sub(r"<\|channel>thought.*$", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 _thinking_mode = False
 _thinking_count = 0
 
@@ -542,7 +643,8 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
             text_parts.append(cleaned)
             if hit_stop:
                 break
-        return "".join(text_parts).strip(), prompt_toks_out, gen_toks_out
+        full = "".join(text_parts).strip()
+        return strip_thought_channels(full), prompt_toks_out, gen_toks_out
 
     from mlx_vlm import generate as vlm_generate
     formatted, images = prepare_prompt_vlm(messages)
@@ -557,7 +659,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
     text, _ = strip_stop_tokens(result.text if hasattr(result, "text") else result)
     prompt_toks = getattr(result, "prompt_tokens", 0)
     gen_toks = getattr(result, "generation_tokens", 0)
-    return text.strip(), prompt_toks, gen_toks
+    return strip_thought_channels(text), prompt_toks, gen_toks
 
 
 def stream_response(messages, max_tokens=256, temperature=0.7):
@@ -720,6 +822,17 @@ class ChatHandler(BaseHTTPRequestHandler):
                 avg_tps = perf_stats["total_tokens"] / perf_stats["total_time"] if perf_stats["total_time"] > 0 else 0
                 health["avg_tok_per_sec"] = round(avg_tps, 1)
                 health["total_requests"] = perf_stats["requests"]
+            health["inference_tuning"] = {
+                "realtime_voice_mode": server_realtime_mode,
+                "speculative_draft_tokens": speculative_draft_tokens,
+                "speculative_active": speculative_enabled,
+                "kv_bits": kv_bits,
+                "kv_scheme": kv_quant_scheme,
+                "turboquant_active": turbo_cache is not None,
+            }
+            iosurf = _iosurface_http_health()
+            if iosurf:
+                health["iosurface"] = iosurf
             self._send_json(200, health)
             return
 
@@ -820,9 +933,12 @@ class ChatHandler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 256)
         temperature = req.get("temperature", 0.7)
+        # Gemma 4 uses ~200-400 thinking tokens before producing visible output;
+        # budget extra so the actual response doesn't get truncated
+        internal_max = max_tokens + 512
 
         with model_lock:
-            text, prompt_toks, gen_toks = generate_response(messages, max_tokens, temperature)
+            text, prompt_toks, gen_toks = generate_response(messages, internal_max, temperature)
 
         elapsed = time.time() - t0
         self._send_json(200, {
@@ -872,10 +988,23 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._handle_non_stream(req, resp_id, t0)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def main():
     global kv_bits, kv_quant_scheme, prompt_cache_state, hw_info, speculative_draft_tokens
+    global server_realtime_mode
 
     hc = _load_human_config()
+    _apply_mlx_local_env_from_hc(hc)
+    _spec_tokens_default = _speculative_tokens_default(hc)
 
     parser = argparse.ArgumentParser(
         description="MLX OpenAI-compatible model server with speculative decoding",
@@ -936,8 +1065,8 @@ Examples:
         help="LoRA adapter path for the draft model.",
     )
     parser.add_argument(
-        "--speculative-tokens", type=int, default=4,
-        help="Number of draft tokens to propose per step (default: 4).",
+        "--speculative-tokens", type=int, default=_spec_tokens_default,
+        help="Draft tokens per speculative step (default: 4, or MLX_SPECULATIVE_TOKENS / GEMMA_SPECULATIVE_TOKENS).",
     )
     parser.add_argument(
         "--realtime", action="store_true",
@@ -946,6 +1075,12 @@ Examples:
              "and optimized generation for lowest TTFT.",
     )
     args = parser.parse_args()
+    if os.environ.get("GEMMA_KV_ASYMMETRIC", "").strip().lower() in ("1", "true", "yes"):
+        args.kv_asymmetric = True
+    if hc.get("prompt_cache") is False:
+        args.no_prompt_cache = True
+    server_realtime_mode = bool(args.realtime)
+    speculative_draft_tokens = args.speculative_tokens
 
     print(f"\n{'='*60}", flush=True)
     print(f"  MLX Inference Server", flush=True)
@@ -996,11 +1131,12 @@ Examples:
 
     load_model(args.model, adapter_path=args.adapter_path)
 
+    _init_iosurface_kv_staging()
+
     if kv_bits is not None:
         _init_turbo_cache()
 
     if args.speculative_draft:
-        speculative_draft_tokens = args.speculative_tokens
         draft_name = args.speculative_draft
         from pathlib import Path
         if Path(draft_name).is_dir() and (Path(draft_name) / "adapters.safetensors").exists():

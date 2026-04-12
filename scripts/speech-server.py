@@ -17,6 +17,8 @@ Usage:
     python3 scripts/speech-server.py --tts kokoro --voice af_bella
     python3 scripts/speech-server.py --no-mic --text-only
 
+    Tuning (env, read at import): GEMMA_MIN_FLUSH_CHARS, GEMMA_MAX_BUFFER_CHARS — see guides/08-inference-sota-roadmap.md
+
 Requirements:
     pip install mlx-whisper kokoro sounddevice numpy websockets silero-vad
 """
@@ -24,6 +26,7 @@ Requirements:
 import argparse
 import asyncio
 import json
+import os
 import queue
 import re
 import sys
@@ -44,8 +47,8 @@ CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 VAD_THRESHOLD = 0.4
 SILENCE_TIMEOUT_MS = 800
 SENTENCE_BOUNDARY = re.compile(r"[.!?]\s*$|[.!?][\"']\s*$")
-MIN_FLUSH_CHARS = 12
-MAX_BUFFER_CHARS = 120
+MIN_FLUSH_CHARS = int(os.environ.get("GEMMA_MIN_FLUSH_CHARS", "12"))
+MAX_BUFFER_CHARS = int(os.environ.get("GEMMA_MAX_BUFFER_CHARS", "120"))
 
 
 class SileroVAD:

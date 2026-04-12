@@ -72,7 +72,7 @@ Lightweight heads in `scripts/voxtral_speculative.py` predict the next few audio
 ```
 Microphone -> Silero VAD -> Whisper ASR -> text
 text -> Gemma E4B (mlx-server.py) -> text deltas (SSE stream)
-text deltas -> Sentence Buffer -> Kokoro TTS -> Speaker
+text deltas -> Sentence Buffer (env: GEMMA_MIN_FLUSH_CHARS, GEMMA_MAX_BUFFER_CHARS) -> Kokoro TTS -> Speaker
 ```
 
 Components:
@@ -169,7 +169,7 @@ Research-frontier features from Moshi (Kyutai):
 
 **libgemma_hw + IOSurface (default on macOS)**: Build with `make -C secret-apis libgemma_hw`. `IOSurfaceKVManager` in `hw_accel.py` uses real IOSurface memory when the dylib is present (CPU views stay locked until `release_all`). `native_hw.py` exposes Accelerate SGEMM and a **Metal selftest** (`newBufferWithBytesNoCopy` + compute shader) used by `prove-native-hw.py` and red-team Phase 6.
 
-**mlx-server.py**: `GET /health` includes an `iosurface` object (dylib path, load status). Optional staging: set `GEMMA_IOSURFACE_KV_BYTES` (e.g. `65536`); disable with `GEMMA_IOSURFACE_KV=0`.
+**mlx-server.py**: `GET /health` includes an `iosurface` object (dylib path, load status) and **`inference_tuning`** (speculative draft count, KV scheme, realtime flag). Optional staging: set `GEMMA_IOSURFACE_KV_BYTES` (e.g. `65536`); disable with `GEMMA_IOSURFACE_KV=0`. For a full env/benchmark checklist, see [Guide 08: Inference SOTA roadmap](08-inference-sota-roadmap.md).
 
 **realtime-ws.py**: After shared models load, logs a one-line `native_hw.health_payload_for_http` summary on macOS.
 
@@ -185,13 +185,13 @@ Standing on Fish Audio's shoulders for true STS — no text bottleneck.
 
 ```
 User Audio (44.1kHz)
-  → Fish DAC Encode → [cb0..cb9] tokens (~21 Hz, 10 codebooks)
+  → Fish DAC Encode → [cb0..cb7] tokens (~21 Hz, 8 FSQ groups)
   → Extract cb0 (semantic) → Project to Gemma embedding space
   → Gemma (frozen, layer-split):
       Layers 0..K:   shared (text + speech, frozen)
       Layers K..N:   text branch (frozen → inner monologue)
       Speech layers: trainable (audio token generation)
-  → Fish Fast AR: cb0 → cb1..cb9 (400M depth decoder)
+  → Fish Fast AR: cb0 → cb1..cb7 (depth decoder)
   → Fish DAC Decode → Agent Audio (44.1kHz)
 ```
 
@@ -199,7 +199,7 @@ User Audio (44.1kHz)
 
 | | SNAC | Fish DAC |
 |---|---|---|
-| Codebooks | 3 × 4096 | 10 × 1024 |
+| Codebooks | 3 × 4096 | 8 groups × 1000 (FSQ) |
 | Frame rate | 12 Hz | ~21 Hz |
 | Sample rate | 24 kHz | 44.1 kHz |
 | Training data | - | 10M+ hours |
@@ -229,7 +229,7 @@ python3 scripts/codec.py --codec fish
 
 **Training:**
 
-Two codec modes: `snac` (fast iteration, 3 codebooks, 4096 vocab) or `fish` (production quality, 8 codebooks, 1024 vocab).
+Two codec modes: `snac` (fast iteration, 3 codebooks, 4096 vocab) or `fish` (production quality, 8 FSQ groups, 1000 vocab).
 
 ```bash
 # SNAC proxy training (quick, lower-fidelity)
@@ -277,7 +277,7 @@ python3 scripts/eval_sts.py --pipeline cascaded  # Voxtral TTS baseline for comp
 
 | Paper | Key Idea | How We Use It |
 |-------|----------|---------------|
-| Fish Audio S2 (arXiv:2603.08823) | Dual-AR TTS, 10-cb RVQ, GRPO | Codec + Fast AR depth model |
+| Fish Audio S2 (arXiv:2603.08823) | Dual-AR TTS, 8-group FSQ, GRPO | Codec + Fast AR depth model |
 | MOSS-Speech (arXiv:2510.00499) | True STS, layer splitting, no text guidance | Layer splitting for Gemma |
 | Moshi (arXiv:2410.00037) | Inner monologue, dual-stream | Inner monologue training signal |
 
@@ -356,7 +356,7 @@ python3 scripts/hw_accel.py
 | DuplexMamba (arXiv:2502.11123) | Mamba-based duplex speech | Future |
 | Llama-Mimi (arXiv:2509.14882) | Interleaved semantic+acoustic tokens | Phase 5 |
 | MOSS-Speech (arXiv:2510.00499) | True S2S without text guidance | Phase 7 |
-| Fish Audio S2 (arXiv:2603.08823) | Dual-AR TTS, 10-cb RVQ codec, GRPO | Phase 7 |
+| Fish Audio S2 (arXiv:2603.08823) | Dual-AR TTS, 8-group FSQ codec, GRPO | Phase 7 |
 | Voxtral Realtime (arXiv:2602.11298) | Streaming ASR via vLLM WebSocket | Phase 1 alt |
 
 ## File Map

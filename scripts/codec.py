@@ -10,7 +10,7 @@ Supported codecs:
     - SNAC:     Multi-scale RVQ (12/23/47 Hz), MIT license, 3 codebooks
     - Mimi:     Kyutai's codec from Moshi (12.5 Hz, 1.1 kbps, 80ms latency)
     - EnCodec:  Meta's baseline codec (75 Hz, higher bitrate)
-    - Fish DAC: Fish Audio's S2 codec (10 codebooks, ~21 Hz, 44.1kHz, SOTA quality)
+    - Fish DAC: Fish Audio's S2 codec (8 FSQ groups × 1000, ~21 Hz, 44.1kHz, SOTA quality)
                 Standing on Fish Audio's shoulders for true speech-to-speech.
 
 Usage:
@@ -22,11 +22,11 @@ Usage:
     tokens = codec.encode(audio_np)
     audio_out = codec.decode(tokens)
 
-    # Fish DAC: 10 codebooks, cb0 = semantic, cb1-9 = acoustic detail
-    # cb0 feeds Gemma for reasoning, Fish's Fast AR fills cb1-9
+    # Fish DAC: 8 FSQ groups, cb0 = semantic, cb1-7 = acoustic detail
+    # cb0 feeds Gemma for reasoning, Fish's Fast AR fills cb1-7
     fish = AudioCodec("fish")
     fish.load()
-    tokens = fish.encode(audio_44k)  # -> (10, T) codes at ~21 Hz
+    tokens = fish.encode(audio_44k)  # -> (8, T) codes at ~21 Hz
     cb0_semantic = tokens.codes[0]    # primary semantic codebook
 
     # Streaming
@@ -97,8 +97,8 @@ CODEC_CONFIGS = {
         codec_type=CodecType.FISH_DAC,
         sample_rate=44100,
         frame_rate=21.53,       # 44100 / 2048 downsampling ratio
-        n_codebooks=10,
-        codebook_size=1024,     # FSQ codebook entries
+        n_codebooks=8,          # 8 FSQ groups
+        codebook_size=1000,     # prod([8,5,5,5]) per FSQ group
         bandwidth_kbps=2.5,
         latency_ms=46.4,        # 2048 / 44100 * 1000
         streaming=True,
@@ -217,7 +217,7 @@ class AudioCodec:
             raise
 
     def _load_fish_dac(self):
-        """Load Fish Audio's DAC-based codec (10-codebook RVQ, 44.1kHz, ~21 Hz).
+        """Load Fish Audio's DAC-based codec (8 FSQ groups, 44.1kHz, ~21 Hz).
 
         Tries two loading paths:
           1. fish_speech package (pip install fish-speech)
