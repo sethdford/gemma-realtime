@@ -45,6 +45,87 @@ DEFAULT_PORT = 8741
 HUMAN_CONFIG = os.path.expanduser("~/.human/config.json")
 
 
+def _install_mlx_lm_patches():
+    """Monkey-patch mlx_lm to fix two known issues against current Gemma 4:
+
+    1. RotatingKVCache.to_quantized — stock mlx_lm 0.31.x raises NotImplementedError.
+       We provide a conversion: pack the current dense K/V into a QuantizedKVCache.
+       The result loses rotating-window semantics (becomes unbounded), but for chat
+       contexts well below the model's sliding window this is invisible. Saves ~4x
+       bytes per token during decode once the cache is quantized.
+
+    2. speculative_generate_step — model forward may return a LanguageModelOutput
+       dataclass (instead of an mx.array) for VLM-wrapped models. The function
+       does `logits[:, -n_predict:, :]` which fails. We patch the call site by
+       wrapping `model()` and `draft_model()` so their outputs are always mx.arrays.
+    """
+    import mlx.core as mx
+    from mlx_lm.models import cache as _cache_mod
+    from mlx_lm.models.cache import RotatingKVCache, QuantizedKVCache
+
+    if not getattr(RotatingKVCache, "_hu_quant_patched", False):
+        def _rotating_to_quantized(self, group_size: int = 64, bits: int = 4):
+            qc = QuantizedKVCache(group_size=group_size, bits=bits)
+            if self.keys is None or self.offset == 0:
+                return qc
+            keys = self._temporal_order(self.keys)
+            values = self._temporal_order(self.values)
+            keys = keys[..., : self.offset, :]
+            values = values[..., : self.offset, :]
+            qc.update_and_fetch(keys, values)
+            return qc
+
+        RotatingKVCache.to_quantized = _rotating_to_quantized
+        RotatingKVCache._hu_quant_patched = True
+        print("  [patch] RotatingKVCache.to_quantized — installed", flush=True)
+
+    try:
+        import importlib
+        _gen_mod = importlib.import_module("mlx_lm.generate")
+    except ImportError:
+        return
+
+    if not getattr(_gen_mod, "_hu_spec_patched", False):
+        _orig_spec = getattr(_gen_mod, "speculative_generate_step", None)
+        if _orig_spec is None:
+            print(f"  [patch] mlx_lm.generate has no speculative_generate_step "
+                  f"(symbols: {[n for n in dir(_gen_mod) if 'spec' in n.lower()]})",
+                  flush=True)
+            return
+
+        import functools
+
+        class _UnwrapWrapper:
+            """Forwards everything to the wrapped module but unwraps the call result."""
+            def __init__(self, inner):
+                object.__setattr__(self, "_inner", inner)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def __setattr__(self, name, value):
+                setattr(self._inner, name, value)
+
+            def __call__(self, *args, **kwargs):
+                out = self._inner(*args, **kwargs)
+                if hasattr(out, "logits") and not isinstance(out, mx.array):
+                    return out.logits
+                return out
+
+        @functools.wraps(_orig_spec)
+        def _patched_spec(prompt, model, draft_model, **kw):
+            wm = _UnwrapWrapper(model) if not isinstance(model, _UnwrapWrapper) else model
+            wd = _UnwrapWrapper(draft_model) if not isinstance(draft_model, _UnwrapWrapper) else draft_model
+            yield from _orig_spec(prompt, wm, wd, **kw)
+
+        _gen_mod.speculative_generate_step = _patched_spec
+        _gen_mod._hu_spec_patched = True
+        print("  [patch] speculative_generate_step — installed (LanguageModelOutput unwrap)", flush=True)
+
+
+_install_mlx_lm_patches()
+
+
 def _load_human_config():
     """Read ~/.human/config.json for h-uman integration defaults."""
     if not os.path.isfile(HUMAN_CONFIG):
@@ -204,11 +285,16 @@ prompt_cache_state = None
 _cached_system_hash = None
 _cached_system_ntokens = 0
 
+lm_prompt_cache = None
+lm_cache_quantized_start = 0
+lm_quantized_kv_group_size = 64
+
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
 THINKING_TOKENS = frozenset({"|", "|\n", "\n|", "\n"})
 _THOUGHT_CHANNEL_RE = None
 
 adapter_path_global = None
+tensors_loaded_global = 0  # Number of LoRA tensors applied by the most recent successful load/swap
 hw_info = {}
 perf_stats = {"total_tokens": 0, "total_time": 0.0, "requests": 0}
 # Set in main() for /health (inference_tuning)
@@ -275,6 +361,7 @@ def _check_ple_safety(model_name):
 
 def _load_with_adapter(load_fn, model_name, adapter_path):
     """Load a model and apply LoRA adapter weights."""
+    global tensors_loaded_global
     import mlx.core as mx
     from pathlib import Path
 
@@ -283,8 +370,31 @@ def _load_with_adapter(load_fn, model_name, adapter_path):
     if adapter_file.exists():
         adapters = list(mx.load(str(adapter_file)).items())
         model.load_weights(adapters, strict=False)
+        tensors_loaded_global = len(adapters)
         print(f"  Applied {len(adapters)} LoRA weight tensors from {adapter_file}", flush=True)
     return model, tokenizer
+
+
+def _apply_adapter_weights(adapter_path):
+    """Apply LoRA weights from <adapter_path>/adapters.safetensors to the live model.
+
+    Caller MUST hold model_lock. Returns the number of tensors applied.
+    Raises FileNotFoundError if adapters.safetensors is missing.
+    Raises any model.load_weights error (caller decides how to recover).
+    """
+    global tensors_loaded_global
+    import mlx.core as mx
+    from pathlib import Path
+
+    if model is None:
+        raise RuntimeError("model not loaded; cannot apply adapter")
+    adapter_file = Path(adapter_path) / "adapters.safetensors"
+    if not adapter_file.exists():
+        raise FileNotFoundError(str(adapter_file))
+    adapters = list(mx.load(str(adapter_file)).items())
+    model.load_weights(adapters, strict=False)
+    tensors_loaded_global = len(adapters)
+    return len(adapters)
 
 
 def load_model(model_name, adapter_path=None):
@@ -465,30 +575,216 @@ def strip_stop_tokens(text):
     return text, False
 
 
-def strip_thought_channels(text):
-    """Strip Gemma 4's <|channel>thought ... <channel|> blocks from output.
+def _extract_reply_from_body(text):
+    """From a fragment that may have parentheticals, label prefixes, or
+    surrounding quotes, extract the cleanest version of the actual reply."""
+    import re
+    text = text.strip()
+    if not text:
+        return text
+    # Parenthetical evaluation followed by the reply — take what's after `)`.
+    # gemma-4 thinking often emits: `"Yeah!" (Classic, fits constraint).Yeah!`
+    if ")" in text:
+        tail = text.rsplit(")", 1)[1].strip()
+        tail = re.sub(r"^[.,;:!?\s]+", "", tail).strip()
+        if tail:
+            text = tail
+    # "Label: quoted" pattern — extract the quoted value
+    label_match = re.match(r'^[A-Za-z][^:]{0,30}:\s*[\"“]([^\"”]+)[\"”]', text)
+    if label_match:
+        return label_match.group(1)
+    # Strip surrounding straight or smart quotes
+    for a, b in (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")):
+        if text.startswith(a) and text.endswith(b) and len(text) >= 2:
+            text = text[1:-1]
+            break
+    return text.strip()
 
-    Handles both closed blocks (thought + response) and unclosed blocks
-    (model exhausted tokens mid-thought before producing a response).
+
+def strip_thought_channels(text):
+    """Strip Gemma 4 thought blocks from output.
+
+    Handles TWO formats observed empirically (2026-05-25 audit):
+
+    1. Documented channel-marker format:
+       `<|channel>thought ... <channel|> actual_response`
+       Both closed and unclosed (mid-thought) variants stripped.
+
+    2. ACTUAL format emitted by gemma-4-31b-seth-v3-fused AND stock
+       gemma-4-31b-it-4bit: the model does NOT emit channel markers.
+       It emits markdown-bullet thinking followed by a final unmarked
+       reply on its own line (or inside the last bullet with a
+       parenthetical evaluation).  Example:
+
+           *   User: "hey, you around?"
+               *   Persona: Seth (brief, natural).
+               *   "Possible reply A"
+               *   "Possible reply B"
+
+           "Final actual reply"
+
+       OR all-in-one-bullet form:
+
+           *   "Yeah, what's up?" (Classic, fits constraint).Yeah, what's up?
+
+       The reply IS in the text; the prior extractor returned the full
+       thinking transcript verbatim because no `<channel|>` markers were
+       present.  This branch detects the markdown pattern and extracts.
     """
     import re
-    # Closed: <|channel>thought ... <channel|> actual_response
     text = re.sub(r"<\|channel>thought.*?<channel\|>", "", text, flags=re.DOTALL)
-    # Unclosed: model ran out of tokens mid-thought
     text = re.sub(r"<\|channel>thought.*$", "", text, flags=re.DOTALL)
-    return text.strip()
+    text = text.strip()
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    bullet_re = re.compile(r"^\s*\*\s")
+    bullet_indices = [i for i, l in enumerate(lines) if bullet_re.match(l)]
+    if not bullet_indices:
+        return text  # no markdown bullets — already clean
+
+    last_bullet_idx = bullet_indices[-1]
+    tail_lines = [l.strip() for l in lines[last_bullet_idx + 1:]
+                  if l.strip() and not bullet_re.match(l)]
+    if tail_lines:
+        return _extract_reply_from_body(tail_lines[-1])
+    last_bullet_body = re.sub(r"^\s*\*\s*", "", lines[last_bullet_idx])
+    return _extract_reply_from_body(last_bullet_body)
 
 
 _thinking_mode = False
 _thinking_count = 0
 
 
-def filter_thinking(text):
-    """Filter Gemma 4's thinking tokens (alternating | and newlines at start of response).
+class StreamThoughtFilter:
+    """Streaming filter that strips only the `<|channel>thought` and `<channel|>`
+    *markers* — keeping their content — because Gemma 4 routinely emits the user's
+    answer *inside* an unclosed thought block instead of after the close tag.
 
-    Returns the text if it's substantive content, empty string if it's a thinking token.
-    Automatically exits thinking mode once non-thinking content appears.
+    Two filter modes (selected by HU_THOUGHT_FILTER_MODE):
+      - "strip" (default): drop only the literal OPEN/CLOSE markers; emit everything else
+      - "discard": drop everything between OPEN..CLOSE (legacy behavior, may produce empty)
+      - "off": passthrough, emit raw
+
+    Mode "strip" is correct for current Gemma 4 deployments where answers live
+    inside thought blocks. Mode "discard" is correct for well-trained models that
+    keep answers strictly after `<channel|>`.
     """
+
+    OPEN = "<|channel>thought"
+    CLOSE = "<channel|>"
+
+    def __init__(self, mode: str = "strip"):
+        self.buf = ""
+        self.mode = mode
+
+    def feed(self, chunk):
+        if not chunk:
+            return ""
+        if self.mode == "off":
+            return chunk
+        self.buf += chunk
+        if self.mode == "discard":
+            return self._feed_discard()
+        return self._feed_strip()
+
+    def _max_marker_len(self):
+        return max(len(self.OPEN), len(self.CLOSE))
+
+    def _tail_could_be_marker_prefix(self):
+        m = self._max_marker_len()
+        for n in range(min(len(self.buf), m - 1), 0, -1):
+            tail = self.buf[-n:]
+            if self.OPEN.startswith(tail) or self.CLOSE.startswith(tail):
+                return n
+        return 0
+
+    def _feed_strip(self):
+        keep = self._tail_could_be_marker_prefix()
+        emit_end = len(self.buf) - keep if keep > 0 else len(self.buf)
+        if emit_end <= 0:
+            return ""
+        emit = self.buf[:emit_end]
+        self.buf = self.buf[emit_end:]
+        emit = emit.replace(self.OPEN, "").replace(self.CLOSE, "")
+        return emit
+
+    def _feed_discard(self):
+        out = []
+        in_thought = getattr(self, "_in_thought", False)
+        while self.buf:
+            if in_thought:
+                idx = self.buf.find(self.CLOSE)
+                if idx == -1:
+                    if len(self.buf) > len(self.CLOSE):
+                        self.buf = self.buf[-len(self.CLOSE):]
+                    self._in_thought = True
+                    return "".join(out)
+                self.buf = self.buf[idx + len(self.CLOSE):]
+                in_thought = False
+                continue
+            idx = self.buf.find(self.OPEN)
+            if idx == -1:
+                keep = 0
+                for n in range(min(len(self.buf), len(self.OPEN) - 1), 0, -1):
+                    if self.OPEN.startswith(self.buf[-n:]):
+                        keep = n
+                        break
+                if keep > 0:
+                    out.append(self.buf[:-keep])
+                    self.buf = self.buf[-keep:]
+                else:
+                    out.append(self.buf)
+                    self.buf = ""
+                self._in_thought = False
+                return "".join(out)
+            out.append(self.buf[:idx])
+            self.buf = self.buf[idx + len(self.OPEN):]
+            in_thought = True
+        self._in_thought = in_thought
+        return "".join(out)
+
+    def flush(self):
+        if self.mode == "off":
+            out, self.buf = self.buf, ""
+            return out
+        if self.mode == "discard" and getattr(self, "_in_thought", False):
+            self.buf = ""
+            return ""
+        out = self.buf
+        self.buf = ""
+        return out.replace(self.OPEN, "").replace(self.CLOSE, "")
+
+
+_stream_filter = None
+
+
+def reset_stream_filter():
+    global _stream_filter
+    mode = os.environ.get("HU_THOUGHT_FILTER_MODE", "strip").strip().lower()
+    if mode not in ("strip", "discard", "off"):
+        mode = "strip"
+    _stream_filter = StreamThoughtFilter(mode=mode)
+
+
+def stream_filter_feed(text):
+    global _stream_filter
+    if _stream_filter is None:
+        _stream_filter = StreamThoughtFilter()
+    return _stream_filter.feed(text)
+
+
+def stream_filter_flush():
+    global _stream_filter
+    if _stream_filter is None:
+        return ""
+    return _stream_filter.flush()
+
+
+def filter_thinking(text):
+    """Legacy single-token filter retained for back-compat in non-stream call sites.
+    For streaming, use stream_filter_feed/reset/flush instead."""
     global _thinking_mode, _thinking_count
     stripped = text.strip()
     if stripped in ("|", "") and _thinking_count < 500:
@@ -548,14 +844,108 @@ def _compact_turbo_cache():
         pass
 
 
-def _kv_kwargs():
-    """Build KV cache kwargs for generate_step (works for both mlx_lm and mlx_vlm)."""
+lm_cache_supports_quant = False
+
+
+def _init_lm_prompt_cache():
+    """Build a persistent mlx_lm prompt cache for cross-turn reuse.
+
+    Used as the fallback path when TurboQuant+ is not installed. Combined
+    with kv_bits/quantized_kv_start, mlx_lm auto-quantizes the cache to
+    QuantizedKVCache after `quantized_kv_start` tokens of prefill — but
+    only for cache types that implement to_quantized. RotatingKVCache
+    (Gemma 4 sliding-window attention) raises NotImplementedError on
+    quantization, so we detect that and disable kv_bits for that path.
+    """
+    global lm_prompt_cache, lm_cache_supports_quant
+    if turbo_cache is not None or model is None or use_lm_path is False:
+        return None
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+        lm_prompt_cache = make_prompt_cache(model)
+
+        first = lm_prompt_cache[0] if lm_prompt_cache else None
+        cache_type = type(first).__name__ if first is not None else "?"
+        if first is not None and hasattr(first, "to_quantized"):
+            try:
+                _ = first.to_quantized(group_size=64, bits=4)
+                lm_cache_supports_quant = True
+                first.reset() if hasattr(first, "reset") else None
+            except (NotImplementedError, Exception):
+                lm_cache_supports_quant = False
+            lm_prompt_cache = make_prompt_cache(model)
+
+        tag = f" (kv_bits={int(kv_bits)})" if kv_bits is not None and lm_cache_supports_quant else ""
+        if kv_bits is not None and not lm_cache_supports_quant:
+            tag = f" (kv_bits requested but {cache_type} unsupported in stock mlx_lm — install TurboQuant+)"
+        print(f"  Stock mlx_lm prompt cache initialized: {len(lm_prompt_cache)} layers of {cache_type}{tag}", flush=True)
+        return lm_prompt_cache
+    except Exception as e:
+        print(f"  Stock mlx_lm prompt cache init failed: {e}", flush=True)
+        return None
+
+
+def _kv_kwargs(use_lm_cache=True):
+    """Build KV cache kwargs for generate_step (works for both mlx_lm and mlx_vlm).
+
+    Precedence:
+      1. TurboQuant+ cache (turbo_cache list) — design-intent path.
+      2. Stock mlx_lm prompt cache + kv_bits quantization — fallback path.
+      3. Plain kv_bits (no cache reuse) — last resort for vlm path.
+    """
     extra = {}
     if turbo_cache is not None:
         extra["prompt_cache"] = turbo_cache
+    elif use_lm_cache and lm_prompt_cache is not None:
+        extra["prompt_cache"] = lm_prompt_cache
+        if kv_bits is not None and lm_cache_supports_quant:
+            extra["kv_bits"] = int(kv_bits)
+            extra["kv_group_size"] = lm_quantized_kv_group_size
+            extra["quantized_kv_start"] = lm_cache_quantized_start
     elif kv_bits is not None:
         extra["kv_bits"] = int(kv_bits)
     return extra
+
+
+def _cache_offset(cache_list):
+    """Read the current token offset from any prompt cache list."""
+    if not cache_list:
+        return 0
+    first = cache_list[0]
+    if hasattr(first, "offset"):
+        return int(first.offset)
+    return int(getattr(first, "size", 0) or 0)
+
+
+def _trim_cache(cache_list, n):
+    """Trim n tokens from the tail of a prompt cache list. Returns tokens actually trimmed."""
+    if not cache_list or n <= 0:
+        return 0
+    try:
+        from mlx_lm.models.cache import trim_prompt_cache, can_trim_prompt_cache
+        if can_trim_prompt_cache(cache_list):
+            trimmed = trim_prompt_cache(cache_list, n)
+            return int(trimmed) if isinstance(trimmed, (int, float)) else n
+    except Exception:
+        pass
+    trimmed = 0
+    for layer_cache in cache_list:
+        if hasattr(layer_cache, "trim"):
+            try:
+                layer_cache.trim(n)
+                trimmed = n
+            except Exception:
+                pass
+    return trimmed
+
+
+def _active_prompt_cache():
+    """Return whichever prompt-cache list is live for reuse, or None."""
+    if turbo_cache is not None:
+        return turbo_cache
+    if lm_prompt_cache is not None:
+        return lm_prompt_cache
+    return None
 
 
 def _prepare_cache_for_request(messages):
@@ -563,32 +953,27 @@ def _prepare_cache_for_request(messages):
 
     If the system prompt hasn't changed, we keep its KV state and only
     re-process the new user/assistant tokens. If it changed (or this is
-    the first request), the cache starts empty.
-
-    Only works when turbo_cache is active (prompt_cache is the turbo_cache list).
+    the first request), the cache is fully reset.
     """
     global _cached_system_hash, _cached_system_ntokens
 
-    if turbo_cache is None:
+    cache_list = _active_prompt_cache()
+    if cache_list is None:
         return
 
     system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
     sys_hash = hash(tuple(system_parts)) if system_parts else None
 
-    cache_size = turbo_cache[0].offset if turbo_cache else 0
+    cache_size = _cache_offset(cache_list)
 
     if sys_hash is not None and sys_hash == _cached_system_hash and _cached_system_ntokens > 0:
         trim_amount = cache_size - _cached_system_ntokens
         if trim_amount > 0:
-            for layer_cache in turbo_cache:
-                if hasattr(layer_cache, "trim"):
-                    layer_cache.trim(trim_amount)
+            _trim_cache(cache_list, trim_amount)
         return
 
     if cache_size > 0:
-        for layer_cache in turbo_cache:
-            if hasattr(layer_cache, "trim"):
-                layer_cache.trim(cache_size)
+        _trim_cache(cache_list, cache_size)
     _cached_system_hash = sys_hash
     _cached_system_ntokens = 0
 
@@ -597,7 +982,7 @@ def _record_system_cache_boundary(messages):
     """After prefill, record how many tokens the system prompt occupies."""
     global _cached_system_ntokens
 
-    if turbo_cache is None or _cached_system_ntokens > 0:
+    if _active_prompt_cache() is None or _cached_system_ntokens > 0:
         return
 
     system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
@@ -644,7 +1029,32 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
             if hit_stop:
                 break
         full = "".join(text_parts).strip()
-        return strip_thought_channels(full), prompt_toks_out, gen_toks_out
+        stripped = strip_thought_channels(full)
+        # 2026-05-25: when the extractor strips everything (model emitted
+        # markdown bullets with no extractable final reply), log the raw
+        # output for diagnosis AND fall back to a salvage-from-raw heuristic
+        # so the daemon doesn't get empty content and silently fail.
+        if not stripped and full:
+            import re as _re
+            # Salvage: extract the LAST quoted string in the raw output —
+            # gemma-4 thinking often emits candidate replies inside quotes.
+            quoted = _re.findall(r'"([^"]{1,200})"', full)
+            if quoted:
+                stripped = quoted[-1]
+            else:
+                # Last-resort: last non-empty line with surrounding bullets stripped
+                for line in reversed(full.split("\n")):
+                    cleaned_line = _re.sub(r"^\s*\*\s*", "", line).strip()
+                    if cleaned_line:
+                        stripped = cleaned_line
+                        break
+            # Truncate raw for log readability; one-line label per call.
+            try:
+                print(f"  [strip-fallback] extractor empty; salvaged from raw "
+                      f"({len(full)} chars): {stripped[:80]!r}", flush=True)
+            except Exception:
+                pass
+        return stripped, prompt_toks_out, gen_toks_out
 
     from mlx_vlm import generate as vlm_generate
     formatted, images = prepare_prompt_vlm(messages)
@@ -701,6 +1111,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
             ):
                 if not prefill_done:
                     _compact_turbo_cache()
+                    _record_system_cache_boundary(messages)
                     prefill_done = True
                 prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
                 gen_toks = getattr(resp, "generation_tokens", gen_toks)
@@ -806,13 +1217,17 @@ class ChatHandler(BaseHTTPRequestHandler):
                 health["kv_bits"] = kv_bits
                 health["kv_quant_scheme"] = kv_quant_scheme
                 health["turboquant_plus"] = turbo_cache is not None
-            if turbo_cache is not None and _cached_system_ntokens > 0:
+            health["lm_prompt_cache_active"] = lm_prompt_cache is not None
+            if _cached_system_ntokens > 0 and _active_prompt_cache() is not None:
                 health["cached_system_tokens"] = _cached_system_ntokens
                 health["prompt_cache"] = "active"
             elif prompt_cache_state is not None and prompt_cache_state.token_ids is not None:
                 health["cached_tokens"] = len(prompt_cache_state.token_ids)
             if adapter_path_global:
                 health["adapter"] = adapter_path_global
+            # Always include active_adapter (null when no adapter is applied) for the
+            # adapter-swap state surface — consumed by the C side personalization loop.
+            health["active_adapter"] = adapter_path_global
             if speculative_enabled:
                 health["speculative_decoding"] = True
                 health["draft_tokens"] = speculative_draft_tokens
@@ -847,6 +1262,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if self.path == "/v1/adapters/current":
+            self._send_json(200, {
+                "adapter_path": adapter_path_global,
+                "tensors_loaded": tensors_loaded_global if adapter_path_global else 0,
+            })
+            return
+
         self._send_json(404, {"error": "not found"})
 
     def _handle_stream(self, req, resp_id, t0):
@@ -866,13 +1288,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         gen_toks = 0
         first_token_time = None
         reset_thinking_filter()
+        reset_stream_filter()
 
+        debug_stream = os.environ.get("HU_DEBUG_STREAM", "").strip() in ("1", "true", "yes")
+        debug_log = []
         with model_lock:
             for text, pt, gt in stream_response(messages, max_tokens, temperature):
                 prompt_toks = pt
                 gen_toks = gt
 
-                filtered = filter_thinking(text)
+                if debug_stream:
+                    debug_log.append(("raw", text))
+                filtered = stream_filter_feed(text)
                 if not filtered:
                     continue
 
@@ -893,6 +1320,22 @@ class ChatHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
+
+        if debug_stream:
+            preview = "".join(t for _, t in debug_log[:60])
+            print(f"  [debug-stream] {len(debug_log)} raw chunks, "
+                  f"first 60 concatenated: {preview!r}", flush=True)
+        # Flush any answer content stuck in the thought-filter tail buffer.
+        tail = stream_filter_flush()
+        if tail:
+            full_text.append(tail)
+            chunk = {
+                "id": resp_id, "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": model_id,
+                "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.flush()
 
         done_chunk = {
             "id": resp_id,
@@ -933,9 +1376,13 @@ class ChatHandler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 256)
         temperature = req.get("temperature", 0.7)
-        # Gemma 4 uses ~200-400 thinking tokens before producing visible output;
-        # budget extra so the actual response doesn't get truncated
-        internal_max = max_tokens + 512
+        # Gemma 4 may use ~200-400 thinking tokens before producing visible output.
+        # Budget extra only if the system prompt doesn't explicitly suppress it.
+        # GEMMA_DISABLE_THINKING=1 skips the +512 budget entirely (~20-40% faster non-stream calls).
+        if os.environ.get("GEMMA_DISABLE_THINKING", "").strip().lower() in ("1", "true", "yes"):
+            internal_max = max_tokens
+        else:
+            internal_max = max_tokens + 512
 
         with model_lock:
             text, prompt_toks, gen_toks = generate_response(messages, internal_max, temperature)
@@ -966,7 +1413,83 @@ class ChatHandler(BaseHTTPRequestHandler):
         cache_tag = f" [TQ{kv_bits}b]" if kv_bits is not None else ""
         print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s){cache_tag} | {preview}...", flush=True)
 
+    def _handle_adapter_swap(self):
+        """POST /v1/adapters/swap — hot-swap LoRA adapter weights on the live model.
+
+        Body: {"adapter_path": "/abs/path/to/dir-containing-adapters.safetensors"}
+        Serializes against /v1/chat/completions via model_lock. On failure mid-swap,
+        attempts to revert to the previously-active adapter.
+        """
+        global adapter_path_global, tensors_loaded_global
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            req = json.loads(body.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+
+        adapter_path_raw = req.get("adapter_path") if isinstance(req, dict) else None
+        if not isinstance(adapter_path_raw, str) or not adapter_path_raw.strip():
+            self._send_json(400, {"error": "adapter_path must be a non-empty string"})
+            return
+
+        from pathlib import Path
+        resolved = Path(os.path.expanduser(adapter_path_raw)).resolve()
+        if not resolved.is_dir():
+            self._send_json(404, {"error": "adapter directory not found", "path": str(resolved)})
+            return
+        adapter_file = resolved / "adapters.safetensors"
+        if not adapter_file.is_file():
+            self._send_json(404, {
+                "error": "adapters.safetensors missing in directory",
+                "path": str(adapter_file),
+            })
+            return
+
+        old_adapter = adapter_path_global
+        new_adapter = str(resolved)
+        # Serialize against inference. Block; adapter swap is rare.
+        with model_lock:
+            try:
+                n_tensors = _apply_adapter_weights(new_adapter)
+                adapter_path_global = new_adapter
+                print(f"[swap] from {old_adapter} to {new_adapter}: applied {n_tensors} tensors", flush=True)
+                self._send_json(200, {
+                    "status": "ok",
+                    "adapter_path": new_adapter,
+                    "tensors_loaded": n_tensors,
+                })
+                return
+            except Exception as e:
+                err = str(e)
+                print(f"[swap] FAILED applying {new_adapter}: {err}", flush=True)
+                # Model may be in a partially-applied state. Try to revert.
+                if old_adapter is not None:
+                    try:
+                        n_reverted = _apply_adapter_weights(old_adapter)
+                        adapter_path_global = old_adapter
+                        print(f"[swap] reverted to {old_adapter} ({n_reverted} tensors)", flush=True)
+                    except Exception as revert_err:
+                        print(f"[swap] REVERT FAILED: {revert_err}", flush=True)
+                else:
+                    # No prior adapter to revert to. Clear the marker and tensor count;
+                    # the underlying base weights remain whatever load_weights left them as.
+                    adapter_path_global = None
+                    tensors_loaded_global = 0
+                self._send_json(500, {
+                    "error": "adapter load failed",
+                    "message": err,
+                    "reverted_to": old_adapter,
+                })
+                return
+
     def do_POST(self):
+        if self.path == "/v1/adapters/swap":
+            self._handle_adapter_swap()
+            return
+
         if self.path != "/v1/chat/completions":
             self._send_json(404, {"error": "not found"})
             return
@@ -1135,6 +1658,9 @@ Examples:
 
     if kv_bits is not None:
         _init_turbo_cache()
+
+    if turbo_cache is None and use_lm_path and not args.no_prompt_cache:
+        _init_lm_prompt_cache()
 
     if args.speculative_draft:
         draft_name = args.speculative_draft
