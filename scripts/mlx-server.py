@@ -519,12 +519,103 @@ def _has_images(messages):
     return False
 
 
+_NO_THINK_INSTRUCTION = (
+    # Wording chosen 2026-05-27 from the chip-discussion options (detailed,
+    # explicit). Names the four failure modes observed empirically in the
+    # markdown-thinking salvage logs: candidate replies, internal deliberation,
+    # bullet lists, evaluation parentheticals. Tune if the LoRA's voice
+    # fidelity drifts; pin any change with the TestNoThinkInjection suite +
+    # a live probe via the verification recipe in
+    # ~/.claude/projects/.../memory/m3_live_path_extractor_strip.md.
+    "Output only the final response. "
+    "Do not include candidate replies, internal deliberation, markdown bullet lists, "
+    "evaluation parentheticals, or thought process. "
+    "Reply directly in one short message."
+)
+
+
+def _no_think_instruction():
+    """Return the system-instruction text that suppresses Gemma 4 thinking mode.
+
+    Gemma 4's default behavior is to emit chain-of-thought as markdown bullets
+    before producing a final reply. For h-uman's LoRA-fine-tuned model, the
+    final reply is often missing — the model burns its budget on internal
+    deliberation and the strip extractor returns empty. This instruction tells
+    the model to skip deliberation and reply directly.
+
+    The exact wording is a design decision because it affects model quality:
+      - Too aggressive ("DO NOT THINK") may confuse the model or harm voice
+        fidelity learned by the LoRA.
+      - Too soft ("try to skip thinking") may not work — Gemma 4's training
+        defaults to thinking.
+      - Just right: an unambiguous instruction that suppresses chain-of-thought
+        without contradicting the system prompt that established persona.
+
+    Wording lives in `_NO_THINK_INSTRUCTION` above. Returns None if env var
+    `GEMMA_DISABLE_THINKING` is unset (no-op, preserves current behavior).
+    """
+    if os.environ.get("GEMMA_DISABLE_THINKING", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    return _NO_THINK_INSTRUCTION
+
+
+def _maybe_inject_no_think_instruction(messages):
+    """If thinking is disabled, append the no-think instruction to the system
+    message (or insert a new system message if none exists).
+
+    Returns a new messages list — does NOT mutate the input. This preserves
+    OpenAI request idempotency and makes the function safe to call from both
+    streaming and non-streaming paths.
+    """
+    instruction = _no_think_instruction()
+    if not instruction:
+        return messages
+    out = []
+    appended = False
+    for msg in messages:
+        if not appended and msg.get("role") == "system":
+            existing = msg.get("content", "")
+            if isinstance(existing, str) and existing.strip():
+                merged = f"{existing.rstrip()}\n\n{instruction}"
+            else:
+                merged = instruction
+            out.append({**msg, "content": merged})
+            appended = True
+        else:
+            out.append(msg)
+    if not appended:
+        # No system message in the conversation — insert one at the head so
+        # Gemma's chat template renders it before the first user turn.
+        out.insert(0, {"role": "system", "content": instruction})
+    return out
+
+
 def prepare_prompt_lm(messages):
-    """Format messages using mlx_lm's native chat template (fast text path)."""
+    """Format messages using mlx_lm's native chat template (fast text path).
+
+    Gemma 4's chat template has confusing semantics around `enable_thinking`:
+      - `enable_thinking=False` (DEFAULT): template force-prepends
+        `<|channel>thought\\n<channel|>` after the model turn, priming the
+        model into thinking mode REGARDLESS of any system instruction.
+      - `enable_thinking=True`: template skips the auto-prime, letting the
+        model decide based on the prompt.
+
+    When `GEMMA_DISABLE_THINKING` is set we ALSO pass `enable_thinking=True`
+    so the template doesn't undo our system-level instruction by mechanically
+    opening a thinking block. The system instruction alone is insufficient
+    (the template runs after the system message and overrides it).
+    """
+    messages = _maybe_inject_no_think_instruction(messages)
+    template_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if _no_think_instruction() is not None:
+        # Template-level suppression of the thought-channel opener.
+        # See module docstring + `_maybe_inject_no_think_instruction()`.
+        template_kwargs["enable_thinking"] = True
     if hasattr(processor, "apply_chat_template"):
-        prompt = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+        prompt = processor.apply_chat_template(messages, **template_kwargs)
     else:
         parts = []
         for msg in messages:
@@ -540,6 +631,7 @@ def prepare_prompt_vlm(messages):
     """Format messages using mlx_vlm's template (multimodal path)."""
     from mlx_vlm.prompt_utils import apply_chat_template
 
+    messages = _maybe_inject_no_think_instruction(messages)
     system_parts = []
     conversation = []
     all_images = []

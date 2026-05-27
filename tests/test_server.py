@@ -99,6 +99,105 @@ class TestKVKwargs(unittest.TestCase):
         self.assertEqual(extra, {"kv_bits": 3})
 
 
+class TestNoThinkInjection(unittest.TestCase):
+    """Unit tests for _maybe_inject_no_think_instruction().
+
+    Pins the contract that suppresses Gemma 4 thinking-mode degeneration
+    documented in `m3_live_path_extractor_strip.md`.
+
+    Module load policy: mlx-server.py's top-level imports are stdlib only —
+    `mlx_lm` and `mlx_vlm` are imported inside functions we do not call. So
+    importing the module here does NOT trigger model loading.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_for_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def setUp(self):
+        # Save + clear env so tests are deterministic regardless of host env.
+        self._prev = os.environ.pop("GEMMA_DISABLE_THINKING", None)
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("GEMMA_DISABLE_THINKING", None)
+        else:
+            os.environ["GEMMA_DISABLE_THINKING"] = self._prev
+
+    # --- _no_think_instruction() returns None when env unset ---
+    def test_instruction_returns_none_when_env_unset(self):
+        self.assertIsNone(self.mod._no_think_instruction())
+
+    def test_instruction_returns_none_when_env_zero(self):
+        os.environ["GEMMA_DISABLE_THINKING"] = "0"
+        self.assertIsNone(self.mod._no_think_instruction())
+
+    def test_instruction_returns_string_when_env_set_one(self):
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        text = self.mod._no_think_instruction()
+        self.assertIsInstance(text, str)
+        self.assertGreater(len(text), 10)
+
+    def test_instruction_returns_string_when_env_set_true(self):
+        os.environ["GEMMA_DISABLE_THINKING"] = "true"
+        self.assertIsNotNone(self.mod._no_think_instruction())
+
+    # --- _maybe_inject_no_think_instruction() passthrough when disabled ---
+    def test_injection_passthrough_when_env_unset(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        out = self.mod._maybe_inject_no_think_instruction(msgs)
+        # Should be the same list (passthrough — env unset)
+        self.assertEqual(out, msgs)
+
+    def test_injection_does_not_mutate_input(self):
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        msgs = [{"role": "system", "content": "Be Seth."},
+                {"role": "user", "content": "hi"}]
+        original = [dict(m) for m in msgs]  # deep-copy
+        _ = self.mod._maybe_inject_no_think_instruction(msgs)
+        # Original list and dicts unchanged
+        self.assertEqual(msgs, original)
+
+    # --- _maybe_inject_no_think_instruction() behavior when enabled ---
+    def test_injection_appends_to_existing_system_message(self):
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        msgs = [{"role": "system", "content": "Be Seth."},
+                {"role": "user", "content": "hi"}]
+        out = self.mod._maybe_inject_no_think_instruction(msgs)
+        self.assertEqual(len(out), 2)  # no new message added
+        self.assertEqual(out[0]["role"], "system")
+        self.assertIn("Be Seth.", out[0]["content"])
+        # No-think instruction is present in the merged content
+        self.assertIn("final response", out[0]["content"].lower())
+
+    def test_injection_inserts_system_message_when_none_exists(self):
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        msgs = [{"role": "user", "content": "hi"}]
+        out = self.mod._maybe_inject_no_think_instruction(msgs)
+        self.assertEqual(len(out), 2)  # one new system message at head
+        self.assertEqual(out[0]["role"], "system")
+        self.assertEqual(out[1], {"role": "user", "content": "hi"})
+
+    def test_injection_appends_only_to_first_system_message(self):
+        # Multi-system-message conversation — only the FIRST one is augmented.
+        # Gemma's chat template usually merges adjacent system messages anyway.
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        msgs = [{"role": "system", "content": "First system."},
+                {"role": "system", "content": "Second system."},
+                {"role": "user", "content": "hi"}]
+        out = self.mod._maybe_inject_no_think_instruction(msgs)
+        self.assertEqual(len(out), 3)
+        self.assertIn("First system.", out[0]["content"])
+        self.assertIn("final response", out[0]["content"].lower())
+        # Second system message untouched
+        self.assertEqual(out[1]["content"], "Second system.")
+
+
 def _port_free(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) != 0
