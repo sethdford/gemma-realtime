@@ -559,6 +559,40 @@ def _no_think_instruction():
     return _NO_THINK_INSTRUCTION
 
 
+def _thinking_headroom_tokens():
+    """Extra generation budget added on top of the caller's max_tokens to make
+    room for Gemma 4 / seth-lora-v4-repair chain-of-thought deliberation that
+    precedes the visible reply.
+
+    Why this exists (live M3 production bug, m3_live_path_extractor_strip.md):
+    the adapter emits ~150-200 tokens of markdown-bullet deliberation BEFORE
+    the visible reply, even when the GEMMA_DISABLE_THINKING no-think
+    instruction is active (the adapter was trained to deliberate and largely
+    ignores the instruction). If generation is capped at the caller's
+    max_tokens (e.g. 80), the thought channel consumes the entire budget and
+    the visible reply is starved to empty — the strip extractor then salvages
+    a garbage fragment. Empirically, max_tokens=80 degenerated every casual
+    prompt to a single word; with ~512 headroom the same prompts return
+    coherent in-voice replies (finish_reason=stop, thinking stripped).
+
+    Headroom is a CAP, not a target: a completed reply emits its stop token
+    and finishes naturally well below the cap, so a generous headroom is
+    nearly free for well-behaved completions and only costs latency on
+    runaway (never-stopping) generations.
+
+    Tunable via GEMMA_THINKING_HEADROOM_TOKENS. Default 512. Non-integer or
+    negative values fall back to 512.
+    """
+    raw = os.environ.get("GEMMA_THINKING_HEADROOM_TOKENS", "").strip()
+    if not raw:
+        return 512
+    try:
+        val = int(raw)
+    except ValueError:
+        return 512
+    return val if val >= 0 else 512
+
+
 def _maybe_inject_no_think_instruction(messages):
     """If thinking is disabled, append the no-think instruction to the system
     message (or insert a new system message if none exists).
@@ -1128,6 +1162,25 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
         # so the daemon doesn't get empty content and silently fail.
         if not stripped and full:
             import re as _re
+            # DIAGNOSTIC: dump full raw output to a log when env flag is set.
+            # Off by default. Set GEMMA_DUMP_EMPTY_EXTRACT=1 (or a path) to
+            # capture the LoRA's actual output shape — needed to design a
+            # better extractor for the seth-lora-v4-repair bullet-mode bug.
+            # See ~/.claude/projects/.../memory/m3_live_path_extractor_strip.md
+            _dump_flag = os.environ.get("GEMMA_DUMP_EMPTY_EXTRACT", "").strip()
+            if _dump_flag and _dump_flag.lower() not in ("0", "false", "no"):
+                _dump_path = (_dump_flag if "/" in _dump_flag
+                              else os.path.expanduser(
+                                  "~/.human/logs/mlx-server-empty-extract.log"))
+                try:
+                    os.makedirs(os.path.dirname(_dump_path), exist_ok=True)
+                    with open(_dump_path, "a", encoding="utf-8") as _f:
+                        _f.write(f"\n===== {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                                 f"len={len(full)} =====\n")
+                        _f.write(full)
+                        _f.write("\n===== end =====\n")
+                except Exception:
+                    pass  # diagnostic must never break request handling
             # Salvage: extract the LAST quoted string in the raw output —
             # gemma-4 thinking often emits candidate replies inside quotes.
             quoted = _re.findall(r'"([^"]{1,200})"', full)
@@ -1468,13 +1521,27 @@ class ChatHandler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 256)
         temperature = req.get("temperature", 0.7)
-        # Gemma 4 may use ~200-400 thinking tokens before producing visible output.
-        # Budget extra only if the system prompt doesn't explicitly suppress it.
-        # GEMMA_DISABLE_THINKING=1 skips the +512 budget entirely (~20-40% faster non-stream calls).
-        if os.environ.get("GEMMA_DISABLE_THINKING", "").strip().lower() in ("1", "true", "yes"):
-            internal_max = max_tokens
-        else:
-            internal_max = max_tokens + 512
+        # Gemma 4 (and especially the seth-lora-v4-repair adapter) emits
+        # ~150-200 tokens of chain-of-thought deliberation BEFORE the visible
+        # reply. The adapter was trained to deliberate and largely IGNORES the
+        # GEMMA_DISABLE_THINKING no-think instruction, so we cannot assume the
+        # thinking block is absent in no-think mode. If we cap generation at the
+        # caller's max_tokens, the thought channel consumes the entire budget
+        # and the visible reply is starved to empty — the strip extractor then
+        # salvages a garbage fragment ('nights', 'watch'). This was the live
+        # M3 production bug (see m3_live_path_extractor_strip.md): with
+        # max_tokens=80 every casual prompt degenerated; with ~512 the same
+        # prompts returned coherent in-voice replies. So ALWAYS grant thinking
+        # headroom. The thought channel is stripped post-generation, so the
+        # caller still receives only the short reply they asked for.
+        #
+        # Headroom is a CAP, not a target: a completed reply emits its stop
+        # token and finishes naturally well below the cap, so a generous
+        # headroom is nearly free for well-behaved completions and only costs
+        # latency on runaway (never-stopping) generations. See
+        # _thinking_headroom_tokens() for the full rationale + GEMMA_THINKING_
+        # HEADROOM_TOKENS tunable.
+        internal_max = max_tokens + _thinking_headroom_tokens()
 
         with model_lock:
             text, prompt_toks, gen_toks = generate_response(messages, internal_max, temperature)

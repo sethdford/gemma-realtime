@@ -198,6 +198,74 @@ class TestNoThinkInjection(unittest.TestCase):
         self.assertEqual(out[1]["content"], "Second system.")
 
 
+class TestThinkingHeadroom(unittest.TestCase):
+    """Unit tests for _thinking_headroom_tokens().
+
+    Pins the fix for the live M3 production bug documented in
+    `m3_live_path_extractor_strip.md`: the seth-lora-v4-repair adapter emits
+    ~150-200 thinking tokens before the visible reply even with the no-think
+    instruction active, so generation must be granted budget headroom on top
+    of the caller's max_tokens or the visible reply is starved to empty.
+
+    Module load is import-safe (top-level imports are stdlib only); see
+    TestNoThinkInjection's docstring.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_headroom_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def setUp(self):
+        self._prev = os.environ.pop("GEMMA_THINKING_HEADROOM_TOKENS", None)
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("GEMMA_THINKING_HEADROOM_TOKENS", None)
+        else:
+            os.environ["GEMMA_THINKING_HEADROOM_TOKENS"] = self._prev
+
+    def test_default_is_512_when_env_unset(self):
+        # Default must be generous enough to cover the adapter's ~150-200
+        # thinking tokens plus the visible reply (the live bug had 0 headroom).
+        self.assertEqual(self.mod._thinking_headroom_tokens(), 512)
+
+    def test_custom_positive_value_honored(self):
+        os.environ["GEMMA_THINKING_HEADROOM_TOKENS"] = "256"
+        self.assertEqual(self.mod._thinking_headroom_tokens(), 256)
+
+    def test_zero_is_honored(self):
+        # 0 is a valid explicit choice (operator opting out of headroom).
+        os.environ["GEMMA_THINKING_HEADROOM_TOKENS"] = "0"
+        self.assertEqual(self.mod._thinking_headroom_tokens(), 0)
+
+    def test_negative_falls_back_to_512(self):
+        os.environ["GEMMA_THINKING_HEADROOM_TOKENS"] = "-100"
+        self.assertEqual(self.mod._thinking_headroom_tokens(), 512)
+
+    def test_non_integer_falls_back_to_512(self):
+        os.environ["GEMMA_THINKING_HEADROOM_TOKENS"] = "lots"
+        self.assertEqual(self.mod._thinking_headroom_tokens(), 512)
+
+    def test_whitespace_only_falls_back_to_512(self):
+        os.environ["GEMMA_THINKING_HEADROOM_TOKENS"] = "   "
+        self.assertEqual(self.mod._thinking_headroom_tokens(), 512)
+
+    def test_headroom_makes_internal_budget_exceed_caller_max(self):
+        # The contract the bug fix depends on: internal generation budget is
+        # strictly greater than the caller's max_tokens so the visible reply
+        # survives the thinking block. (Mirrors _handle_non_stream's
+        # internal_max = max_tokens + _thinking_headroom_tokens().)
+        caller_max = 80
+        internal_max = caller_max + self.mod._thinking_headroom_tokens()
+        self.assertGreater(internal_max, caller_max)
+        self.assertEqual(internal_max, 80 + 512)
+
+
 def _port_free(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) != 0
