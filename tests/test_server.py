@@ -457,6 +457,122 @@ class TestPureDeliberationGuard(unittest.TestCase):
         self.assertFalse(self.mod._is_pure_deliberation(raw))
 
 
+class TestFinalizeGeneration(unittest.TestCase):
+    """Unit tests for finalize_generation() — the SHARED finalize logic used
+    by both the non-stream (generate_response) and buffered-stream
+    (_handle_stream_buffered) paths.
+
+    Pins the (clean_text, is_runaway) contract so the two paths are provably
+    identical: thought-stripping, the runaway guard, and the salvage heuristic
+    all live in one place. (2026-05-28 streaming-guard arc.)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_finalize_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_empty_returns_empty_not_runaway(self):
+        clean, runaway = self.mod.finalize_generation("")
+        self.assertEqual(clean, "")
+        self.assertFalse(runaway)
+
+    def test_none_returns_empty_not_runaway(self):
+        clean, runaway = self.mod.finalize_generation(None)
+        self.assertEqual(clean, "")
+        self.assertFalse(runaway)
+
+    def test_clean_reply_passes_through(self):
+        clean, runaway = self.mod.finalize_generation(
+            "Yeah, just chilling at home, what's up?")
+        self.assertIn("chilling", clean.lower())
+        self.assertFalse(runaway)
+
+    def test_unclosed_thought_channel_is_runaway_empty(self):
+        raw = ("<|channel>thought\nThe user asked about feeds. Let me weigh the "
+               "format request against the no-think instruction and consider...")
+        clean, runaway = self.mod.finalize_generation(raw)
+        self.assertEqual(clean, "")
+        self.assertTrue(runaway)
+
+    def test_markerless_bullets_salvage_not_runaway(self):
+        # Markdown-bullet deliberation with NO channel markers: the
+        # runaway-empty guard is INTENTIONALLY Case-1-only (unclosed channel),
+        # because strip_thought_channels handles marker-free text and a
+        # legitimate "respond in bullets" reply must NOT be nuked to empty.
+        # So finalize salvages the last line and reports is_runaway=False —
+        # identical to the non-stream path. The streaming guard's value is
+        # parity + no token-by-token leak, not nuking bullet output.
+        raw = ("*   User asked X.\n"
+               "*   Candidate reply A: \"Sure thing\"\n"
+               "*   Candidate reply B: \"On it\"\n"
+               "*   Evaluating which fits the persona...")
+        clean, runaway = self.mod.finalize_generation(raw)
+        self.assertNotEqual(clean, "")
+        self.assertFalse(runaway)
+
+    def test_closed_thought_channel_keeps_reply(self):
+        raw = "<|channel>thought\nthinking hard<channel|>The answer is 42."
+        clean, runaway = self.mod.finalize_generation(raw)
+        self.assertIn("42", clean)
+        self.assertFalse(runaway)
+
+
+class TestStreamShouldBuffer(unittest.TestCase):
+    """Unit tests for _stream_should_buffer() — the env gate that decides
+    whether the SSE path buffers + strips (default for the deliberating
+    seth-lora-v4-repair model) or yields raw incremental chunks.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_sbuf_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def setUp(self):
+        self._saved = {
+            k: os.environ.get(k)
+            for k in ("HU_STREAM_BUFFER_STRIP", "GEMMA_DISABLE_THINKING")
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_override_force_on(self):
+        for val in ("1", "true", "yes"):
+            os.environ["HU_STREAM_BUFFER_STRIP"] = val
+            os.environ.pop("GEMMA_DISABLE_THINKING", None)
+            self.assertTrue(self.mod._stream_should_buffer(), val)
+
+    def test_override_force_off_beats_disable_thinking(self):
+        for val in ("0", "false", "no"):
+            os.environ["HU_STREAM_BUFFER_STRIP"] = val
+            os.environ["GEMMA_DISABLE_THINKING"] = "1"
+            self.assertFalse(self.mod._stream_should_buffer(), val)
+
+    def test_default_on_when_disable_thinking_set(self):
+        os.environ.pop("HU_STREAM_BUFFER_STRIP", None)
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        self.assertTrue(self.mod._stream_should_buffer())
+
+    def test_default_off_when_disable_thinking_unset(self):
+        os.environ.pop("HU_STREAM_BUFFER_STRIP", None)
+        os.environ.pop("GEMMA_DISABLE_THINKING", None)
+        self.assertFalse(self.mod._stream_should_buffer())
+
+
 def _port_free(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) != 0

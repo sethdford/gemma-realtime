@@ -916,6 +916,109 @@ def _is_pure_deliberation(raw):
     return len(non_bullet_reply) == 0
 
 
+def finalize_generation(full):
+    """Strip thought blocks from a fully-accumulated raw generation.
+
+    SHARED by the non-streaming path (generate_response) and the buffered
+    streaming path (_handle_stream_buffered) so BOTH apply identical
+    thought-stripping and runaway handling — the markdown-bullet reply can
+    only be extracted once the full output is known, so streaming must buffer
+    to match.
+
+    Returns (clean_text, is_runaway):
+      - clean_text: visible reply with thought blocks removed (possibly
+        salvaged from raw if the extractor came up empty but the output was
+        NOT pure deliberation)
+      - is_runaway: True when the raw output was pure deliberation (unclosed
+        thought channel or all-bullets-no-reply); callers emit empty rather
+        than the salvage fragment.
+
+    Honors GEMMA_DUMP_EMPTY_EXTRACT for raw-output diagnostics. Side effects
+    are limited to that optional diagnostic write + stdout logging, so the
+    (text, runaway) decision is deterministic and unit-testable.
+    """
+    full = (full or "").strip()
+    if not full:
+        return "", False
+    import re as _re
+    stripped = strip_thought_channels(full)
+    if stripped:
+        return stripped, False
+
+    # Extractor came up empty — diagnose, then decide runaway vs salvage.
+    # DIAGNOSTIC: dump full raw output when GEMMA_DUMP_EMPTY_EXTRACT is set.
+    _dump_flag = os.environ.get("GEMMA_DUMP_EMPTY_EXTRACT", "").strip()
+    if _dump_flag and _dump_flag.lower() not in ("0", "false", "no"):
+        _dump_path = (_dump_flag if "/" in _dump_flag
+                      else os.path.expanduser(
+                          "~/.human/logs/mlx-server-empty-extract.log"))
+        try:
+            os.makedirs(os.path.dirname(_dump_path), exist_ok=True)
+            with open(_dump_path, "a", encoding="utf-8") as _f:
+                _f.write(f"\n===== {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                         f"len={len(full)} =====\n")
+                _f.write(full)
+                _f.write("\n===== end =====\n")
+        except Exception:
+            pass  # diagnostic must never break request handling
+
+    # RUNAWAY GUARD: pure deliberation (unclosed thought channel or a
+    # bullet-list of candidates with no resolved reply) -> return empty so the
+    # caller sees a clean failure instead of a confident-looking garbage
+    # fragment. See m3_live_path_extractor_strip.md "runaway" arc.
+    if _is_pure_deliberation(full):
+        try:
+            print(f"  [runaway-detected] pure deliberation, no final reply "
+                  f"({len(full)} chars); returning empty instead of salvaging "
+                  f"garbage", flush=True)
+        except Exception:
+            pass
+        return "", True
+
+    # Salvage: last quoted string (gemma-4 emits candidates in quotes), else
+    # the last non-empty line with surrounding bullets stripped.
+    quoted = _re.findall(r'"([^"]{1,200})"', full)
+    if quoted:
+        salvaged = quoted[-1]
+    else:
+        salvaged = ""
+        for line in reversed(full.split("\n")):
+            cleaned_line = _re.sub(r"^\s*\*\s*", "", line).strip()
+            if cleaned_line:
+                salvaged = cleaned_line
+                break
+    try:
+        print(f"  [strip-fallback] extractor empty; salvaged from raw "
+              f"({len(full)} chars): {salvaged[:80]!r}", flush=True)
+    except Exception:
+        pass
+    return salvaged, False
+
+
+def _stream_should_buffer():
+    """Whether the streaming endpoint should buffer the full generation and
+    apply non-stream thought-stripping before emitting, instead of yielding
+    raw token chunks.
+
+    Required for the seth-lora-v4-repair model: it deliberates in markdown
+    bullets with NO channel markers, so the incremental strip-mode filter
+    leaks the deliberation to the client (the reply can only be extracted
+    once the full output is known). Confirmed live 2026-05-28: a feed-research
+    structured prompt streamed bullet-deliberation while the non-stream path
+    returned a clean report for the same prompt.
+
+    Default: ON when GEMMA_DISABLE_THINKING is set (that flag signals "this
+    model deliberates and we want clean output"). Override with
+    HU_STREAM_BUFFER_STRIP=1 (force on) / 0 (force off, legacy incremental).
+    """
+    override = os.environ.get("HU_STREAM_BUFFER_STRIP", "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    return _no_think_instruction() is not None
+
+
 _thinking_mode = False
 _thinking_count = 0
 
@@ -1292,66 +1395,11 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
             if hit_stop:
                 break
         full = "".join(text_parts).strip()
-        stripped = strip_thought_channels(full)
-        # 2026-05-25: when the extractor strips everything (model emitted
-        # markdown bullets with no extractable final reply), log the raw
-        # output for diagnosis AND fall back to a salvage-from-raw heuristic
-        # so the daemon doesn't get empty content and silently fail.
-        if not stripped and full:
-            import re as _re
-            # DIAGNOSTIC: dump full raw output to a log when env flag is set.
-            # Off by default. Set GEMMA_DUMP_EMPTY_EXTRACT=1 (or a path) to
-            # capture the LoRA's actual output shape — needed to design a
-            # better extractor for the seth-lora-v4-repair bullet-mode bug.
-            # See ~/.claude/projects/.../memory/m3_live_path_extractor_strip.md
-            _dump_flag = os.environ.get("GEMMA_DUMP_EMPTY_EXTRACT", "").strip()
-            if _dump_flag and _dump_flag.lower() not in ("0", "false", "no"):
-                _dump_path = (_dump_flag if "/" in _dump_flag
-                              else os.path.expanduser(
-                                  "~/.human/logs/mlx-server-empty-extract.log"))
-                try:
-                    os.makedirs(os.path.dirname(_dump_path), exist_ok=True)
-                    with open(_dump_path, "a", encoding="utf-8") as _f:
-                        _f.write(f"\n===== {time.strftime('%Y-%m-%dT%H:%M:%S')} "
-                                 f"len={len(full)} =====\n")
-                        _f.write(full)
-                        _f.write("\n===== end =====\n")
-                except Exception:
-                    pass  # diagnostic must never break request handling
-            # RUNAWAY GUARD (2026-05-28): if the raw output is pure
-            # deliberation — an unclosed thought channel or a bullet-list of
-            # candidate replies the model never resolved — salvaging "the last
-            # quoted string" emits a confident-looking GARBAGE fragment (a
-            # candidate the model was still evaluating). Returning empty is
-            # strictly better: the caller sees a clean failure and can retry,
-            # rather than acting on a fabricated answer. See
-            # m3_live_path_extractor_strip.md "runaway" arc.
-            if _is_pure_deliberation(full):
-                try:
-                    print(f"  [runaway-detected] pure deliberation, no final "
-                          f"reply ({len(full)} chars); returning empty instead "
-                          f"of salvaging garbage", flush=True)
-                except Exception:
-                    pass
-                return "", prompt_toks_out, gen_toks_out
-            # Salvage: extract the LAST quoted string in the raw output —
-            # gemma-4 thinking often emits candidate replies inside quotes.
-            quoted = _re.findall(r'"([^"]{1,200})"', full)
-            if quoted:
-                stripped = quoted[-1]
-            else:
-                # Last-resort: last non-empty line with surrounding bullets stripped
-                for line in reversed(full.split("\n")):
-                    cleaned_line = _re.sub(r"^\s*\*\s*", "", line).strip()
-                    if cleaned_line:
-                        stripped = cleaned_line
-                        break
-            # Truncate raw for log readability; one-line label per call.
-            try:
-                print(f"  [strip-fallback] extractor empty; salvaged from raw "
-                      f"({len(full)} chars): {stripped[:80]!r}", flush=True)
-            except Exception:
-                pass
+        # Shared finalize: strip thought channels, dump-on-empty diagnostics,
+        # runaway guard, and salvage heuristic all live in finalize_generation
+        # so the buffered streaming path (_handle_stream_buffered) applies the
+        # IDENTICAL logic. See m3_live_path_extractor_strip.md "runaway" arc.
+        stripped, _runaway = finalize_generation(full)
         return stripped, prompt_toks_out, gen_toks_out
 
     from mlx_vlm import generate as vlm_generate
@@ -1581,6 +1629,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+        # RUNAWAY GUARD for the streaming path (2026-05-28): the
+        # seth-lora-v4-repair model deliberates in markdown bullets with NO
+        # channel markers, so the incremental strip-mode filter cannot tell
+        # deliberation from the reply and leaks it to the client. The reply is
+        # only extractable once the full output is known, so when buffering is
+        # enabled we accumulate the whole generation and apply the IDENTICAL
+        # finalize_generation logic the non-stream path uses, then emit the
+        # clean reply as a single SSE content chunk. See _stream_should_buffer.
+        if _stream_should_buffer():
+            self._handle_stream_buffered(messages, resp_id, t0, max_tokens, temperature)
+            return
+
         full_text = []
         prompt_toks = 0
         gen_toks = 0
@@ -1669,6 +1729,85 @@ class ChatHandler(BaseHTTPRequestHandler):
         perf_stats["requests"] += 1
 
         print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s, TTFT {ttft:.2f}s){cache_tag}{spec_tag}{reused} | {preview}...", flush=True)
+
+    def _handle_stream_buffered(self, messages, resp_id, t0, max_tokens, temperature):
+        """Buffered streaming: accumulate the full generation, apply the SAME
+        finalize_generation logic as the non-stream path, then emit the clean
+        reply as a single SSE content chunk + done chunk.
+
+        Used when _stream_should_buffer() is true (default for the
+        deliberating seth-lora-v4-repair model). The SSE response headers have
+        already been sent by _handle_stream; this method owns the body.
+
+        Like _handle_non_stream, grant thinking headroom: the model deliberates
+        ~150-200 tokens before the visible reply, so capping at the caller's
+        max_tokens starves the reply to empty. Headroom is a CAP (well-behaved
+        completions stop early) — see _thinking_headroom_tokens().
+        """
+        internal_max = max_tokens + _thinking_headroom_tokens()
+
+        raw_parts = []
+        prompt_toks = 0
+        gen_toks = 0
+        first_token_time = None
+        with model_lock:
+            for text, pt, gt in stream_response(messages, internal_max, temperature):
+                prompt_toks = pt
+                gen_toks = gt
+                if text and first_token_time is None:
+                    first_token_time = time.time()
+                raw_parts.append(text)
+
+        full = "".join(raw_parts).strip()
+        clean, is_runaway = finalize_generation(full)
+
+        if clean:
+            content_chunk = {
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": clean},
+                    "finish_reason": None,
+                }],
+            }
+            self.wfile.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+            self.wfile.flush()
+
+        done_chunk = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": gen_toks,
+                "total_tokens": prompt_toks + gen_toks,
+            },
+        }
+        self.wfile.write(f"data: {json.dumps(done_chunk)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+        elapsed = time.time() - t0
+        ttft = (first_token_time - t0) if first_token_time else elapsed
+        tps = gen_toks / elapsed if elapsed > 0 else 0
+        perf_stats["total_tokens"] += gen_toks
+        perf_stats["total_time"] += elapsed
+        perf_stats["requests"] += 1
+        cache_tag = f" [TQ{kv_bits}b]" if kv_bits is not None else ""
+        spec_tag = " [spec]" if speculative_enabled else ""
+        if is_runaway:
+            tag = " [buffered->runaway-empty]"
+        else:
+            tag = " [buffered]"
+        preview = clean[:60].replace("\n", " ")
+        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s, "
+              f"TTFT {ttft:.2f}s){cache_tag}{spec_tag}{tag} | {preview}...",
+              flush=True)
 
     def _handle_non_stream(self, req, resp_id, t0):
         messages = req.get("messages", [])
