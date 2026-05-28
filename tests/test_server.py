@@ -266,6 +266,197 @@ class TestThinkingHeadroom(unittest.TestCase):
         self.assertEqual(internal_max, 80 + 512)
 
 
+class TestStructuredOutputDetection(unittest.TestCase):
+    """Unit tests for _system_prompt_requests_structured_output().
+
+    Pins the detector that distinguishes structured-output callers (feed
+    research reports, JSON proposers) from casual chat. Drives which no-think
+    instruction variant is injected — see the 2026-05-28 runaway diagnosis in
+    `m3_live_path_extractor_strip.md`.
+
+    Module load is import-safe; see TestNoThinkInjection's docstring.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_structdetect_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_casual_chat_is_not_structured(self):
+        msgs = [{"role": "system", "content": "You are Seth. Be brief and natural."},
+                {"role": "user", "content": "hey, you around?"}]
+        self.assertFalse(self.mod._system_prompt_requests_structured_output(msgs))
+
+    def test_empty_messages_is_not_structured(self):
+        self.assertFalse(self.mod._system_prompt_requests_structured_output([]))
+        self.assertFalse(self.mod._system_prompt_requests_structured_output(None))
+
+    def test_json_request_in_system_is_structured(self):
+        msgs = [{"role": "system",
+                 "content": "Decide whether to propose. Respond in JSON only."},
+                {"role": "user", "content": "..."}]
+        self.assertTrue(self.mod._system_prompt_requests_structured_output(msgs))
+
+    def test_single_json_object_request_is_structured(self):
+        msgs = [{"role": "system",
+                 "content": "Return a single JSON object with fields: decision, reason."}]
+        self.assertTrue(self.mod._system_prompt_requests_structured_output(msgs))
+
+    def test_feed_research_report_format_is_structured(self):
+        # The actual runaway trigger: feed-research agent report format.
+        msgs = [{"role": "system",
+                 "content": "Review these feed items. For each, output in the "
+                            "following format: Source, Finding, Relevance, "
+                            "Priority, Suggested Action."},
+                {"role": "user", "content": "Twitter: ..."}]
+        self.assertTrue(self.mod._system_prompt_requests_structured_output(msgs))
+
+    def test_marker_in_user_message_is_structured(self):
+        # Detector scans user messages too, not just system.
+        msgs = [{"role": "user",
+                 "content": "Summarize as JSON object with keys a, b, c."}]
+        self.assertTrue(self.mod._system_prompt_requests_structured_output(msgs))
+
+    def test_assistant_message_markers_ignored(self):
+        # Only system+user drive the decision — a prior assistant turn that
+        # happened to mention "json" must NOT flip a casual conversation.
+        msgs = [{"role": "system", "content": "You are Seth."},
+                {"role": "assistant", "content": "Here is some json: {}"},
+                {"role": "user", "content": "cool, thanks"}]
+        self.assertFalse(self.mod._system_prompt_requests_structured_output(msgs))
+
+    def test_multimodal_text_parts_scanned(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "respond in json please"},
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+        ]}]
+        self.assertTrue(self.mod._system_prompt_requests_structured_output(msgs))
+
+
+class TestNoThinkStructuredVariant(unittest.TestCase):
+    """Unit tests for the structured no-think instruction variant selection.
+
+    Pins the runaway fix (2026-05-28): a structured caller prompt must receive
+    the STRUCTURED instruction (which drops the contradictory "one short
+    message / no bullet lists" clauses) while casual chat keeps the casual
+    instruction. Both variants retain the universal "no deliberation" core.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_structvariant_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def setUp(self):
+        self._prev = os.environ.pop("GEMMA_DISABLE_THINKING", None)
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("GEMMA_DISABLE_THINKING", None)
+        else:
+            os.environ["GEMMA_DISABLE_THINKING"] = self._prev
+
+    def test_casual_prompt_gets_casual_instruction(self):
+        msgs = [{"role": "system", "content": "You are Seth."},
+                {"role": "user", "content": "hey, you around?"}]
+        out = self.mod._maybe_inject_no_think_instruction(msgs)
+        merged = out[0]["content"].lower()
+        # Casual variant contains the "one short message" clause.
+        self.assertIn("one short message", merged)
+
+    def test_structured_prompt_gets_structured_instruction(self):
+        msgs = [{"role": "system",
+                 "content": "Review feed items. Output in the following format: "
+                            "Source, Finding, Suggested Action."},
+                {"role": "user", "content": "Reddit: ..."}]
+        out = self.mod._maybe_inject_no_think_instruction(msgs)
+        merged = out[0]["content"].lower()
+        # Structured variant must NOT contain the contradictory clauses.
+        self.assertNotIn("one short message", merged)
+        self.assertNotIn("markdown bullet lists", merged)
+        # But MUST retain the universal no-deliberation core.
+        self.assertIn("deliberation", merged)
+        self.assertIn("format the prompt specifies", merged)
+
+    def test_both_variants_suppress_deliberation(self):
+        # The universal core ("no internal deliberation / thought process") is
+        # what protects working JSON callers like init_proposer; it must be
+        # present in BOTH variants.
+        self.assertIn("deliberation", self.mod._NO_THINK_INSTRUCTION.lower())
+        self.assertIn("deliberation", self.mod._NO_THINK_INSTRUCTION_STRUCTURED.lower())
+        self.assertIn("thought process", self.mod._NO_THINK_INSTRUCTION.lower())
+        self.assertIn("thought process", self.mod._NO_THINK_INSTRUCTION_STRUCTURED.lower())
+
+    def test_structured_variant_drops_contradictory_clauses(self):
+        struct = self.mod._NO_THINK_INSTRUCTION_STRUCTURED.lower()
+        self.assertNotIn("one short message", struct)
+        self.assertNotIn("markdown bullet lists", struct)
+
+
+class TestPureDeliberationGuard(unittest.TestCase):
+    """Unit tests for _is_pure_deliberation().
+
+    Pins the runaway guard (2026-05-28): when the model never closes its
+    thought channel and never writes a reply line, the salvage heuristic emits
+    garbage. The guard returns True so the caller can return empty instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_pdelib_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_empty_is_not_deliberation(self):
+        self.assertFalse(self.mod._is_pure_deliberation(""))
+        self.assertFalse(self.mod._is_pure_deliberation(None))
+
+    def test_clean_reply_is_not_deliberation(self):
+        self.assertFalse(self.mod._is_pure_deliberation(
+            "Yeah, just chilling at home, what's up?"))
+
+    def test_unclosed_thought_channel_is_deliberation(self):
+        raw = ("<|channel>thought\nThe user asked about feeds. Let me consider "
+               "the format requested versus the no-think instruction...")
+        self.assertTrue(self.mod._is_pure_deliberation(raw))
+
+    def test_closed_thought_channel_with_reply_is_not_deliberation(self):
+        raw = ("<|channel>thought\nThinking...<channel|>Here is the answer.")
+        self.assertFalse(self.mod._is_pure_deliberation(raw))
+
+    def test_pure_bullet_list_is_deliberation(self):
+        raw = ("*   User asked X.\n"
+               "*   Candidate reply A: \"Sure thing\"\n"
+               "*   Candidate reply B: \"On it\"\n"
+               "*   Evaluating which fits the persona...")
+        self.assertTrue(self.mod._is_pure_deliberation(raw))
+
+    def test_bullets_with_final_reply_line_is_not_deliberation(self):
+        raw = ("*   Candidate A: \"Sure\"\n"
+               "*   Candidate B: \"On it\"\n"
+               "\n"
+               "On it, leaving now.")
+        self.assertFalse(self.mod._is_pure_deliberation(raw))
+
+    def test_plain_prose_without_bullets_is_not_deliberation(self):
+        # No thought marker, no bullets — even if rambly, it is a real answer.
+        raw = ("I think the best approach here is to wait until tomorrow and "
+               "then revisit the plan with fresh eyes.")
+        self.assertFalse(self.mod._is_pure_deliberation(raw))
+
+
 def _port_free(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) != 0

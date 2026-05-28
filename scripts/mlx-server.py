@@ -534,6 +534,90 @@ _NO_THINK_INSTRUCTION = (
 )
 
 
+# Structured-output variant of the no-think instruction.
+#
+# Why this exists (runaway diagnosis 2026-05-28, m3_live_path_extractor_strip.md
+# "runaway" arc): the casual _NO_THINK_INSTRUCTION above contains TWO clauses
+# that CONTRADICT a structured-output caller prompt (e.g. the feed-research
+# agent that asks for a "Source / Finding / Relevance / Priority /
+# Suggested-Action" report, or any caller requesting JSON):
+#   - "markdown bullet lists" forbidden  → conflicts with a report/list format
+#   - "Reply directly in one short message" → conflicts with a multi-field report
+# When both the structured request and the casual no-think clause are present,
+# the model spends its entire budget deliberating about which instruction to
+# obey (ground truth: mlx-server-empty-extract.log 15:09:20, the model writes
+# "the system prompt requested a specific format ... However, the *last*
+# instruction says ... Reply directly in one short message") and never closes
+# its thought channel → runaway → empty/garbage salvage.
+#
+# The fix keeps the UNIVERSAL "no deliberation / no thought process" core
+# (which protects every prompt, including working JSON callers like
+# init_proposer) but DROPS the two clauses that fight a structured format.
+_NO_THINK_INSTRUCTION_STRUCTURED = (
+    "Do not include candidate replies, internal deliberation, "
+    "evaluation parentheticals, or thought process. "
+    "Produce the requested output directly in the format the prompt specifies."
+)
+
+
+# Markers that indicate a system/user prompt is asking for STRUCTURED output
+# (JSON, a multi-field report, a named format) rather than a casual chat reply.
+# Matched case-insensitively as substrings. Kept deliberately specific to avoid
+# false-positives on casual prompts that merely mention the word "format".
+_STRUCTURED_OUTPUT_MARKERS = (
+    "output format",
+    "respond in json",
+    "reply in json",
+    "return json",
+    "as json",
+    "json object",
+    "single json",
+    "valid json",
+    "json only",
+    "in the following format",
+    "use the following format",
+    "respond in the format",
+    "following structure",
+    "schema:",
+    "fields:",
+    "format:",
+    "suggested action",  # feed-research report field
+    "suggested-action",
+)
+
+
+def _system_prompt_requests_structured_output(messages):
+    """Return True if any system OR user message asks for structured output.
+
+    Pure function (no I/O, no globals) — directly unit-testable. Drives the
+    choice between the casual and structured no-think instruction variants so
+    a structured caller prompt isn't sabotaged by the casual "one short
+    message / no bullet lists" clauses (the runaway root cause).
+    """
+    if not messages:
+        return False
+    for msg in messages:
+        role = msg.get("role")
+        if role not in ("system", "user"):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Multimodal content parts — concatenate any text parts.
+            text = " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = ""
+        lowered = text.lower()
+        if any(marker in lowered for marker in _STRUCTURED_OUTPUT_MARKERS):
+            return True
+    return False
+
+
 def _no_think_instruction():
     """Return the system-instruction text that suppresses Gemma 4 thinking mode.
 
@@ -597,6 +681,12 @@ def _maybe_inject_no_think_instruction(messages):
     """If thinking is disabled, append the no-think instruction to the system
     message (or insert a new system message if none exists).
 
+    Picks the STRUCTURED variant of the instruction when the caller prompt
+    requests structured output (JSON / a named report format) — otherwise the
+    casual variant. This prevents the runaway where the casual "one short
+    message / no bullet lists" clauses contradict a structured request and the
+    model burns its whole budget deliberating about which to obey.
+
     Returns a new messages list — does NOT mutate the input. This preserves
     OpenAI request idempotency and makes the function safe to call from both
     streaming and non-streaming paths.
@@ -604,6 +694,9 @@ def _maybe_inject_no_think_instruction(messages):
     instruction = _no_think_instruction()
     if not instruction:
         return messages
+    if instruction is _NO_THINK_INSTRUCTION and \
+            _system_prompt_requests_structured_output(messages):
+        instruction = _NO_THINK_INSTRUCTION_STRUCTURED
     out = []
     appended = False
     for msg in messages:
@@ -777,6 +870,50 @@ def strip_thought_channels(text):
         return _extract_reply_from_body(tail_lines[-1])
     last_bullet_body = re.sub(r"^\s*\*\s*", "", lines[last_bullet_idx])
     return _extract_reply_from_body(last_bullet_body)
+
+
+def _is_pure_deliberation(raw):
+    """Return True if `raw` is an unclosed/never-resolved thought block with no
+    extractable final reply — i.e. a RUNAWAY generation, not a real answer.
+
+    Pure function (no I/O) — directly unit-testable. Used as a guard before the
+    salvage heuristic in generate_response: when the model never closed its
+    thought channel and never wrote a reply line, salvaging "the last quoted
+    string" produces garbage (a candidate reply the model was still evaluating,
+    or a fragment of its own deliberation). It is strictly better to return
+    empty (so the caller sees a clean failure / can retry) than to emit a
+    confident-looking garbage fragment.
+
+    Detects the runaway shape observed in mlx-server-empty-extract.log:
+      - opens with a `<|channel>thought` marker that is NEVER closed by
+        `<channel|>`, OR
+      - is entirely markdown-bullet deliberation with no non-bullet reply line
+    AND strip_thought_channels() already returned empty for it.
+    """
+    if not raw:
+        return False
+    import re
+    text = raw.strip()
+
+    # Case 1: explicit thought-channel marker opened but never closed.
+    if "<|channel>thought" in text and "<channel|>" not in text:
+        return True
+
+    # Case 2: markdown-bullet deliberation with no final reply line.
+    # (Only meaningful when there ARE bullets — a plain unbulleted answer is
+    # never pure deliberation.)
+    lines = text.split("\n")
+    bullet_re = re.compile(r"^\s*\*\s")
+    bullet_lines = [l for l in lines if bullet_re.match(l)]
+    if not bullet_lines:
+        return False
+    non_bullet_reply = [
+        l.strip() for l in lines
+        if l.strip() and not bullet_re.match(l)
+    ]
+    # If every non-bullet line is itself empty/whitespace, the model produced
+    # only a bullet-list of candidate replies and never committed to one.
+    return len(non_bullet_reply) == 0
 
 
 _thinking_mode = False
@@ -1181,6 +1318,22 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
                         _f.write("\n===== end =====\n")
                 except Exception:
                     pass  # diagnostic must never break request handling
+            # RUNAWAY GUARD (2026-05-28): if the raw output is pure
+            # deliberation — an unclosed thought channel or a bullet-list of
+            # candidate replies the model never resolved — salvaging "the last
+            # quoted string" emits a confident-looking GARBAGE fragment (a
+            # candidate the model was still evaluating). Returning empty is
+            # strictly better: the caller sees a clean failure and can retry,
+            # rather than acting on a fabricated answer. See
+            # m3_live_path_extractor_strip.md "runaway" arc.
+            if _is_pure_deliberation(full):
+                try:
+                    print(f"  [runaway-detected] pure deliberation, no final "
+                          f"reply ({len(full)} chars); returning empty instead "
+                          f"of salvaging garbage", flush=True)
+                except Exception:
+                    pass
+                return "", prompt_toks_out, gen_toks_out
             # Salvage: extract the LAST quoted string in the raw output —
             # gemma-4 thinking often emits candidate replies inside quotes.
             quoted = _re.findall(r'"([^"]{1,200})"', full)
