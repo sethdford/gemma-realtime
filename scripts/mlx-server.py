@@ -677,6 +677,47 @@ def _thinking_headroom_tokens():
     return val if val >= 0 else 512
 
 
+def _repetition_penalty():
+    """Repetition penalty for the logits processor — suppresses the ultra-short-
+    prompt runaway (m3_live_path_extractor_strip.md). With NO penalty, minimal
+    prompts like "yo" occasionally collapse into a token-repetition loop that
+    burns the entire thinking-headroom budget (observed 592 generated tokens)
+    and yields an empty reply after strip (the _is_pure_deliberation runaway
+    guard correctly returns "" rather than garbage). A mild penalty (default
+    1.1) breaks the degenerate loop so the model commits to a real reply.
+
+    Tunable via GEMMA_REPETITION_PENALTY. Default 1.1. 1.0 disables. Non-numeric
+    or non-positive values fall back to 1.1.
+    """
+    raw = os.environ.get("GEMMA_REPETITION_PENALTY", "").strip()
+    if not raw:
+        return 1.1
+    try:
+        val = float(raw)
+    except ValueError:
+        return 1.1
+    return val if val > 0 else 1.1
+
+
+def _repetition_logits_processors():
+    """Build the logits_processors list applying the repetition penalty, or
+    None when disabled (penalty == 1.0). In this mlx_lm version repetition
+    penalty is applied via make_logits_processors, NOT make_sampler (the
+    sampler signature has no repetition_penalty arg). Context window tunable
+    via GEMMA_REPETITION_CONTEXT (default 20)."""
+    penalty = _repetition_penalty()
+    if abs(penalty - 1.0) < 1e-9:
+        return None
+    from mlx_lm.sample_utils import make_logits_processors
+    raw = os.environ.get("GEMMA_REPETITION_CONTEXT", "").strip()
+    try:
+        ctx = int(raw) if raw else 20
+    except ValueError:
+        ctx = 20
+    return make_logits_processors(repetition_penalty=penalty,
+                                  repetition_context_size=ctx)
+
+
 def _maybe_inject_no_think_instruction(messages):
     """If thinking is disabled, append the no-think instruction to the system
     message (or insert a new system message if none exists).
@@ -1374,6 +1415,9 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
         prompt = prepare_prompt_lm(messages)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
+        _rp = _repetition_logits_processors()
+        if _rp:
+            extra["logits_processors"] = _rp
         text_parts = []
         prompt_toks_out = 0
         gen_toks_out = 0
@@ -1440,6 +1484,9 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
             prompt = prepare_prompt_lm(messages)
             extra = _kv_kwargs()
             extra["sampler"] = make_sampler(temp=temperature)
+            _rp = _repetition_logits_processors()
+            if _rp:
+                extra["logits_processors"] = _rp
 
             import inspect
             sig = inspect.signature(lm_stream_generate)
@@ -1486,6 +1533,9 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
         prompt = prepare_prompt_lm(messages)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
+        _rp = _repetition_logits_processors()
+        if _rp:
+            extra["logits_processors"] = _rp
 
         prefill_done = False
         for resp in lm_stream_generate(
