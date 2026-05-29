@@ -1,0 +1,210 @@
+[
+  {
+    "trait": "formality",
+    "monotonic": "none",
+    "safe_alpha_range": [
+      -1.0,
+      2.0
+    ],
+    "rows": [
+      {
+        "alpha": -2.0,
+        "proxy": 0.6448,
+        "capability": "1/3",
+        "cap_ok": false
+      },
+      {
+        "alpha": -1.0,
+        "proxy": 0.9191,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": -0.5,
+        "proxy": 0.8711,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.0,
+        "proxy": 0.8409,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.5,
+        "proxy": 0.909,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 1.0,
+        "proxy": 0.9392,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 2.0,
+        "proxy": 1.0,
+        "capability": "3/3",
+        "cap_ok": true
+      }
+    ]
+  },
+  {
+    "trait": "verbosity",
+    "monotonic": "up",
+    "safe_alpha_range": [
+      -2.0,
+      2.0
+    ],
+    "rows": [
+      {
+        "alpha": -2.0,
+        "proxy": 42.4,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": -1.0,
+        "proxy": 53.2,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": -0.5,
+        "proxy": 54.4,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.0,
+        "proxy": 63.2,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.5,
+        "proxy": 68.2,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 1.0,
+        "proxy": 89.6,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 2.0,
+        "proxy": 1153.6,
+        "capability": "3/3",
+        "cap_ok": true
+      }
+    ]
+  },
+  {
+    "trait": "warmth",
+    "monotonic": "none",
+    "safe_alpha_range": [
+      -1.0,
+      2.0
+    ],
+    "rows": [
+      {
+        "alpha": -2.0,
+        "proxy": 0.0,
+        "capability": "2/3",
+        "cap_ok": false
+      },
+      {
+        "alpha": -1.0,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": -0.5,
+        "proxy": 0.0154,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.0,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.5,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 1.0,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 2.0,
+        "proxy": 0.063,
+        "capability": "3/3",
+        "cap_ok": true
+      }
+    ]
+  },
+  {
+    "trait": "humor",
+    "monotonic": "none",
+    "safe_alpha_range": [
+      -2.0,
+      1.0
+    ],
+    "rows": [
+      {
+        "alpha": -2.0,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": -1.0,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": -0.5,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.0,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 0.5,
+        "proxy": 0.0,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 1.0,
+        "proxy": 0.062,
+        "capability": "3/3",
+        "cap_ok": true
+      },
+      {
+        "alpha": 2.0,
+        "proxy": 0.022,
+        "capability": "1/3",
+        "cap_ok": false
+      }
+    ]
+  }
+]

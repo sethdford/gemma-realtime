@@ -35,10 +35,14 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Lock
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import persona_steering as ps  # noqa: E402  (sibling module; activation steering)
 
 DEFAULT_MODEL = "mlx-community/gemma-4-31b-it-4bit"
 DEFAULT_PORT = 8741
@@ -2115,10 +2119,19 @@ class ChatHandler(BaseHTTPRequestHandler):
         t0 = time.time()
         resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if req.get("stream", False):
-            self._handle_stream(req, resp_id, t0)
-        else:
-            self._handle_non_stream(req, resp_id, t0)
+        # Activation steering: arm per-request trait coefficients from the
+        # optional "steering" field, then clear after. The server is
+        # single-threaded (HTTPServer), so requests are fully serialized — no
+        # cross-request leakage. No "steering" field => set_active({}) => the
+        # layer hook is a strict no-op (byte-identical to unsteered).
+        ps.set_active(req.get("steering"))
+        try:
+            if req.get("stream", False):
+                self._handle_stream(req, resp_id, t0)
+            else:
+                self._handle_non_stream(req, resp_id, t0)
+        finally:
+            ps.clear_active()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -2263,6 +2276,18 @@ Examples:
             print("Prompt cache: not available (mlx_vlm.generate.PromptCacheState missing)", flush=True)
 
     load_model(args.model, adapter_path=args.adapter_path)
+
+    # Phase 1: install activation steering if trait vectors are present. Probe-
+    # gated (declines on shape/version mismatch) and default-off — no behavior
+    # change until a request carries a "steering" field. Never breaks generation.
+    try:
+        _steer_vecs = ps.load_vectors(os.path.expanduser("~/.human/persona_vectors"))
+        if use_lm_path and _steer_vecs:
+            ps.install_steering(ps.get_layers(model), _steer_vecs)
+        elif _steer_vecs and not use_lm_path:
+            print("[steering] vectors present but vlm path active; steering off", flush=True)
+    except Exception as _steer_ex:  # noqa: BLE001
+        print(f"[steering] install skipped ({_steer_ex}); running unsteered", flush=True)
 
     _init_iosurface_kv_staging()
 
