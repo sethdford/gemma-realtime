@@ -758,7 +758,7 @@ def _maybe_inject_no_think_instruction(messages):
     return out
 
 
-def prepare_prompt_lm(messages):
+def prepare_prompt_lm(messages, skip_thinking_primer=None):
     """Format messages using mlx_lm's native chat template (fast text path).
 
     Gemma 4's chat template has confusing semantics around `enable_thinking`:
@@ -772,13 +772,26 @@ def prepare_prompt_lm(messages):
     so the template doesn't undo our system-level instruction by mechanically
     opening a thinking block. The system instruction alone is insufficient
     (the template runs after the system message and overrides it).
+
+    `skip_thinking_primer` lets a CALLER force the primer-skip per request,
+    independent of the global no-think config. This is the reply-first lever
+    for streamed casual tiers (Task-0 spike 2026-05-29): the seth-lora-v4-repair
+    model emits a short, in-voice, reply-FIRST response when NOT primed, but the
+    template's forced `<|channel>thought` opener makes it front-load ~150 tokens
+    of deliberation and emit the reply LAST (streaming_beneficial:false). Passing
+    skip_thinking_primer=True drops the opener so the reply streams first.
+      - None  (default): preserve legacy behavior — skip iff a no-think
+                          instruction is configured.
+      - True / False:    explicit override from the caller.
     """
+    if skip_thinking_primer is None:
+        skip_thinking_primer = _no_think_instruction() is not None
     messages = _maybe_inject_no_think_instruction(messages)
     template_kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
     }
-    if _no_think_instruction() is not None:
+    if skip_thinking_primer:
         # Template-level suppression of the thought-channel opener.
         # See module docstring + `_maybe_inject_no_think_instruction()`.
         template_kwargs["enable_thinking"] = True
@@ -1101,6 +1114,48 @@ def _stream_should_buffer(req=None):
     return _resolve_should_buffer(
         _request_stream_strip(req),
         os.environ.get("HU_STREAM_BUFFER_STRIP", ""),
+        _no_think_instruction() is not None,
+    )
+
+
+def _resolve_skip_thinking_primer(req_flag, no_think_active):
+    """Pure decision: should we skip Gemma's forced `<|channel>thought` primer?
+
+    Skipping the primer (passing enable_thinking=True to the chat template)
+    lets the seth-lora-v4-repair model reply FIRST instead of front-loading
+    ~150 tokens of deliberation, which is what makes incremental streaming
+    actually win first-token latency (streaming_beneficial:true). Proven by
+    the Task-0 spike (2026-05-29): unprimed v4-repair emits short reply-first
+    in-voice output with no channel markers.
+
+    Inputs, in precedence order (highest first):
+      1. req_flag        — per-request `stream_strip` override.
+                           False = casual/incremental tier (reply-first wanted)
+                                   → skip the primer.
+                           True  = analytical/buffered tier (think-first kept)
+                                   → fall through to the global default.
+                           None  = "not specified" → fall through.
+      2. no_think_active — bool: a no-think instruction is configured, so the
+                           legacy default already skips the primer.
+
+    Only `stream_strip=false` (casual) opts into reply-first; True/None preserve
+    the EXACT current global behavior so heavy tiers and the non-stream path are
+    untouched. Per-request beats model-default.
+    """
+    if req_flag is False:
+        return True
+    return bool(no_think_active)
+
+
+def _request_skip_thinking_primer(req):
+    """Whether to skip the thinking-primer for this streaming request.
+
+    Casual streamed tiers (model_router sends stream_strip=false) get reply-first
+    generation; every other request keeps the server's global primer behavior.
+    Passing req=None reproduces the legacy default exactly.
+    """
+    return _resolve_skip_thinking_primer(
+        _request_stream_strip(req),
         _no_think_instruction() is not None,
     )
 
@@ -1507,7 +1562,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
     return strip_thought_channels(text), prompt_toks, gen_toks
 
 
-def stream_response(messages, max_tokens=256, temperature=0.7):
+def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_primer=None):
     """Streaming generator: yield (text_chunk, prompt_toks, gen_toks) per token.
 
     Fast path: mlx_lm.stream_generate (no vision overhead, no numpy sync)
@@ -1515,6 +1570,9 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
 
     When speculative decoding is enabled, uses the draft model to propose
     multiple tokens that the target model verifies in parallel.
+
+    `skip_thinking_primer` is forwarded to prepare_prompt_lm so streamed casual
+    tiers (stream_strip=false) generate reply-first. None = legacy default.
     """
     has_imgs = _has_images(messages)
     prompt_toks = 0
@@ -1526,7 +1584,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
             from mlx_lm import stream_generate as lm_stream_generate
             from mlx_lm.sample_utils import make_sampler
             _prepare_cache_for_request(messages)
-            prompt = prepare_prompt_lm(messages)
+            prompt = prepare_prompt_lm(messages, skip_thinking_primer)
             extra = _kv_kwargs()
             extra["sampler"] = make_sampler(temp=temperature)
             _rp = _repetition_logits_processors()
@@ -1575,7 +1633,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7):
         from mlx_lm.sample_utils import make_sampler
 
         _prepare_cache_for_request(messages)
-        prompt = prepare_prompt_lm(messages)
+        prompt = prepare_prompt_lm(messages, skip_thinking_primer)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
         _rp = _repetition_logits_processors()
@@ -1745,8 +1803,14 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         debug_stream = os.environ.get("HU_DEBUG_STREAM", "").strip() in ("1", "true", "yes")
         debug_log = []
+        # Casual streamed tiers (stream_strip=false) skip Gemma's forced thinking
+        # primer so v4-repair replies FIRST → real first-token latency win
+        # (streaming_beneficial:true). Heavy/buffered tiers took the early return
+        # above and are unaffected. See _request_skip_thinking_primer (Task-0 spike).
+        skip_primer = _request_skip_thinking_primer(req)
         with model_lock:
-            for text, pt, gt in stream_response(messages, max_tokens, temperature):
+            for text, pt, gt in stream_response(messages, max_tokens, temperature,
+                                                skip_thinking_primer=skip_primer):
                 prompt_toks = pt
                 gen_toks = gt
 
