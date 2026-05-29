@@ -698,5 +698,114 @@ class TestServerIntegration(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 404)
 
 
+class TestStreamShouldBufferPrecedence(unittest.TestCase):
+    """Unit tests for the per-request streaming-buffer override (Option B).
+
+    Pins the precedence the gemma-realtime server uses to decide, per request,
+    whether the /v1/chat/completions streaming path buffers+strips (clean, but
+    TTFT == total) or yields raw token chunks (low TTFT, but leaks markerless
+    deliberation). The whole point of the per-request `stream_strip` flag is to
+    let h-uman's model_router ask for incremental streaming on casual/reflexive
+    turns while analytical/structured turns keep the clean buffered default —
+    WITHOUT touching the server's global env. See docs plan
+    `2026-05-29-realtime-streaming-sota` (Option B) + scripts/eval_streaming_smoke.py.
+
+    Precedence (highest first): per-request flag > HU_STREAM_BUFFER_STRIP env >
+    model-deliberates default. Tested against the REAL production functions
+    (_resolve_should_buffer / _request_stream_strip / _stream_should_buffer).
+
+    Module load is import-safe; see TestThinkingHeadroom's docstring.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_bufferprec_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def setUp(self):
+        self._prev_env = os.environ.pop("HU_STREAM_BUFFER_STRIP", None)
+
+    def tearDown(self):
+        if self._prev_env is None:
+            os.environ.pop("HU_STREAM_BUFFER_STRIP", None)
+        else:
+            os.environ["HU_STREAM_BUFFER_STRIP"] = self._prev_env
+
+    # --- _resolve_should_buffer: the pure precedence matrix ----------------
+
+    def test_request_true_beats_everything(self):
+        # Per-request stream_strip=True forces buffering even if env says "0"
+        # and the model doesn't deliberate.
+        self.assertTrue(self.mod._resolve_should_buffer(True, "0", False))
+
+    def test_request_false_beats_everything(self):
+        # Per-request stream_strip=False forces incremental even if env says "1"
+        # and the model deliberates (the casual-turn realtime case).
+        self.assertFalse(self.mod._resolve_should_buffer(False, "1", True))
+
+    def test_env_used_when_request_unspecified(self):
+        # req_flag None => fall through to env.
+        self.assertTrue(self.mod._resolve_should_buffer(None, "yes", False))
+        self.assertFalse(self.mod._resolve_should_buffer(None, "no", True))
+
+    def test_model_default_when_request_and_env_unspecified(self):
+        # No request flag, no env => the model-deliberates default decides.
+        self.assertTrue(self.mod._resolve_should_buffer(None, "", True))
+        self.assertFalse(self.mod._resolve_should_buffer(None, "", False))
+
+    def test_env_blank_or_garbage_falls_through_to_model_default(self):
+        for junk in ("", "   ", "maybe", "2"):
+            self.assertTrue(self.mod._resolve_should_buffer(None, junk, True), junk)
+            self.assertFalse(self.mod._resolve_should_buffer(None, junk, False), junk)
+
+    # --- _request_stream_strip: tolerant extraction ------------------------
+
+    def test_extract_real_bools(self):
+        self.assertIs(self.mod._request_stream_strip({"stream_strip": True}), True)
+        self.assertIs(self.mod._request_stream_strip({"stream_strip": False}), False)
+
+    def test_extract_missing_is_none(self):
+        self.assertIsNone(self.mod._request_stream_strip({"messages": []}))
+        self.assertIsNone(self.mod._request_stream_strip({}))
+
+    def test_extract_non_bool_is_ignored(self):
+        # A malformed field must never silently flip global policy — it falls
+        # through (None) to env/model default. 1/0 are NOT treated as bools.
+        for bad in ({"stream_strip": 1}, {"stream_strip": "true"},
+                    {"stream_strip": None}, {"stream_strip": 0}):
+            self.assertIsNone(self.mod._request_stream_strip(bad), bad)
+
+    def test_extract_non_dict_is_none(self):
+        self.assertIsNone(self.mod._request_stream_strip(None))
+        self.assertIsNone(self.mod._request_stream_strip("not a dict"))
+
+    # --- _stream_should_buffer(req): end-to-end with env control -----------
+
+    def test_request_override_wins_over_env(self):
+        # The contract the h-uman router relies on: a per-turn stream_strip=False
+        # forces incremental streaming regardless of the server's global env.
+        os.environ["HU_STREAM_BUFFER_STRIP"] = "1"
+        self.assertFalse(self.mod._stream_should_buffer({"stream_strip": False}))
+        self.assertTrue(self.mod._stream_should_buffer({"stream_strip": True}))
+
+    def test_no_request_flag_uses_env(self):
+        os.environ["HU_STREAM_BUFFER_STRIP"] = "0"
+        self.assertFalse(self.mod._stream_should_buffer({"messages": []}))
+        os.environ["HU_STREAM_BUFFER_STRIP"] = "1"
+        self.assertTrue(self.mod._stream_should_buffer({"messages": []}))
+
+    def test_none_request_reproduces_legacy(self):
+        # Passing req=None must behave exactly like the env/default-only path.
+        os.environ["HU_STREAM_BUFFER_STRIP"] = "1"
+        self.assertEqual(
+            self.mod._stream_should_buffer(None),
+            self.mod._stream_should_buffer({}),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

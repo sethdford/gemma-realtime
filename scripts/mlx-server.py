@@ -1036,7 +1036,53 @@ def finalize_generation(full):
     return salvaged, False
 
 
-def _stream_should_buffer():
+def _resolve_should_buffer(req_flag, env_value, no_think_active):
+    """Pure decision: should the streaming endpoint buffer+strip for this request?
+
+    Buffering accumulates the whole generation and applies the non-stream
+    thought-stripping before emitting ONE clean chunk (correct output, but
+    TTFT == total). Not-buffering yields raw token chunks incrementally (low
+    TTFT, but leaks markerless deliberation for models like seth-lora-v4-repair).
+
+    Inputs, in precedence order (highest first):
+      1. req_flag      — per-request `stream_strip` override. True = buffer/clean,
+                         False = incremental/raw, None = "not specified" (fall through).
+      2. env_value     — raw HU_STREAM_BUFFER_STRIP string ("1"/"0"/"true"/... or "").
+      3. no_think_active — bool: a no-think instruction is configured (the model
+                         deliberates), so default to buffering for clean output.
+
+    This lets h-uman's model_router request incremental streaming per turn-type
+    (e.g. casual/reflexive turns → stream_strip=false for realtime feel) while
+    analytical/structured turns keep the clean buffered default — WITHOUT changing
+    the server's global env. Per-request beats env beats model-default.
+    """
+    if req_flag is True:
+        return True
+    if req_flag is False:
+        return False
+    ev = (env_value or "").strip().lower()
+    if ev in ("1", "true", "yes"):
+        return True
+    if ev in ("0", "false", "no"):
+        return False
+    return bool(no_think_active)
+
+
+def _request_stream_strip(req):
+    """Extract the per-request `stream_strip` override from a request body.
+
+    Returns True/False when the field is a real bool, else None ("not specified").
+    Non-bool values (ints, strings, missing) are ignored so a malformed field
+    can never silently flip the global buffering policy — it just falls through
+    to the env/model default.
+    """
+    if not isinstance(req, dict):
+        return None
+    v = req.get("stream_strip")
+    return v if isinstance(v, bool) else None
+
+
+def _stream_should_buffer(req=None):
     """Whether the streaming endpoint should buffer the full generation and
     apply non-stream thought-stripping before emitting, instead of yielding
     raw token chunks.
@@ -1048,16 +1094,15 @@ def _stream_should_buffer():
     structured prompt streamed bullet-deliberation while the non-stream path
     returned a clean report for the same prompt.
 
-    Default: ON when GEMMA_DISABLE_THINKING is set (that flag signals "this
-    model deliberates and we want clean output"). Override with
-    HU_STREAM_BUFFER_STRIP=1 (force on) / 0 (force off, legacy incremental).
+    Precedence: per-request `stream_strip` (body field) > HU_STREAM_BUFFER_STRIP
+    env > model-deliberates default (GEMMA_DISABLE_THINKING / no-think config).
+    Passing req=None reproduces the legacy env-or-default behavior exactly.
     """
-    override = os.environ.get("HU_STREAM_BUFFER_STRIP", "").strip().lower()
-    if override in ("1", "true", "yes"):
-        return True
-    if override in ("0", "false", "no"):
-        return False
-    return _no_think_instruction() is not None
+    return _resolve_should_buffer(
+        _request_stream_strip(req),
+        os.environ.get("HU_STREAM_BUFFER_STRIP", ""),
+        _no_think_instruction() is not None,
+    )
 
 
 _thinking_mode = False
@@ -1687,7 +1732,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         # enabled we accumulate the whole generation and apply the IDENTICAL
         # finalize_generation logic the non-stream path uses, then emit the
         # clean reply as a single SSE content chunk. See _stream_should_buffer.
-        if _stream_should_buffer():
+        if _stream_should_buffer(req):
             self._handle_stream_buffered(messages, resp_id, t0, max_tokens, temperature)
             return
 
