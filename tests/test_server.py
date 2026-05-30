@@ -807,5 +807,53 @@ class TestStreamShouldBufferPrecedence(unittest.TestCase):
         )
 
 
+class TestAdapterServingStatus(unittest.TestCase):
+    """_load_with_adapter must FAIL-LOUD (not silently serve base) when a configured
+    adapter is missing, and record tensors_loaded_global so /health's adapter_applied
+    reflects reality. Regression guard for the fail-silent base-fallback that masked an
+    inactive persona fine-tune (active_adapter reported a path while serving base)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_adapter_status", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_missing_adapter_records_zero_and_serves_base(self):
+        import tempfile
+        sentinel_model, sentinel_tok = object(), object()
+        loader = lambda name: (sentinel_model, sentinel_tok)
+        self.mod.tensors_loaded_global = 999  # poison: prove it is reset, not left stale
+        with tempfile.TemporaryDirectory() as d:  # no adapters.safetensors inside
+            model, _tok = self.mod._load_with_adapter(loader, "base/model", d)
+        self.assertIs(model, sentinel_model)                 # base weights served
+        self.assertEqual(self.mod.tensors_loaded_global, 0)  # fail-loud observability
+        self.assertFalse(self.mod.tensors_loaded_global > 0)  # -> adapter_applied == False
+
+    def test_adapter_applied_records_tensor_count(self):
+        import tempfile
+        import os as _os
+        import mlx.core as mx
+        captured = {}
+
+        class _FakeModel:
+            def load_weights(self, adapters, strict=False):
+                captured["n"] = len(adapters)
+
+        loader = lambda name: (_FakeModel(), object())
+        with tempfile.TemporaryDirectory() as d:
+            mx.save_safetensors(
+                _os.path.join(d, "adapters.safetensors"),
+                {"a": mx.zeros((2, 2)), "b": mx.zeros((2, 2))},
+            )
+            self.mod.tensors_loaded_global = 0
+            self.mod._load_with_adapter(loader, "base/model", d)
+        self.assertEqual(captured["n"], 2)                   # load_weights got 2 tensors
+        self.assertEqual(self.mod.tensors_loaded_global, 2)  # -> adapter_applied == True
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -364,7 +364,16 @@ def _check_ple_safety(model_name):
 
 
 def _load_with_adapter(load_fn, model_name, adapter_path):
-    """Load a model and apply LoRA adapter weights."""
+    """Load a model and apply LoRA adapter weights.
+
+    Fail-loud invariant: when ``adapter_path`` is configured but the adapter cannot
+    be applied (no adapters.safetensors), the server must NOT silently fall back to
+    base weights. That silent fallback masked an inactive persona fine-tune for
+    weeks — /health reported a configured ``adapter`` path while the model was
+    actually serving base. We warn prominently and record
+    ``tensors_loaded_global = 0`` so the state is observable via /health
+    (``adapter_applied``).
+    """
     global tensors_loaded_global
     import mlx.core as mx
     from pathlib import Path
@@ -376,6 +385,14 @@ def _load_with_adapter(load_fn, model_name, adapter_path):
         model.load_weights(adapters, strict=False)
         tensors_loaded_global = len(adapters)
         print(f"  Applied {len(adapters)} LoRA weight tensors from {adapter_file}", flush=True)
+    else:
+        tensors_loaded_global = 0
+        print(
+            f"  WARNING: adapter configured ({adapter_path}) but {adapter_file.name} "
+            f"NOT FOUND at {adapter_file} — serving BASE weights. The persona fine-tune "
+            f"is NOT active. Check ~/.human/config.json mlx_local.adapter_path.",
+            flush=True,
+        )
     return model, tokenizer
 
 
@@ -1731,6 +1748,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             # Always include active_adapter (null when no adapter is applied) for the
             # adapter-swap state surface — consumed by the C side personalization loop.
             health["active_adapter"] = adapter_path_global
+            # Observability: distinguish "adapter configured" (a path) from "adapter
+            # actually applied" (weights loaded). adapter_applied=False with a non-null
+            # adapter path means the server silently fell back to BASE weights — the
+            # exact fail-silent that masked an inactive persona fine-tune. tensors_loaded
+            # is the LoRA tensor count from the most recent load/swap.
+            health["tensors_loaded"] = tensors_loaded_global
+            health["adapter_applied"] = tensors_loaded_global > 0
             if speculative_enabled:
                 health["speculative_decoding"] = True
                 health["draft_tokens"] = speculative_draft_tokens
