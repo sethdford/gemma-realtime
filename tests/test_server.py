@@ -499,6 +499,39 @@ class TestFinalizeGeneration(unittest.TestCase):
         self.assertEqual(clean, "")
         self.assertTrue(runaway)
 
+    def test_runaway_with_quoted_candidate_salvages_nonempty(self):
+        # 2026-05-30: a runaway (unclosed thought) where the model quoted
+        # candidate replies must NOT return empty — salvage the last candidate so
+        # the chat turn is never empty (HU_SALVAGE_RUNAWAY default on). The real
+        # fix is the reply-first/ORPO retrain; this guarantees non-empty until then.
+        os.environ.pop("HU_SALVAGE_RUNAWAY", None)  # default-on
+        raw = ('<|channel>thought\nThe user said "hey whats up". Candidates: '
+               '"not much, you?" or "just chilling, what about you?"')
+        clean, runaway = self.mod.finalize_generation(raw)
+        self.assertTrue(clean.strip())          # NON-empty
+        self.assertIn("you", clean.lower())     # a real candidate reply
+        self.assertFalse(runaway)               # resolved by salvage
+
+    def test_runaway_no_candidate_still_empty(self):
+        # No quoted candidate to salvage -> still empty (nothing usable).
+        os.environ.pop("HU_SALVAGE_RUNAWAY", None)
+        raw = ("<|channel>thought\nThe user asked something; let me weigh the "
+               "options carefully before deciding how to respond.")
+        clean, runaway = self.mod.finalize_generation(raw)
+        self.assertEqual(clean, "")
+        self.assertTrue(runaway)
+
+    def test_runaway_salvage_disabled_returns_empty(self):
+        # HU_SALVAGE_RUNAWAY=0 restores strict empty-on-runaway even with candidates.
+        os.environ["HU_SALVAGE_RUNAWAY"] = "0"
+        try:
+            raw = '<|channel>thought\nOptions: "not much, you?"'
+            clean, runaway = self.mod.finalize_generation(raw)
+            self.assertEqual(clean, "")
+            self.assertTrue(runaway)
+        finally:
+            os.environ.pop("HU_SALVAGE_RUNAWAY", None)
+
     def test_markerless_bullets_salvage_not_runaway(self):
         # Markdown-bullet deliberation with NO channel markers: the
         # runaway-empty guard is INTENTIONALLY Case-1-only (unclosed channel),

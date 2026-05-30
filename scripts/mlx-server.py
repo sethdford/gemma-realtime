@@ -1042,10 +1042,29 @@ def finalize_generation(full):
     # caller sees a clean failure instead of a confident-looking garbage
     # fragment. See m3_live_path_extractor_strip.md "runaway" arc.
     if _is_pure_deliberation(full):
+        # The model deliberated without committing to a final reply. The prior
+        # behavior returned empty ("better empty than garbage"), but for a chat
+        # persona an empty turn is the worst outcome — and gemma-4 emits its
+        # candidate replies in QUOTES while deliberating, so the last quoted
+        # candidate is a plausible in-voice reply, not raw thought. Salvage it
+        # so the surface is never empty. Gated by HU_SALVAGE_RUNAWAY (default
+        # on; set 0 to restore strict empty-on-runaway). The real fix is the
+        # reply-first/ORPO retrain that stops the deliberation at the source;
+        # this guarantees a non-empty turn until then.
+        salvage_runaway = os.environ.get("HU_SALVAGE_RUNAWAY", "1").strip().lower() \
+            not in ("0", "false", "no")
+        runaway_quoted = _re.findall(r'"([^"]{1,200})"', full)
+        if salvage_runaway and runaway_quoted and runaway_quoted[-1].strip():
+            picked = runaway_quoted[-1].strip()
+            try:
+                print(f"  [runaway-salvage] no committed reply; salvaged candidate "
+                      f"({len(full)} chars): {picked[:80]!r}", flush=True)
+            except Exception:
+                pass
+            return picked, False  # resolved -> caller emits the salvaged reply
         try:
-            print(f"  [runaway-detected] pure deliberation, no final reply "
-                  f"({len(full)} chars); returning empty instead of salvaging "
-                  f"garbage", flush=True)
+            print(f"  [runaway-detected] pure deliberation, no extractable candidate "
+                  f"({len(full)} chars); returning empty", flush=True)
         except Exception:
             pass
         return "", True
