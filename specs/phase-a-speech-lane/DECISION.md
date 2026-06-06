@@ -54,12 +54,18 @@ Per-extraction time on the live **Gemma-31b-8bit** server ranged **~16–178 s**
 - If fish cannot reach **turn-take ≥95%** once measured, same demotion.
 - Vendor rejection is **not** subject to reversal (structural, not performance-based).
 
+## Fish S2S stack + conversational gates — measured status (do-it-all session)
+
+- **Fish S2S stack VALIDATED end-to-end** — `prove-fish-sts.py`: **24/24 pass**, full audio→audio in **~2.3 s** (generate 1362 ms · depth 435 ms · decode 463 ms); trained `fish_sts_final.safetensors` loads. The architecture works.
+- **BUT the fish adapters are undertrained** — reconstruction SNR −2.6 dB, speech-branch top_prob 0.05 (near-flat), embedding alignment cosine 0.62. A fish self-correction run now would measure *adapter-training maturity*, not the frozen-Gemma brain (already answered by the E2B proxy = 0.619), so we deliberately do **not** report a fish number — it would mislead.
+- **Duplex predictor runs but is unvalidated** — mixed/uninformative states (SPEAK in the pipeline path, INTERRUPT on synthetic inputs); no clean LISTEN/SPEAK/INTERRUPT signal yet. **Turn-take / interruption (AC-3/4) are blocked on duplex-predictor training, not architecture.** Scorers + aggregation (`conversational_runner`, `conversational_scoring`) are done + unit-tested, ready to consume real states.
+- **Conversational audio fixtures rendered** — 8 turn-take/backchannel/barge-in clips (`conversational_scenarios.json` → `data/realistic-audio/conversational/`), the reusable AC-3/4 input for once the duplex predictor is trained.
+
 ## Pending to fully close Phase A
 
-- **Fish lane live run** (self-correction + the conversational gates) — needs the S2S adapters loaded end-to-end.
-- **Turn-take / interruption (AC-3/4)** — need conversational/backchannel audio fixtures (current fixtures are single-utterance self-corrections) + the streaming duplex path; scorers + aggregation are done and tested.
-- **TTFA (AC-5)** — needs the streaming TTS path's `first_audio_ms` (cascade self-correction run measured extraction latency, not audio TTFA).
-- **Task 11** — `spec-verifier` pass once fish numbers land.
+- **Train the fish speech adapters + duplex predictor** — the gating blocker for fish-on-real-stack self-correction and AC-3/4 (brain + latency already proven via the E2B proxy).
+- **TTFA (AC-5)** — fish E2E is ~2.3 s untuned; streaming `first_audio_ms` < 400 ms is the target once the speech path is tuned.
+- **Task 11** — `spec-verifier` once the trained-stack numbers land.
 
 ## What is firmly closed
 

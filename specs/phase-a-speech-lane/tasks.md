@@ -76,3 +76,11 @@ Implemented & verified (full suite **114 passed, 6 skipped**):
 - **Brain-capacity risk for fish-as-primary: RESOLVED.** 31b=0.762 vs E2B=0.619; the gap is ~2 genuine reasoning misses (sc02 qty, sc04 amount), the other 6 are the shared format/ASR/strictness floor. Fish's E4B brain (between E2B and larger) should self-correct ≥0.619.
 - **Decision risk shifted capability → latency.** E2B's 4–10 s/call came from 768-token reasoning blocks; real-time fish needs non-reasoning mode / tuned budget. DECISION.md reversal trigger + status updated accordingly.
 - **Runner hardened:** `run_phase_a_scoreboard.py` gains an in-process `--mlx-model` path (no server/cache), `--llm-url`/`--tag`, and a reasoning-robust `_parse_json` (extracts the final ```json after a `<channel>thought` block). This is what made the clean E2B measurement possible (the mlx-server prompt cache corrupted E2B output).
+
+### Progress log (2026-06-06, cont. 6) — DO-IT-ALL: latency + fish stack + conversational
+
+1. **Latency RESOLVED** — no-think E2B = **0.619 @ 0.2 s/call** (same accuracy as reasoning, ~25× faster). On-device brain self-corrects above the frontier at real-time speed. `lane-scoreboard-cascade-e2b-nothink.json`.
+2. **Fish S2S stack VALIDATED** — `prove-fish-sts.py` 24/24, audio→audio ~2.3 s. BUT adapters undertrained (SNR −2.6 dB, top_prob 0.05) → no fish self-correction number reported (would measure training maturity, not the brain). Duplex predictor runs but unvalidated (mixed states) → AC-3/4 blocked on duplex training, not architecture.
+3. **Conversational fixtures rendered** — 8 turn-take/backchannel/barge-in clips (`conversational_scenarios.json` → `data/realistic-audio/conversational/`), reusable AC-3/4 input.
+
+**Net:** fish-as-primary validated on brain capacity + latency (via E2B proxy). Remaining is TRAINING (fish adapters + duplex predictor), not architecture or decision. Scorers/aggregation/runner all ready.
