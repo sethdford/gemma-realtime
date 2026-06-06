@@ -888,5 +888,93 @@ class TestAdapterServingStatus(unittest.TestCase):
         self.assertEqual(self.mod.tensors_loaded_global, 2)  # -> adapter_applied == True
 
 
+class EchoGuardTests(unittest.TestCase):
+    """Unit tests for _is_input_echo() + finalize_generation()'s echo guard.
+
+    Pins the 2026-06-04 finding: at tight caps the model truncates mid/post
+    deliberation and the strip/salvage path can surface a prompt echo, a
+    prior-turn echo, or a system-prompt leak instead of a committed reply.
+    The guard rejects those (returns empty/runaway) — better empty than garbage.
+    Pure-fn; no model load (top-level imports are stdlib only).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_for_echo_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    SYS = ("You are Seth, texting from your own phone. Reply in your own voice: "
+           "casual, short, lowercase. Their recent messages are short; match "
+           "their brevity.")
+
+    def _msgs(self, *turns, system=None):
+        out = [{"role": "system", "content": system or self.SYS}]
+        out += [{"role": r, "content": c} for r, c in turns]
+        return out
+
+    # --- prompt echo ---
+    def test_prompt_echo_rejected(self):
+        msgs = self._msgs(("user", "did you eat yet?"))
+        self.assertTrue(self.mod._is_input_echo("did you eat yet?", msgs))
+
+    def test_prompt_echo_case_and_ws_insensitive(self):
+        msgs = self._msgs(("user", "Running Late, you still good for 7?"))
+        self.assertTrue(
+            self.mod._is_input_echo("running late,   you still good for 7?", msgs))
+
+    def test_short_prompt_echo_not_rejected(self):
+        # Genuine "ok" -> "ok" must NOT be a false positive (last user <3 words).
+        self.assertFalse(self.mod._is_input_echo("ok", self._msgs(("user", "ok"))))
+        self.assertFalse(self.mod._is_input_echo("yeah", self._msgs(("user", "yeah?"))))
+
+    # --- system-prompt leak ---
+    def test_system_prompt_leak_rejected(self):
+        leak = "their recent messages are short; match their brevity"
+        self.assertTrue(self.mod._is_input_echo(leak, self._msgs(("user", "hey"))))
+
+    def test_short_overlap_with_system_not_rejected(self):
+        # A <6-word incidental overlap is fine ("match" appears in sys prompt).
+        self.assertFalse(
+            self.mod._is_input_echo("yeah that works", self._msgs(("user", "thursday?"))))
+
+    # --- history echo ---
+    def test_history_echo_exact_rejected(self):
+        msgs = self._msgs(("assistant", "starving lol"), ("user", "did you eat yet?"))
+        self.assertTrue(self.mod._is_input_echo("starving lol", msgs))
+
+    def test_legit_terse_reply_not_rejected(self):
+        msgs = self._msgs(("assistant", "starving lol"), ("user", "did you eat yet?"))
+        self.assertFalse(self.mod._is_input_echo("nah not yet", msgs))
+
+    # --- robustness ---
+    def test_empty_and_malformed(self):
+        self.assertFalse(self.mod._is_input_echo("", self._msgs(("user", "hey there"))))
+        self.assertFalse(self.mod._is_input_echo("anything", []))
+        self.assertFalse(self.mod._is_input_echo("anything", None))
+
+    # --- finalize_generation integration ---
+    def test_finalize_rejects_echo_when_messages_supplied(self):
+        msgs = self._msgs(("user", "did you eat yet?"))
+        text, runaway = self.mod.finalize_generation("did you eat yet?", msgs)
+        self.assertEqual(text, "")
+        self.assertTrue(runaway)
+
+    def test_finalize_passes_real_reply(self):
+        msgs = self._msgs(("user", "did you eat yet?"))
+        text, runaway = self.mod.finalize_generation("nah not yet", msgs)
+        self.assertEqual(text, "nah not yet")
+        self.assertFalse(runaway)
+
+    def test_finalize_messages_none_preserves_legacy(self):
+        # Without messages, no echo guard runs (back-compat with existing tests).
+        text, runaway = self.mod.finalize_generation("did you eat yet?")
+        self.assertEqual(text, "did you eat yet?")
+        self.assertFalse(runaway)
+
+
 if __name__ == "__main__":
     unittest.main()
