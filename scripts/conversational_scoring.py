@@ -18,16 +18,87 @@ from __future__ import annotations
 from typing import Iterable
 
 
-def score_self_correction(final_intent: dict, scenario: dict) -> bool:
+import re as _re
+
+NUMERIC_TOL = 0.05  # ±5% — matches Full-Duplex-Bench-v3 GPT-4o argument-accuracy tolerance
+
+
+def _as_number(v) -> float | None:
+    """Parse a number from int/float or a money/grouped string ($1,500 -> 1500). None if not numeric."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = _re.sub(r"[,$\s]", "", v)
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _norm_str(v) -> str:
+    """Case/whitespace/punctuation-insensitive string normal form."""
+    return _re.sub(r"[^a-z0-9]+", " ", str(v).lower()).strip()
+
+
+def match_value(expected, actual, *, numeric_tol: float = NUMERIC_TOL, aliases: dict | None = None) -> bool:
+    """SOTA argument-accuracy match (FDB-v3 semantics): lenient on FORMAT, strict on VALUE.
+
+    - numbers match within ±numeric_tol ("1500" == 1500 == "$1,500"; 1450 within 5%);
+    - strings match case/punctuation-insensitively, with an optional alias map
+      (e.g. {"vegas": "las vegas"}); exact-equality is the floor.
+    """
+    if expected == actual:
+        return True
+    en, an = _as_number(expected), _as_number(actual)
+    if en is not None and an is not None:
+        if en == 0.0:
+            return abs(an) < 1e-9
+        return abs(an - en) / abs(en) <= numeric_tol
+    ne, na = _norm_str(expected), _norm_str(actual)
+    if ne == na:
+        return True
+    if aliases:
+        al = {_norm_str(k): _norm_str(v) for k, v in aliases.items()}
+        return al.get(na) == ne or al.get(ne) == na
+    return False
+
+
+def score_self_correction(final_intent: dict, scenario: dict, *, semantic: bool = True,
+                          aliases: dict | None = None) -> bool:
     """True iff ``final_intent`` matches the scenario's ``expected_final`` on every key.
 
-    Only ``expected_final`` keys are graded; extra fields on the agent's intent
-    are ignored. A missing/wrong key fails the scenario.
+    Default (``semantic=True``) uses SOTA argument-accuracy tolerance (see match_value):
+    lenient on format, strict on the corrected VALUE — so an agent that correctly
+    self-corrects to 1500 but emits "$1,500" is NOT falsely failed. ``semantic=False``
+    falls back to exact equality. Only ``expected_final`` keys are graded; extra
+    fields are ignored; a missing/wrong key fails.
     """
     expected = scenario.get("expected_final") or {}
     if not expected:
         raise ValueError(f"scenario {scenario.get('id')!r} has no expected_final to score against")
-    return all(final_intent.get(k) == v for k, v in expected.items())
+    if not semantic:
+        return all(final_intent.get(k) == v for k, v in expected.items())
+    return all(
+        match_value(v, final_intent.get(k), numeric_tol=_numeric_tol_for_key(k), aliases=aliases)
+        for k, v in expected.items()
+    )
+
+
+# ±5% tolerance is a MAGNITUDE concept — it must NOT apply to identifiers, or
+# order_id 456 would "match" 459. Identifier keys get exact-numeric (format-
+# insensitive, zero tolerance): "456" == 456 but != 459.
+IDENTIFIER_TOKENS = {
+    "id", "code", "number", "no", "phone", "zip", "account", "acct",
+    "order", "ssn", "confirmation", "pin", "sku", "tracking",
+}
+
+
+def _numeric_tol_for_key(key: str) -> float:
+    tokens = _re.split(r"[^a-z0-9]+", str(key).lower())
+    return 0.0 if any(t in IDENTIFIER_TOKENS for t in tokens) else NUMERIC_TOL
 
 
 def self_correction_pass1(pairs: Iterable[tuple[dict, dict]]) -> float | None:

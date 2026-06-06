@@ -57,3 +57,8 @@ Implemented & verified (full suite **114 passed, 6 skipped**):
 - **Persona probe orchestration ✅ (Task 6)** — `persona_consistency.probe_persona_portability()` scores each lane's render vs the text-path reference; `vendor_lane_persona_verdict()` fails vendor **by construction** (can't carry LoRA). tests +4.
 
 **The single remaining model-bound boundary:** `run_lane_conversational()` + the persona/lane render calls — drive live fish/cascade inference (audio→states, first-audio capture, scenario replay) on Apple Silicon. Everything that funnels into the scoreboard is now unit-tested. Plus externals: Task 1 (LibriSpeech+noise refinement), Task 5 (vendor key), Task 10 (full run + DECISION.md), Task 11 (spec-verifier).
+
+### Progress log (2026-06-06, cont. 3)
+
+- **D8 decision locked (AC-6 scoring method)** — focused arxiv run (`wf_42258104-b4d`, 16 sources / 18 confirmed) settled the intent-extraction fork: **structured tool-call grounding** (option b), graded against `corrected_intent` with **SOTA argument-accuracy tolerance**; LLM-judge (option a) rejected as ground truth (κ≈0.43), kept only as a free-form fallback. See design.md D8.
+- **`score_self_correction` upgraded to SOTA semantics** — `match_value` (±5% numeric, case/format-insensitive, alias-aware) replaces exact `==`, so an agent that self-corrects to 1500 but emits "$1,500" is not falsely failed. **Identifier keys** (order_id/code/phone…) get exact-numeric via `_numeric_tol_for_key` (the real-fixture invariant caught `456`≈`459` and forced this). tests +5 (148 passed).

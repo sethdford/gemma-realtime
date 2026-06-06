@@ -63,6 +63,50 @@ def test_pass1_empty_is_none():
     assert self_correction_pass1([]) is None
 
 
+# ── SOTA argument-accuracy semantics (FDB-v3 tolerance) ───────────────────────
+from conversational_scoring import match_value, score_self_correction  # noqa: E402
+
+
+def _num_scn(expected):
+    return _scn(corrected_intent={"amount": expected}, expected_final={"amount": expected})
+
+
+def test_match_value_numeric_tolerance_and_formatting():
+    assert match_value(1500, "$1,500") is True          # money-string formatting
+    assert match_value(1500, 1500.0) is True            # int/float
+    assert match_value(1500, 1450) is True              # within ±5%
+    assert match_value(1500, 1400) is False             # 6.7% off
+    assert match_value(1500, 15) is False               # mishearing -> fail
+
+
+def test_match_value_string_case_and_alias():
+    assert match_value("New York", "new york") is True              # case/format
+    assert match_value("Las Vegas", "Vegas", aliases={"Vegas": "Las Vegas"}) is True
+    assert match_value("New York", "Boston") is False
+
+
+def test_self_correction_semantic_default_accepts_format_variation():
+    # Agent self-corrected to the right value but emitted a money string -> still pass.
+    assert score_self_correction({"amount": "$1,500"}, _num_scn(1500)) is True
+    # Strict mode would reject the format variation.
+    assert score_self_correction({"amount": "$1,500"}, _num_scn(1500), semantic=False) is False
+
+
+def test_self_correction_value_error_still_fails_semantically():
+    # The dominant speech failure (argument-VALUE error) must still fail.
+    assert score_self_correction({"amount": 15}, _num_scn(1500)) is False
+
+
+def test_identifier_keys_get_no_magnitude_tolerance():
+    # order_id 456 vs 459 must FAIL (IDs are not magnitudes) even though within 5%.
+    id_scn = _scn(corrected_intent={"order_id": "459"}, expected_final={"order_id": "459"})
+    assert score_self_correction({"order_id": "456"}, id_scn) is False
+    # but format-insensitivity still holds for IDs: "459" == 459.
+    assert score_self_correction({"order_id": 459}, id_scn) is True
+    # a genuine magnitude key keeps ±5% tolerance.
+    assert score_self_correction({"amount": 1450}, _num_scn(1500)) is True
+
+
 def test_scores_against_real_fixture_perfect_and_zero():
     scenarios = load_self_correction_scenarios()
     # An agent that always lands the corrected intent scores 1.0 on the real set.
