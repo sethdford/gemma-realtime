@@ -1,0 +1,10 @@
+[
+  {"id": "cv01", "type": "respond", "should_respond": true, "utterance": "What time does the pharmacy close today?", "note": "direct question — agent should take the floor (reach SPEAK)"},
+  {"id": "cv02", "type": "respond", "should_respond": true, "utterance": "Can you add milk and eggs to my shopping list?", "note": "actionable request — agent should respond"},
+  {"id": "cv03", "type": "backchannel", "should_respond": false, "utterance": "mm-hmm, right, yeah okay", "note": "listener backchannel — agent should stay LISTEN, not grab the floor"},
+  {"id": "cv04", "type": "backchannel", "should_respond": false, "utterance": "uh-huh, sure, go on", "note": "continuer — agent should keep listening"},
+  {"id": "cv05", "type": "respond", "should_respond": true, "utterance": "So given all that, what would you recommend I do next?", "note": "question after a pause — agent should respond"},
+  {"id": "cv06", "type": "barge_in_nonterminal", "should_respond": false, "utterance": "yeah... mhm... totally", "note": "non-terminal barge-in during agent speech — agent should HOLD SPEAK (interruption avoidance)"},
+  {"id": "cv07", "type": "barge_in_nonterminal", "should_respond": false, "utterance": "right, exactly", "note": "backchannel over agent speech — should not yield"},
+  {"id": "cv08", "type": "respond", "should_respond": true, "utterance": "Wait, stop — actually cancel that order.", "note": "terminal barge-in / genuine interruption — agent SHOULD yield then act"}
+]

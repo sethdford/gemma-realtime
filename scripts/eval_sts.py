@@ -13,6 +13,10 @@ Usage:
     python3 scripts/eval_sts.py --pipeline cascaded   # Whisper + LLM + Voxtral
     python3 scripts/eval_sts.py --pipeline fish        # True STS (Fish codec)
     python3 scripts/eval_sts.py --pipeline fish --eval-set data/eval-spoken-qa.jsonl
+
+Fish cb0 sampling (same env as ``fish_sts.FishSTSPipeline``): FISH_STS_CB0_TEMPERATURE,
+FISH_STS_CB0_TOP_K, FISH_STS_CB0_TOP_P, FISH_STS_CB0_REPETITION_PENALTY,
+FISH_STS_CB0_REP_WINDOW, FISH_STS_CB0_MAX_FRAMES.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections import Counter
 
 import numpy as np
 
@@ -35,20 +40,46 @@ PROOF_DIR.mkdir(exist_ok=True)
 class STSMetrics:
     wer: float = 0.0
     wer_count: int = 0
+    wer_skipped_short_ref: int = 0
     audio_quality: list[float] = field(default_factory=list)
     speaker_sims: list[float] = field(default_factory=list)
     latencies_ms: list[float] = field(default_factory=list)
     rtfs: list[float] = field(default_factory=list)
+    hypothesis_diversity: list[float] = field(default_factory=list)
+    failure_tags: Counter = field(default_factory=Counter)
+    # Phase-A conversational gate metrics (specs/phase-a-speech-lane). Each is a
+    # list of per-sample observations; aggregated in summary().
+    #   turn_take            : 1.0 if the agent yielded/took the turn correctly (AC-3)
+    #   interruption_avoidance: 1.0 if SPEAK was held through a non-terminal barge-in (AC-4)
+    #   ttfa_ms              : time-to-first-audio per turn, ms (AC-5)
+    #   self_correction      : 1.0 if final intent matched the corrected intent (AC-6)
+    turn_take: list[float] = field(default_factory=list)
+    interruption_avoidance: list[float] = field(default_factory=list)
+    ttfa_ms: list[float] = field(default_factory=list)
+    self_correction: list[float] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {
             "wer": round(self.wer, 4) if self.wer_count else None,
+            "wer_n_scored": self.wer_count,
+            "wer_skipped_short_ref": self.wer_skipped_short_ref,
+            "hypothesis_diversity_mean": round(float(np.mean(self.hypothesis_diversity)), 3)
+            if self.hypothesis_diversity else None,
             "audio_quality_mean": round(float(np.mean(self.audio_quality)), 3) if self.audio_quality else None,
             "audio_quality_std": round(float(np.std(self.audio_quality)), 3) if self.audio_quality else None,
             "spk_sim_mean": round(float(np.mean(self.speaker_sims)), 3) if self.speaker_sims else None,
             "latency_p50_ms": round(float(np.median(self.latencies_ms)), 1) if self.latencies_ms else None,
             "latency_p95_ms": round(float(np.percentile(self.latencies_ms, 95)), 1) if self.latencies_ms else None,
             "rtf_mean": round(float(np.mean(self.rtfs)), 4) if self.rtfs else None,
+            # Phase-A conversational gates (None until populated):
+            "turn_take_rate": round(float(np.mean(self.turn_take)), 4) if self.turn_take else None,
+            "interruption_avoidance": round(float(np.mean(self.interruption_avoidance)), 4)
+            if self.interruption_avoidance else None,
+            "ttfa_p50_ms": round(float(np.median(self.ttfa_ms)), 1) if self.ttfa_ms else None,
+            "ttfa_p95_ms": round(float(np.percentile(self.ttfa_ms, 95)), 1) if self.ttfa_ms else None,
+            "self_correction_pass1": round(float(np.mean(self.self_correction)), 4)
+            if self.self_correction else None,
+            "failure_tags": dict(self.failure_tags),
             "n_samples": max(self.wer_count, len(self.audio_quality), len(self.latencies_ms)),
         }
 
@@ -76,27 +107,145 @@ def compute_wer(reference: str, hypothesis: str) -> float:
     return d[len(ref)][len(hyp)] / len(ref)
 
 
+def hypothesis_word_diversity(transcript: str) -> float | None:
+    """Unique-token ratio for collapse spotting (None if too short)."""
+    words = transcript.lower().split()
+    if len(words) < 3:
+        return None
+    return len(set(words)) / len(words)
+
+
+def _failure_tags_for_sample(
+    *,
+    reference: str,
+    transcript: str,
+    audio_quality: float,
+    duration_s: float,
+) -> list[str]:
+    tags: list[str] = []
+    ref_words = reference.strip().split()
+    hyp_words = transcript.strip().split()
+    if len(ref_words) < 2:
+        tags.append("short_reference")
+    if not transcript.strip():
+        tags.append("empty_hypothesis")
+    if duration_s < 0.35:
+        tags.append("too_short_audio")
+    if audio_quality < 2.0:
+        tags.append("low_audio_quality")
+    if len(hyp_words) >= 8:
+        uniq_ratio = len(set(w.lower() for w in hyp_words)) / max(1, len(hyp_words))
+        if uniq_ratio < 0.35:
+            tags.append("repetition_collapse")
+    return tags
+
+
+def _compute_scorecard(summary: dict) -> dict:
+    """Balanced score combining intelligibility, latency, diversity, and stability."""
+    wer = summary.get("wer")
+    lat50 = summary.get("latency_p50_ms")
+    lat95 = summary.get("latency_p95_ms")
+    div = summary.get("hypothesis_diversity_mean")
+    aq = summary.get("audio_quality_mean")
+    fail_tags = summary.get("failure_tags") or {}
+    n = max(1, int(summary.get("n_samples") or 1))
+    bad = sum(int(v) for k, v in fail_tags.items() if k in {"empty_hypothesis", "repetition_collapse", "low_audio_quality"})
+    bad_rate = bad / n
+
+    wer_score = max(0.0, min(1.0, 1.0 - ((wer if wer is not None else 3.0) / 3.0)))
+    lat50_score = max(0.0, min(1.0, 1.0 - ((float(lat50 or 4000.0) - 900.0) / 2600.0)))
+    lat95_score = max(0.0, min(1.0, 1.0 - ((float(lat95 or 8000.0) - 2200.0) / 6000.0)))
+    div_score = max(0.0, min(1.0, float(div or 0.0)))
+    aq_score = max(0.0, min(1.0, (float(aq or 0.0) - 1.0) / 4.0))
+    stability = max(0.0, 1.0 - bad_rate)
+
+    overall = (
+        0.38 * wer_score
+        + 0.20 * lat50_score
+        + 0.10 * lat95_score
+        + 0.12 * div_score
+        + 0.12 * aq_score
+        + 0.08 * stability
+    )
+    return {
+        "overall": round(float(overall), 4),
+        "components": {
+            "wer_score": round(float(wer_score), 4),
+            "latency_p50_score": round(float(lat50_score), 4),
+            "latency_p95_score": round(float(lat95_score), 4),
+            "diversity_score": round(float(div_score), 4),
+            "audio_quality_score": round(float(aq_score), 4),
+            "stability_score": round(float(stability), 4),
+        },
+        "conversational": _conversational_gates(summary),
+    }
+
+
+# Phase-A exit gates vs the mid-2026 frontier (specs/phase-a-speech-lane,
+# docs/research/2026-06-06-s2s-L1-L5-roadmap.md). higher_is_better says which
+# direction passes; threshold is the bar the chosen lane must clear.
+CONVERSATIONAL_GATES = {
+    "turn_take_rate": {"threshold": 0.95, "higher_is_better": True},          # AC-3 (FDB-v3: Cascaded 1.00, Gemini 3.1 0.78)
+    "interruption_avoidance": {"threshold": 0.135, "higher_is_better": True}, # AC-4 (FDB-v3 leader GPT-Realtime 0.135)
+    "ttfa_p50_ms": {"threshold": 400.0, "higher_is_better": False},           # AC-5 (<400 ms p50, realistic audio)
+    "self_correction_pass1": {"threshold": 0.60, "higher_is_better": True},   # AC-6 (FDB-v3 leader GPT-Realtime 0.588)
+}
+
+
+def _conversational_gates(summary: dict) -> dict:
+    """Per-gate {value, threshold, pass} for the Phase-A lane decision.
+
+    pass is None when the metric was not measured (value None) — an unmeasured
+    gate is neither pass nor fail, so the decision step knows to collect it.
+    """
+    out: dict = {}
+    for key, spec in CONVERSATIONAL_GATES.items():
+        value = summary.get(key)
+        thr = spec["threshold"]
+        if value is None:
+            passed = None
+        elif spec["higher_is_better"]:
+            passed = bool(value >= thr) if key == "turn_take_rate" else bool(value > thr)
+        else:
+            passed = bool(value < thr)
+        out[key] = {"value": value, "threshold": thr, "pass": passed}
+    return out
+
+
 def whisper_transcribe(audio_np: np.ndarray, sr: int = 24000) -> str:
     """Transcribe audio with mlx-whisper."""
     import tempfile
     import soundfile as sf
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+        x = audio_np.astype(np.float32).reshape(-1)
+        peak = float(np.max(np.abs(x))) if x.size else 0.0
+        # Very quiet STS / codec outputs often decode to Whisper-empty transcripts.
+        if peak > 1e-6:
+            x = x * min(0.95 / peak, 50.0)
+
         if sr != 16000:
-            n_out = int(len(audio_np) * 16000 / sr)
+            n_out = int(len(x) * 16000 / sr)
             audio_16k = np.interp(
                 np.linspace(0, 1, n_out),
-                np.linspace(0, 1, len(audio_np)),
-                audio_np.astype(np.float32),
+                np.linspace(0, 1, len(x)),
+                x,
             ).astype(np.float32)
         else:
-            audio_16k = audio_np.astype(np.float32)
+            audio_16k = x
         sf.write(f.name, audio_16k, 16000)
 
         try:
             import mlx_whisper
+            # Default mlx_whisper temperature=(0..1) retries often yield **no segments**
+            # on short or quirky STS waveforms; greedy decode is a better eval gate.
             result = mlx_whisper.transcribe(
-                f.name, path_or_hf_repo="mlx-community/whisper-small-mlx"
+                f.name,
+                path_or_hf_repo="mlx-community/whisper-small-mlx",
+                language="en",
+                temperature=0.0,
+                no_speech_threshold=0.0,
+                logprob_threshold=-2.0,
             )
             return result.get("text", "").strip()
         except ImportError:
@@ -190,6 +339,12 @@ DEFAULT_EVAL_TEXTS = [
     "Can you believe it? This is amazing! I never thought this would work.",
 ]
 
+BUNDLES = {
+    "smoke": 20,
+    "dev": 100,
+    "gate": 200,
+}
+
 
 def build_eval_from_libritts(n: int = 20, seed: int = 42) -> list[dict]:
     """Build eval set from LibriTTS data with reference audio for speaker sim."""
@@ -238,24 +393,38 @@ def _phase1_embed(texts: list[str], cache_path: Path) -> None:
 
 
 def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path,
-                     audio_paths: list[str] | None = None) -> None:
+                     audio_paths: list[str] | None = None,
+                     use_gemma: bool = False,
+                     weights_path: str | None = None) -> None:
     """Subprocess: load STS model + codec, generate audio, save wavs.
 
     When audio_paths are provided, uses the audio-to-audio pathway
     (encode reference → audio_input projection → generate), which matches
     how the model was trained. Falls back to text embeddings when no
     reference audio is available.
+
+    When use_gemma is True, also loads Gemma's frozen shared layers and
+    forwards embeddings through them before generation (produces
+    semantically-rich context matching the training pipeline).
     """
     import mlx.core as mx
-    from fish_sts import FishSpeechToSpeech, FishSTSPipeline
+    from fish_sts import FishSpeechToSpeech, FishSTSPipeline, cb0_sampler_env_overrides
     from codec import AudioCodec, CodecTokens, CodecType
     import soundfile as sf
 
-    w_path = FishSTSPipeline._resolve_weights(None)
+    w_path = FishSTSPipeline._resolve_weights(weights_path)
     if w_path is None:
         print("    [SKIP] No trained STS weights")
         return
-    config = FishSTSPipeline.config_from_weights(w_path)
+    try:
+        config = FishSTSPipeline.config_from_weights(str(w_path))
+    except Exception:
+        # Early checkpoints (e.g., phase-a) may not contain full depth keys.
+        # Fall back to any full checkpoint for architecture shape inference.
+        base_full = FishSTSPipeline._resolve_weights(None)
+        if base_full is None:
+            raise
+        config = FishSTSPipeline.config_from_weights(str(base_full))
     model = FishSpeechToSpeech(config)
     w = mx.load(str(w_path))
     model.load_weights(list(w.items()), strict=False)
@@ -273,6 +442,24 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path,
         codec.load()
         codec_type = CodecType.SNAC
     sr = codec.sample_rate
+
+    _gemma_shared = None
+    if use_gemma:
+        from mlx_lm import load as lm_load
+        print("    Loading Gemma for shared layer inference...", flush=True)
+        _gemma, _tok = lm_load("mlx-community/gemma-4-26b-a4b-it-4bit")
+        _inner = _gemma.language_model.model if hasattr(_gemma, "language_model") else _gemma.model
+        _split_idx = min(28, len(_inner.layers) // 2)
+        _shared_layers = _inner.layers[:_split_idx]
+
+        def _gemma_shared(embeddings):
+            h = embeddings
+            for layer in _shared_layers:
+                out = layer(h, mask=None)
+                h = out[0] if isinstance(out, tuple) else out
+            return mx.stop_gradient(h)
+
+        print(f"    Gemma shared layers: {_split_idx}", flush=True)
 
     embs = np.load(str(emb_path))
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -296,18 +483,38 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path,
             cb0_input = mx.array(tokens.codes[0:1, :], dtype=mx.int32)
             emb = model.audio_input(cb0_input)
             mx.eval(emb)
+            if _gemma_shared is not None:
+                emb = _gemma_shared(emb)
+                mx.eval(emb)
             input_mode = "audio"
         else:
             key = f"emb_{i}"
             if key not in embs:
                 continue
             emb = mx.array(embs[key][np.newaxis])
+            if _gemma_shared is not None:
+                emb = _gemma_shared(emb)
+                mx.eval(emb)
             input_mode = "text"
 
         n_words = len(text.split())
-        max_frames = min(max(n_words * 6, 40), 150)
+        samp = cb0_sampler_env_overrides(
+            temperature=0.3,
+            top_k=30,
+            repetition_penalty=1.2,
+            rep_window=16,
+            max_frames_cap=400,
+            top_p=0.92,
+        )
+        max_frames = min(max(n_words * 8, 60), samp["max_frames_cap"])
         cb0_out, speech_hidden = model.generate_cb0(
-            emb, temperature=0.5, top_k=30, max_frames=max_frames
+            emb,
+            temperature=samp["temperature"],
+            top_k=samp["top_k"],
+            max_frames=max_frames,
+            repetition_penalty=samp["repetition_penalty"],
+            rep_window=samp["rep_window"],
+            top_p=float(samp.get("top_p", 1.0)),
         )
         mx.eval(cb0_out, speech_hidden)
         if cb0_out.size == 0:
@@ -333,11 +540,13 @@ def _phase2_generate(texts: list[str], emb_path: Path, audio_dir: Path,
         json.dump(meta, f)
 
 
-def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
+def _run_fish_eval(eval_items: list[dict], use_gemma: bool = False,
+                   weights_path: str | None = None) -> tuple[STSMetrics, list[dict]]:
     """Run eval in separate subprocesses so GPU memory is truly freed between phases."""
     import subprocess
 
     metrics = STSMetrics()
+    samples: list[dict] = []
     texts = [item["text"][:200] for item in eval_items]
 
     cache_dir = Path("data/.eval_cache")
@@ -357,7 +566,7 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
     r = subprocess.run([sys.executable, "-c", code1], capture_output=False)
     if r.returncode != 0 or not emb_path.exists():
         print("  [FAIL] Phase 1 (Gemma embeddings) failed or OOM'd")
-        return metrics
+        return metrics, samples
 
     # Phase 2: STS generation (subprocess)
     audio_paths = [item.get("audio_path", "") for item in eval_items]
@@ -366,13 +575,13 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
         f"import sys, json; sys.path.insert(0, {str(Path(__file__).parent)!r}); "
         f"from eval_sts import _phase2_generate; from pathlib import Path; "
         f"_phase2_generate(json.loads({texts_json!r}), Path({str(emb_path)!r}), Path({str(audio_dir)!r}), "
-        f"json.loads({audio_paths_json!r}))"
+        f"json.loads({audio_paths_json!r}), use_gemma={use_gemma}, weights_path={weights_path!r})"
     )
     r = subprocess.run([sys.executable, "-c", code2], capture_output=False)
     meta_path = audio_dir / "meta.json"
     if r.returncode != 0 or not meta_path.exists():
         print("  [FAIL] Phase 2 (speech generation) failed or OOM'd")
-        return metrics
+        return metrics, samples
 
     with open(meta_path) as f:
         meta = json.load(f)
@@ -394,13 +603,26 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
 
         aq = estimate_audio_quality(audio, sr=sr)
         metrics.audio_quality.append(aq)
+        duration_s = len(audio) / max(1, sr)
 
         rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
         if rms < 0.005 or len(audio) < sr * 0.3:
+            metrics.failure_tags.update(["silent_or_too_short"])
+            samples.append({
+                "index": i + 1,
+                "wer": None,
+                "aq": round(float(aq), 3),
+                "spk_sim": None,
+                "duration_s": round(float(duration_s), 3),
+                "rtf": round(float(m["elapsed"] / m["dur"]) if m["dur"] > 0 else 0.0, 4),
+                "transcript": "",
+                "tags": ["silent_or_too_short"],
+            })
             print(f"    [{i+1}] AQ={aq:.1f} [skip WER — silent/too short]", flush=True)
             continue
 
         ref_path = eval_items[i].get("audio_path") if i < len(eval_items) else None
+        sim = None
         if ref_path and Path(ref_path).exists():
             ref_audio, ref_sr = sf.read(ref_path)
             ref_audio = ref_audio.astype(np.float32)
@@ -410,13 +632,54 @@ def _run_fish_eval(eval_items: list[dict]) -> STSMetrics:
             metrics.speaker_sims.append(sim)
 
         transcript = whisper_transcribe(audio, sr=sr)
+        div = hypothesis_word_diversity(transcript)
+        if div is not None:
+            metrics.hypothesis_diversity.append(div)
+        tags = _failure_tags_for_sample(
+            reference=text,
+            transcript=transcript,
+            audio_quality=aq,
+            duration_s=duration_s,
+        )
+        metrics.failure_tags.update(tags)
+
+        ref_words = text.strip().split()
+        if len(ref_words) < 2:
+            metrics.wer_skipped_short_ref += 1
+            spk_str = f" spk={sim:.3f}" if ref_path and Path(ref_path).exists() else ""
+            samples.append({
+                "index": i + 1,
+                "wer": None,
+                "aq": round(float(aq), 3),
+                "spk_sim": round(float(sim), 3) if sim is not None else None,
+                "duration_s": round(float(duration_s), 3),
+                "rtf": round(float(m["elapsed"] / m["dur"]) if m["dur"] > 0 else 0.0, 4),
+                "transcript": transcript,
+                "tags": tags,
+            })
+            print(
+                f"    [{i+1}] [skip WER — ref <2 words] AQ={aq:.1f}{spk_str} — \"{transcript[:60]}\"",
+                flush=True,
+            )
+            continue
+
         wer = compute_wer(text, transcript)
         metrics.wer = (metrics.wer * metrics.wer_count + wer) / (metrics.wer_count + 1)
         metrics.wer_count += 1
         spk_str = f" spk={sim:.3f}" if ref_path and Path(ref_path).exists() else ""
+        samples.append({
+            "index": i + 1,
+            "wer": round(float(wer), 4),
+            "aq": round(float(aq), 3),
+            "spk_sim": round(float(sim), 3) if sim is not None else None,
+            "duration_s": round(float(duration_s), 3),
+            "rtf": round(float(m["elapsed"] / m["dur"]) if m["dur"] > 0 else 0.0, 4),
+            "transcript": transcript,
+            "tags": tags,
+        })
         print(f"    [{i+1}] WER={wer:.2f} AQ={aq:.1f}{spk_str} — \"{transcript[:60]}\"", flush=True)
 
-    return metrics
+    return metrics, samples
 
 
 def _cascaded_generate(texts: list[str], audio_dir_str: str) -> None:
@@ -466,11 +729,12 @@ def _cascaded_generate(texts: list[str], audio_dir_str: str) -> None:
         json.dump(meta, f)
 
 
-def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
+def _run_cascaded_eval(eval_items: list[dict]) -> tuple[STSMetrics, list[dict]]:
     """Cascaded pipeline: text → Voxtral TTS → Whisper re-transcription → WER + audio quality."""
     import subprocess
 
     metrics = STSMetrics()
+    samples: list[dict] = []
     texts = [item["text"][:200] for item in eval_items]
 
     cache_dir = Path("data/.eval_cache_cascaded")
@@ -489,7 +753,7 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
     meta_path = audio_dir / "meta.json"
     if r.returncode != 0 or not meta_path.exists():
         print("  [FAIL] Phase 1 (Voxtral TTS) failed or OOM'd")
-        return metrics
+        return metrics, samples
 
     with open(meta_path) as f:
         meta = json.load(f)
@@ -512,6 +776,7 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
 
         aq = estimate_audio_quality(audio, sr=sr)
         metrics.audio_quality.append(aq)
+        duration_s = len(audio) / max(1, sr)
 
         if prev_audio is not None:
             sim = speaker_similarity(prev_audio, audio, sr=sr)
@@ -519,19 +784,60 @@ def _run_cascaded_eval(eval_items: list[dict]) -> STSMetrics:
         prev_audio = audio
 
         transcript = whisper_transcribe(audio, sr=sr)
+        div = hypothesis_word_diversity(transcript)
+        if div is not None:
+            metrics.hypothesis_diversity.append(div)
+        tags = _failure_tags_for_sample(
+            reference=text,
+            transcript=transcript,
+            audio_quality=aq,
+            duration_s=duration_s,
+        )
+        metrics.failure_tags.update(tags)
+
+        ref_words = text.strip().split()
+        if len(ref_words) < 2:
+            metrics.wer_skipped_short_ref += 1
+            samples.append({
+                "index": i + 1,
+                "wer": None,
+                "aq": round(float(aq), 3),
+                "spk_sim": None,
+                "duration_s": round(float(duration_s), 3),
+                "rtf": round(float(m["elapsed"] / m["dur"]) if m["dur"] > 0 else 0.0, 4),
+                "transcript": transcript,
+                "tags": tags,
+            })
+            print(
+                f"    [{i+1}] [skip WER — ref <2 words] AQ={aq:.1f} — \"{transcript[:60]}\"",
+                flush=True,
+            )
+            continue
+
         wer = compute_wer(text, transcript)
         metrics.wer = (metrics.wer * metrics.wer_count + wer) / (metrics.wer_count + 1)
         metrics.wer_count += 1
+        samples.append({
+            "index": i + 1,
+            "wer": round(float(wer), 4),
+            "aq": round(float(aq), 3),
+            "spk_sim": None,
+            "duration_s": round(float(duration_s), 3),
+            "rtf": round(float(m["elapsed"] / m["dur"]) if m["dur"] > 0 else 0.0, 4),
+            "transcript": transcript,
+            "tags": tags,
+        })
         print(f"    [{i+1}] WER={wer:.2f} AQ={aq:.1f} — \"{transcript[:60]}\"", flush=True)
 
-    return metrics
+    return metrics, samples
 
 
 def run_eval(args) -> STSMetrics:
     if args.eval_set and Path(args.eval_set).exists():
         eval_items = load_eval_set(args.eval_set)
     else:
-        libri_items = build_eval_from_libritts(n=20)
+        bundle_n = BUNDLES.get(args.bundle, 20)
+        libri_items = build_eval_from_libritts(n=bundle_n, seed=args.seed)
         if libri_items:
             print(f"  Using {len(libri_items)} LibriTTS eval samples (with reference audio)")
             eval_items = libri_items
@@ -547,26 +853,49 @@ def run_eval(args) -> STSMetrics:
     print(f"{'='*60}\n")
 
     if args.pipeline == "fish":
-        metrics = _run_fish_eval(eval_items)
+        metrics, samples = _run_fish_eval(
+            eval_items,
+            use_gemma=getattr(args, 'use_gemma', False),
+            weights_path=getattr(args, "weights", None),
+        )
     elif args.pipeline == "cascaded":
-        metrics = _run_cascaded_eval(eval_items)
+        metrics, samples = _run_cascaded_eval(eval_items)
     else:
         print(f"  [unknown pipeline: {args.pipeline}]")
         metrics = STSMetrics()
+        samples = []
 
     summary = metrics.summary()
+    scorecard = _compute_scorecard(summary)
     print(f"\n{'='*60}")
     print(f"  EVALUATION SUMMARY")
     print(f"{'='*60}")
     for k, v in summary.items():
         if v is not None:
             print(f"  {k:<18} {v}")
+    print(f"  sota_score         {scorecard['overall']}")
     print(f"{'='*60}\n")
 
     out_path = PROOF_DIR / f"eval_{args.pipeline}.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"  Saved to {out_path}")
+    score_path = PROOF_DIR / f"eval_{args.pipeline}_scorecard.json"
+    score_out = {
+        "bundle": args.bundle,
+        "seed": args.seed,
+        "pipeline": args.pipeline,
+        "summary": summary,
+        "scorecard": scorecard,
+    }
+    with open(score_path, "w") as f:
+        json.dump(score_out, f, indent=2)
+    print(f"  Saved to {score_path}")
+    samples_path = PROOF_DIR / f"eval_{args.pipeline}_samples.jsonl"
+    with open(samples_path, "w") as f:
+        for row in samples:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"  Saved to {samples_path}")
 
     return metrics
 
@@ -575,7 +904,15 @@ def main():
     parser = argparse.ArgumentParser(description="STS Evaluation Harness")
     parser.add_argument("--pipeline", default="fish", choices=["fish", "cascaded"])
     parser.add_argument("--eval-set", default=None, help="JSONL with {text, audio_path?}")
+    parser.add_argument("--bundle", default="smoke", choices=sorted(BUNDLES.keys()),
+                        help="Built-in eval size when --eval-set is omitted (default: smoke=20)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Sampling seed for built-in LibriTTS bundle")
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--use-gemma", action="store_true",
+                        help="Route through Gemma's shared layers (FishSTSPipeline.process_audio)")
+    parser.add_argument("--weights", default=None,
+                        help="Optional fish_sts .safetensors path (fish pipeline only)")
     args = parser.parse_args()
     run_eval(args)
 
