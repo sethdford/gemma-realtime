@@ -19,6 +19,7 @@ Features:
     - Sentence-level streaming LLM -> TTS
     - Full-duplex: client can send {"type": "interrupt"} to stop generation
     - VAD: Silero (if onnxruntime installed) or energy-based fallback
+    - Optional JSONL metrics: --metrics-jsonl / --sota (same schema as speech-server)
 
 Protocol:
     ws://localhost:8742/v1/realtime
@@ -55,6 +56,7 @@ Usage:
 import argparse
 import asyncio
 import base64
+import itertools
 import json
 import os
 import platform
@@ -69,6 +71,8 @@ import numpy as np
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import lane_select  # which-lane-active resolution + health (specs/phase-a-speech-lane, AC-7)
 
 SAMPLE_RATE = 24000
 WHISPER_RATE = 16000
@@ -303,7 +307,13 @@ class FishTTSEngine:
 
     def load(self, inner_model, tokenizer):
         """Load Fish codec + Fast AR for TTS mode with trained weights."""
-        from fish_sts import FishSpeechToSpeech, FishSTSConfig, FishSTSPipeline, PRESET_CONFIGS
+        from fish_sts import (
+            FishSpeechToSpeech,
+            FishSTSConfig,
+            FishSTSPipeline,
+            PRESET_CONFIGS,
+            cb0_sampler_env_overrides,
+        )
         from codec import AudioCodec
 
         self._inner = inner_model
@@ -352,8 +362,24 @@ class FishTTSEngine:
 
         emb = self._inner.embed_tokens(mx.array([ids]))
 
+        samp = cb0_sampler_env_overrides(
+            temperature=0.5,
+            top_k=30,
+            repetition_penalty=1.2,
+            rep_window=16,
+            max_frames_cap=400,
+            top_p=0.92,
+        )
+        n_words = max(1, len(text.split()))
+        max_frames = min(max(n_words * 8, 48), samp["max_frames_cap"])
         cb0_out, speech_hidden = self._sts_model.generate_cb0(
-            emb, temperature=0.5, top_k=30
+            emb,
+            temperature=samp["temperature"],
+            top_k=samp["top_k"],
+            max_frames=max_frames,
+            repetition_penalty=samp["repetition_penalty"],
+            rep_window=samp["rep_window"],
+            top_p=float(samp.get("top_p", 1.0)),
         )
         mx.eval(cb0_out, speech_hidden)
 
@@ -483,7 +509,8 @@ class RealtimeServer:
                  whisper_model="mlx-community/whisper-small-mlx", voice=None,
                  tts_backend="kokoro", tts_precision="6bit", denoise_steps=4,
                  draft_heads=None,
-                 ref_audio_path=None, ref_audio_text=None, f5_steps=8):
+                 ref_audio_path=None, ref_audio_text=None, f5_steps=8,
+                 metrics_jsonl: str | None = None):
         self.host = host
         self.port = port
         self.llm_url = llm_url
@@ -496,6 +523,8 @@ class RealtimeServer:
         self.ref_audio_path = ref_audio_path
         self.ref_audio_text = ref_audio_text
         self.f5_steps = f5_steps
+        self.metrics_jsonl = metrics_jsonl
+        self._turn_seq = itertools.count()
         self._sessions = {}
         self._shared_vad = None
         self._shared_asr = None
@@ -665,6 +694,10 @@ class RealtimeServer:
                 ),
             })
 
+            lane = lane_select.lane_health(
+                requested=self.tts_backend,
+                active=lane_select.resolve_lane(self.tts_backend),
+            )
             await websocket.send(json.dumps({
                 "type": "session.created",
                 "session_id": session_id,
@@ -674,10 +707,17 @@ class RealtimeServer:
                     "text_input": True,
                     "text_output": True,
                     "vad": True,
+                    "lane": lane,
                 },
             }))
 
-            print(f"  [{session_id}] Session started", flush=True)
+            print(
+                f"  [{session_id}] Session started "
+                f"(lane={lane['active_lane']}, on_device={lane['on_device']}"
+                + (f", FALLBACK<-{lane['requested_tts']}" if lane['fallback_occurred'] else "")
+                + ")",
+                flush=True,
+            )
 
             async for message in websocket:
                 try:
@@ -894,6 +934,38 @@ class RealtimeServer:
             flush=True,
         )
 
+        if self.metrics_jsonl:
+            try:
+                from speech_metrics import append_turn_metrics, build_turn_record
+
+                tid = next(self._turn_seq)
+                ttft_s = (
+                    (first_token_time - t_asr) if first_token_time is not None else None
+                )
+                t_audio_s = (
+                    (first_audio_time - t_start) if first_audio_time is not None else None
+                )
+                rec = build_turn_record(
+                    user_text=user_text,
+                    assistant_text=response_text,
+                    interrupted=session._interrupted,
+                    elapsed_s=(t_end - t_start),
+                    ttft_s=ttft_s,
+                    first_tts_enqueue_s=t_audio_s,
+                    aec_active=False,
+                    streaming_asr=False,
+                    whisper_model=self.whisper_model,
+                    tts_backend=self.tts_backend,
+                    turn_index=tid,
+                )
+                rec["session_id"] = session.session_id
+                rec["proto"] = "realtime-ws"
+                rec["asr_ms"] = latency.get("asr_ms")
+                rec["first_audio_ms"] = latency.get("first_audio_ms")
+                append_turn_metrics(self.metrics_jsonl, rec)
+            except Exception as e:
+                print(f"  [{session.session_id}] metrics: {e}", flush=True)
+
     def _handle_config(self, session, msg):
         """Update session configuration."""
         if "voice" in msg:
@@ -928,6 +1000,8 @@ class RealtimeServer:
         tts_mode = f"{self.tts_backend} ({voice}{precision_str})"
         print(f"  TTS:      {tts_mode}", flush=True)
         print(f"  ASR:      {self.whisper_model}", flush=True)
+        if self.metrics_jsonl:
+            print(f"  Metrics:  {self.metrics_jsonl}", flush=True)
         print(f"{'='*60}\n", flush=True)
 
         await self._ensure_shared_models()
@@ -995,9 +1069,25 @@ def main():
         "--native-tts", action="store_true",
         help="Shorthand for --tts native",
     )
+    parser.add_argument(
+        "--metrics-jsonl",
+        default=None,
+        metavar="PATH",
+        help="Append one JSON line per WebSocket response (latency + session_id)",
+    )
+    parser.add_argument(
+        "--sota",
+        action="store_true",
+        help="Enable default metrics path proof-artifacts/realtime_turn_metrics.jsonl",
+    )
     args = parser.parse_args()
     if args.native_tts:
         args.tts = "native"
+
+    if getattr(args, "sota", False) and not args.metrics_jsonl:
+        mp = Path("proof-artifacts") / "realtime_turn_metrics.jsonl"
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        args.metrics_jsonl = str(mp)
 
     from draft_heads_resolve import resolve_draft_heads_path
 
@@ -1019,6 +1109,7 @@ def main():
         ref_audio_path=args.ref_audio,
         ref_audio_text=args.ref_text,
         f5_steps=args.f5_steps,
+        metrics_jsonl=args.metrics_jsonl,
     )
     asyncio.run(server.start())
 
