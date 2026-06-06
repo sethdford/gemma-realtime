@@ -55,3 +55,34 @@ def test_empty_and_zero_vectors():
     assert cosine([0.0, 0.0], [1.0, 0.0]) == 0.0          # one no-signal => orthogonal
     r = persona_consistency("the the the", "the the the")
     assert r["cosine"] == 1.0 and r["consistent"] is True
+
+
+# ── Task-6 live probe orchestration (AC-2) ────────────────────────────────────
+from persona_consistency import probe_persona_portability, vendor_lane_persona_verdict  # noqa: E402
+
+
+def test_probe_on_device_lanes_preserve_persona():
+    out = probe_persona_portability(FORMAL_A, {"fish": FORMAL_B, "cascade": FORMAL_A})
+    assert out["lanes"]["fish"]["consistent"] is True
+    assert out["lanes"]["cascade"]["consistent"] is True
+    assert set(out["portable_lanes"]) == {"fish", "cascade"}
+
+
+def test_probe_casual_lane_render_fails():
+    out = probe_persona_portability(FORMAL_A, {"fish": CASUAL})
+    assert out["lanes"]["fish"]["consistent"] is False
+    assert "fish" not in out["portable_lanes"]
+
+
+def test_probe_vendor_fails_by_construction():
+    # vendor is disqualified regardless of what it renders (can't carry the LoRA).
+    out = probe_persona_portability(FORMAL_A, {"fish": FORMAL_B, "vendor": FORMAL_A})
+    v = out["lanes"]["vendor"]
+    assert v["consistent"] is False and v["by_construction"] is True
+    assert v["cosine"] is None and "LoRA" in v["reason"]
+    assert out["portable_lanes"] == ["fish"]
+
+
+def test_vendor_verdict_standalone():
+    v = vendor_lane_persona_verdict()
+    assert v["consistent"] is False and v["by_construction"] is True

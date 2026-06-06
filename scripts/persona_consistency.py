@@ -96,3 +96,41 @@ def persona_consistency(text_a: str, text_b: str, threshold: float = DEFAULT_THR
         "vector_b": vb,
         "traits": list(TRAITS.keys()),
     }
+
+
+VENDOR_REASON = (
+    "vendor native-S2S cannot load the frozen-Gemma+LoRA persona; "
+    "persona portability fails by construction (AC-2)"
+)
+
+
+def vendor_lane_persona_verdict() -> dict:
+    """The structural fact that disqualifies vendor S2S from the persona path: it
+    owns the brain, so the same LoRA persona cannot be carried — no render needed."""
+    return {"lane": "vendor", "cosine": None, "consistent": False,
+            "by_construction": True, "reason": VENDOR_REASON}
+
+
+def probe_persona_portability(reference_render: str, lane_renders: dict[str, str],
+                              threshold: float = DEFAULT_THRESHOLD) -> dict:
+    """Task-6 live probe (orchestration): compare each lane's render of the same
+    persona prompt against the text-path ``reference_render``.
+
+    On-device lanes (fish/cascade) are scored by trait-vector cosine; a ``vendor``
+    lane is failed by construction (it can't carry the LoRA). The live caller
+    supplies the renders (text path + each speech lane → ASR transcript).
+    """
+    lanes: dict[str, dict] = {}
+    for lane, text in lane_renders.items():
+        if lane == "vendor":
+            lanes[lane] = vendor_lane_persona_verdict()
+        else:
+            r = persona_consistency(reference_render, text, threshold)
+            lanes[lane] = {"lane": lane, "cosine": r["cosine"],
+                           "consistent": r["consistent"], "by_construction": False}
+    return {
+        "reference_render": reference_render,
+        "threshold": threshold,
+        "lanes": lanes,
+        "portable_lanes": [l for l, v in lanes.items() if v["consistent"]],
+    }
