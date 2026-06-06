@@ -44,17 +44,47 @@ def asr(wav_path: str, whisper_repo: str) -> str:
     return mlx_whisper.transcribe(x, path_or_hf_repo=whisper_repo)["text"].strip()
 
 
-def llm_extract_final_intent(transcript: str, keys: list[str], timeout: float = 180.0,
-                             retries: int = 1) -> tuple[dict, float]:
-    """Constrain the LLM to emit the user's FINAL intent as JSON over the expected keys
-    (D8 structured-action grounding). Returns (intent_dict, latency_s). Raises on
-    repeated transport failure so the caller can isolate the scenario."""
+_MLX = None  # (model, tokenizer) when using the direct in-process mlx_lm path
+
+
+def _load_mlx(model_id: str):
+    global _MLX
+    if _MLX is None:
+        from mlx_lm import load
+        print(f"  loading mlx_lm model {model_id} ...", flush=True)
+        _MLX = load(model_id)
+    return _MLX
+
+
+def _prompts(transcript: str, keys: list[str]) -> tuple[str, str]:
     sys_prompt = (
         "You extract the user's FINAL request after any self-corrections. "
         "The user may change their mind mid-utterance ('no wait', 'actually', 'I meant'); "
         "always use the LAST stated value. Output ONLY compact JSON, no prose."
     )
     user = f'Extract these fields as JSON {{{", ".join(repr(k) for k in keys)}}} from:\n"{transcript}"'
+    return sys_prompt, user
+
+
+def llm_extract_final_intent(transcript: str, keys: list[str], timeout: float = 180.0,
+                             retries: int = 1) -> tuple[dict, float]:
+    """Constrain the LLM to emit the user's FINAL intent as JSON over the expected keys
+    (D8 structured-action grounding). Returns (intent_dict, latency_s). Uses the
+    in-process mlx_lm model if loaded (no server / no shared prompt cache), else the
+    HTTP endpoint. Raises on repeated transport failure so the caller can isolate."""
+    sys_prompt, user = _prompts(transcript, keys)
+    if _MLX is not None:
+        from mlx_lm import generate
+        model, tok = _MLX
+        prompt = tok.apply_chat_template(
+            [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
+            add_generation_prompt=True, tokenize=False,
+        )
+        t0 = time.time()
+        # reasoning models (e.g. gemma E-series -it) emit a thought block before the
+        # final JSON; give enough budget to finish thinking AND answer.
+        text = generate(model, tok, prompt=prompt, max_tokens=768, verbose=False)
+        return _parse_json(text), time.time() - t0
     body = json.dumps({
         "model": "gemma",
         "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
@@ -74,19 +104,33 @@ def llm_extract_final_intent(transcript: str, keys: list[str], timeout: float = 
     raise RuntimeError(f"LLM extract failed after {retries + 1} attempts: {last_err}")
 
 
+import re as _re_json
+
+
 def _parse_json(s: str) -> dict:
-    s = s.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        s = s[s.find("{"):] if "{" in s else s
-    start, end = s.find("{"), s.rfind("}")
-    if start == -1 or end == -1:
-        return {}
-    try:
-        obj = json.loads(s[start:end + 1])
-        return obj if isinstance(obj, dict) else {}
-    except json.JSONDecodeError:
-        return {}
+    """Extract the FINAL JSON object — robust to reasoning models that emit a
+    <channel>thought block (with brace-y text) before a final ```json answer."""
+    s = (s or "").strip()
+    candidates: list[str] = []
+    # 1) fenced ```json blocks, last one first (the post-thinking answer)
+    fenced = _re_json.findall(r"```(?:json)?\s*(\{.*?\})\s*```", s, _re_json.DOTALL)
+    candidates.extend(reversed(fenced))
+    # 2) the last bare {...} (flat intent objects)
+    li, ri = s.rfind("{"), s.rfind("}")
+    if li != -1 and ri != -1 and ri > li:
+        candidates.append(s[li:ri + 1])
+    # 3) first {...} as a fallback
+    fi, fe = s.find("{"), s.rfind("}")
+    if fi != -1 and fe != -1 and fe > fi:
+        candidates.append(s[fi:fe + 1])
+    for c in candidates:
+        try:
+            obj = json.loads(c)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return {}
 
 
 def run_cascade(scenarios: list[dict], whisper_repo: str, max_samples: int | None) -> tuple[list[TurnRecord], int]:
@@ -110,11 +154,18 @@ def run_cascade(scenarios: list[dict], whisper_repo: str, max_samples: int | Non
 
 
 def main() -> int:
+    global LLM_URL
     ap = argparse.ArgumentParser()
     ap.add_argument("--lane", default="cascade", choices=["cascade"])
     ap.add_argument("--whisper", default="mlx-community/whisper-large-v3-turbo")
+    ap.add_argument("--llm-url", default=LLM_URL, help="OpenAI-compatible chat endpoint for the lane's brain")
+    ap.add_argument("--mlx-model", default=None, help="load this model in-process via mlx_lm (bypasses any server/cache)")
+    ap.add_argument("--tag", default="", help="suffix for the output scoreboard filename (e.g. -e2b)")
     ap.add_argument("--max-samples", type=int, default=None)
     args = ap.parse_args()
+    LLM_URL = args.llm_url
+    if args.mlx_model:
+        _load_mlx(args.mlx_model)
 
     scenarios = load_self_correction_scenarios()
     if not (AUDIO_DIR / f"{scenarios[0]['id']}.wav").exists():
@@ -128,7 +179,8 @@ def main() -> int:
     board["n_scenarios"] = len(records)
     board["n_errors"] = errors
     board["whisper"] = args.whisper
-    out = PROOF / f"lane-scoreboard-{args.lane}.json"
+    board["brain"] = args.mlx_model or args.llm_url
+    out = PROOF / f"lane-scoreboard-{args.lane}{args.tag}.json"
     out.write_text(json.dumps(board, indent=2), encoding="utf-8")
 
     s = board["summary"]

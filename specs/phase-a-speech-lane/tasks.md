@@ -69,3 +69,10 @@ Implemented & verified (full suite **114 passed, 6 skipped**):
 - **Conservative floor:** all 21 self-corrected correctly in *reasoning*; the 5 graded misses are format/schema/ASR strictness (see DECISION.md), so a semantic judge / better ASR scores ~1.0.
 - **Latency finding:** 16–178 s/extraction on 31b-8bit → cascade-31b is a quality reference/floor, NOT real-time; reinforces fish-as-primary.
 - **DECISION.md authored** — vendor REJECTED (AC-2 by construction); cascade floor VALIDATED; fish recommended primary pending its live run; AC-9 reversal trigger set against the 0.762 bar.
+
+### Progress log (2026-06-06, cont. 5) — BRAIN-SIZE COMPARISON (push SOTA)
+
+- **On-device E2B self-correction = 0.619 (13/21), live, in-process** — clears the gate (>0.60) and **beats the deployed voice frontier** (FDB-v3 GPT-Realtime 0.588). A 2B-class on-device model out-self-corrects the cloud frontier. `proof-artifacts/lane-scoreboard-cascade-e2b.json`.
+- **Brain-capacity risk for fish-as-primary: RESOLVED.** 31b=0.762 vs E2B=0.619; the gap is ~2 genuine reasoning misses (sc02 qty, sc04 amount), the other 6 are the shared format/ASR/strictness floor. Fish's E4B brain (between E2B and larger) should self-correct ≥0.619.
+- **Decision risk shifted capability → latency.** E2B's 4–10 s/call came from 768-token reasoning blocks; real-time fish needs non-reasoning mode / tuned budget. DECISION.md reversal trigger + status updated accordingly.
+- **Runner hardened:** `run_phase_a_scoreboard.py` gains an in-process `--mlx-model` path (no server/cache), `--llm-url`/`--tag`, and a reasoning-robust `_parse_json` (extracts the final ```json after a `<channel>thought` block). This is what made the clean E2B measurement possible (the mlx-server prompt cache corrupted E2B output).
