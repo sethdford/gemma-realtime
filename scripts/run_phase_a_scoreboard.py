@@ -45,6 +45,7 @@ def asr(wav_path: str, whisper_repo: str) -> str:
 
 
 _MLX = None  # (model, tokenizer) when using the direct in-process mlx_lm path
+NO_THINK = False  # suppress reasoning via chat-template enable_thinking=False (real-time mode)
 
 
 def _load_mlx(model_id: str):
@@ -76,14 +77,18 @@ def llm_extract_final_intent(transcript: str, keys: list[str], timeout: float = 
     if _MLX is not None:
         from mlx_lm import generate
         model, tok = _MLX
+        tmpl_kw = {"add_generation_prompt": True, "tokenize": False}
+        if NO_THINK:
+            tmpl_kw["enable_thinking"] = False  # template-level reasoning suppression
         prompt = tok.apply_chat_template(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
-            add_generation_prompt=True, tokenize=False,
+            **tmpl_kw,
         )
+        # no-think answers immediately (~0.3s); reasoning mode needs budget to finish
+        # its <channel>thought block before the final JSON.
+        mt = 64 if NO_THINK else 768
         t0 = time.time()
-        # reasoning models (e.g. gemma E-series -it) emit a thought block before the
-        # final JSON; give enough budget to finish thinking AND answer.
-        text = generate(model, tok, prompt=prompt, max_tokens=768, verbose=False)
+        text = generate(model, tok, prompt=prompt, max_tokens=mt, verbose=False)
         return _parse_json(text), time.time() - t0
     body = json.dumps({
         "model": "gemma",
@@ -123,12 +128,19 @@ def _parse_json(s: str) -> dict:
     fi, fe = s.find("{"), s.rfind("}")
     if fi != -1 and fe != -1 and fe > fi:
         candidates.append(s[fi:fe + 1])
+    import ast
     for c in candidates:
         try:
             obj = json.loads(c)
             if isinstance(obj, dict):
                 return obj
         except json.JSONDecodeError:
+            pass
+        try:  # no-think output is often single-quoted Python-dict style: {'qty': 1}
+            obj = ast.literal_eval(c)
+            if isinstance(obj, dict):
+                return obj
+        except (ValueError, SyntaxError):
             continue
     return {}
 
@@ -154,16 +166,18 @@ def run_cascade(scenarios: list[dict], whisper_repo: str, max_samples: int | Non
 
 
 def main() -> int:
-    global LLM_URL
+    global LLM_URL, NO_THINK
     ap = argparse.ArgumentParser()
     ap.add_argument("--lane", default="cascade", choices=["cascade"])
     ap.add_argument("--whisper", default="mlx-community/whisper-large-v3-turbo")
     ap.add_argument("--llm-url", default=LLM_URL, help="OpenAI-compatible chat endpoint for the lane's brain")
     ap.add_argument("--mlx-model", default=None, help="load this model in-process via mlx_lm (bypasses any server/cache)")
+    ap.add_argument("--no-think", action="store_true", help="suppress reasoning (enable_thinking=False) for real-time latency")
     ap.add_argument("--tag", default="", help="suffix for the output scoreboard filename (e.g. -e2b)")
     ap.add_argument("--max-samples", type=int, default=None)
     args = ap.parse_args()
     LLM_URL = args.llm_url
+    NO_THINK = args.no_think
     if args.mlx_model:
         _load_mlx(args.mlx_model)
 
@@ -180,6 +194,7 @@ def main() -> int:
     board["n_errors"] = errors
     board["whisper"] = args.whisper
     board["brain"] = args.mlx_model or args.llm_url
+    board["no_think"] = args.no_think
     out = PROOF / f"lane-scoreboard-{args.lane}{args.tag}.json"
     out.write_text(json.dumps(board, indent=2), encoding="utf-8")
 

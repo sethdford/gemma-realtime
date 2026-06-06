@@ -1,6 +1,6 @@
 # Phase-A Speech-Lane Decision — DECISION RECORD
 
-> Status: **DECIDED — vendor rejected (final); on-device brain capacity VALIDATED (E2B 0.619 > frontier 0.588); fish recommended primary, now gated on a real-time-LATENCY check, not capability.**
+> Status: **DECIDED — vendor rejected (final); fish-as-primary VALIDATED on both axes: on-device brain self-corrects 0.619 (> frontier 0.588) at 0.2 s/extraction (no-think). Remaining: confirm on the actual fish S2S stack + the turn-take/interruption/TTFA gates (confirmation, not decision-blocking).**
 > Date: 2026-06-06 · Spec: `requirements.md` / `design.md` / `tasks.md` · Roadmap: `docs/research/2026-06-06-s2s-L1-L5-roadmap.md`
 
 ## Decision
@@ -14,7 +14,8 @@
 | Lane / brain | Self-correction Pass@1 (AC-6) | Latency/call | Persona portability (AC-2) | Notes |
 |---|---|---|---|---|
 | **cascade · Gemma-31b-8bit** | **0.762 (16/21)** | 16–178 s | preserved (shared Gemma+LoRA) | live, on-device; `lane-scoreboard-cascade.json` |
-| **on-device brain · Gemma-E2B-4bit** | **0.619 (13/21)** | 4–10 s | preserved (shared Gemma+LoRA) | live, in-process (reasoning); fish-brain proxy; `lane-scoreboard-cascade-e2b.json` |
+| **on-device brain · Gemma-E2B-4bit (reasoning)** | **0.619 (13/21)** | 4–10 s | preserved (shared Gemma+LoRA) | live, in-process; fish-brain proxy; `lane-scoreboard-cascade-e2b.json` |
+| **on-device brain · Gemma-E2B-4bit (NO-THINK / real-time)** | **0.619 (13/21)** | **0.2 s** | preserved (shared Gemma+LoRA) | live; **same accuracy at ~25× speed**; `lane-scoreboard-cascade-e2b-nothink.json` |
 | **fish · frozen-Gemma-E4B S2S** | *pending live run* (E2B proxy ⇒ brain capacity validated) | — | preserved (shared Gemma+LoRA) | S2S stack not exercised this session |
 | **vendor · gpt-realtime** | n/a | — | **FAIL by construction** | cannot load LoRA persona |
 
@@ -49,7 +50,7 @@ Per-extraction time on the live **Gemma-31b-8bit** server ranged **~16–178 s**
 ## AC-9 reversal trigger (when to revisit)
 
 - **Brain capacity: VALIDATED** (E2B proxy = 0.619 > gate 0.60 > frontier 0.588). Fish's E4B brain must clear the **gate (>0.60)** and land **≥ the E2B proxy (0.619)** on its live run; if it cannot, demote to R&D.
-- **Latency is now the primary open risk.** If fish cannot hold self-correction quality at **TTFA <400 ms p50** on realistic audio (E2B needed 4–10 s *with* reasoning tokens), ship **cascade-with-micro-turns as the real-time primary** and keep fish for quality-tier turns. Resolve via non-reasoning mode / tuned token budget before deciding.
+- **Latency: RESOLVED at the brain level.** No-think E2B holds the *same* 0.619 self-correction at **0.2 s/extraction** (reasoning tokens added 0 accuracy here). The small on-device brain self-corrects above the frontier at real-time speed. Remaining latency work is in the *speech path* (encoder/codec/TTS streaming TTFA), measured separately against AC-5 — not the brain.
 - If fish cannot reach **turn-take ≥95%** once measured, same demotion.
 - Vendor rejection is **not** subject to reversal (structural, not performance-based).
 
