@@ -1,0 +1,378 @@
+[
+  {
+    "id": "sc01",
+    "domain": "travel",
+    "correction_type": "destination_change",
+    "utterance": "Book me a flight to Boston \u2014 no wait, make it New York.",
+    "original_intent": {
+      "action": "book_flight",
+      "dest": "Boston"
+    },
+    "corrected_intent": {
+      "action": "book_flight",
+      "dest": "New York"
+    },
+    "expected_final": {
+      "dest": "New York"
+    }
+  },
+  {
+    "id": "sc02",
+    "domain": "ecommerce",
+    "correction_type": "quantity_change",
+    "utterance": "Add three of the blue mugs to my cart, actually make that two.",
+    "original_intent": {
+      "action": "add_to_cart",
+      "item": "blue mug",
+      "qty": 3
+    },
+    "corrected_intent": {
+      "action": "add_to_cart",
+      "item": "blue mug",
+      "qty": 2
+    },
+    "expected_final": {
+      "qty": 2
+    }
+  },
+  {
+    "id": "sc03",
+    "domain": "calendar",
+    "correction_type": "date_change",
+    "utterance": "Schedule the review for Tuesday, sorry I mean Thursday.",
+    "original_intent": {
+      "action": "schedule",
+      "event": "review",
+      "day": "Tuesday"
+    },
+    "corrected_intent": {
+      "action": "schedule",
+      "event": "review",
+      "day": "Thursday"
+    },
+    "expected_final": {
+      "day": "Thursday"
+    }
+  },
+  {
+    "id": "sc04",
+    "domain": "finance",
+    "correction_type": "amount_change",
+    "utterance": "Transfer five hundred dollars to savings \u2014 hold on, fifteen hundred.",
+    "original_intent": {
+      "action": "transfer",
+      "to": "savings",
+      "amount": 500
+    },
+    "corrected_intent": {
+      "action": "transfer",
+      "to": "savings",
+      "amount": 1500
+    },
+    "expected_final": {
+      "amount": 1500
+    }
+  },
+  {
+    "id": "sc05",
+    "domain": "food",
+    "correction_type": "item_swap",
+    "utterance": "I'll have the margherita pizza, actually change that to the pepperoni.",
+    "original_intent": {
+      "action": "order",
+      "item": "margherita pizza"
+    },
+    "corrected_intent": {
+      "action": "order",
+      "item": "pepperoni pizza"
+    },
+    "expected_final": {
+      "item": "pepperoni pizza"
+    }
+  },
+  {
+    "id": "sc06",
+    "domain": "travel",
+    "correction_type": "date_change",
+    "utterance": "I need a hotel from the 10th to the 14th \u2014 sorry, the 12th to the 14th.",
+    "original_intent": {
+      "action": "book_hotel",
+      "checkin": "10th",
+      "checkout": "14th"
+    },
+    "corrected_intent": {
+      "action": "book_hotel",
+      "checkin": "12th",
+      "checkout": "14th"
+    },
+    "expected_final": {
+      "checkin": "12th"
+    }
+  },
+  {
+    "id": "sc07",
+    "domain": "housing",
+    "correction_type": "constraint_change",
+    "utterance": "Show me two-bedroom apartments under two thousand \u2014 actually under twenty-five hundred.",
+    "original_intent": {
+      "action": "search_listings",
+      "beds": 2,
+      "max_rent": 2000
+    },
+    "corrected_intent": {
+      "action": "search_listings",
+      "beds": 2,
+      "max_rent": 2500
+    },
+    "expected_final": {
+      "max_rent": 2500
+    }
+  },
+  {
+    "id": "sc08",
+    "domain": "support",
+    "correction_type": "cancel_and_restart",
+    "utterance": "I want to return the headphones \u2014 actually no, I want to exchange them.",
+    "original_intent": {
+      "action": "return",
+      "item": "headphones"
+    },
+    "corrected_intent": {
+      "action": "exchange",
+      "item": "headphones"
+    },
+    "expected_final": {
+      "action": "exchange"
+    }
+  },
+  {
+    "id": "sc09",
+    "domain": "finance",
+    "correction_type": "account_change",
+    "utterance": "Pay the electric bill from checking, wait, from the credit card instead.",
+    "original_intent": {
+      "action": "pay_bill",
+      "bill": "electric",
+      "source": "checking"
+    },
+    "corrected_intent": {
+      "action": "pay_bill",
+      "bill": "electric",
+      "source": "credit_card"
+    },
+    "expected_final": {
+      "source": "credit_card"
+    }
+  },
+  {
+    "id": "sc10",
+    "domain": "travel",
+    "correction_type": "time_change",
+    "utterance": "Set my alarm for six a.m. \u2014 uh, make it six thirty.",
+    "original_intent": {
+      "action": "set_alarm",
+      "time": "06:00"
+    },
+    "corrected_intent": {
+      "action": "set_alarm",
+      "time": "06:30"
+    },
+    "expected_final": {
+      "time": "06:30"
+    }
+  },
+  {
+    "id": "sc11",
+    "domain": "ecommerce",
+    "correction_type": "item_swap",
+    "utterance": "Order the large size in black \u2014 sorry, in navy.",
+    "original_intent": {
+      "action": "order",
+      "size": "large",
+      "color": "black"
+    },
+    "corrected_intent": {
+      "action": "order",
+      "size": "large",
+      "color": "navy"
+    },
+    "expected_final": {
+      "color": "navy"
+    }
+  },
+  {
+    "id": "sc12",
+    "domain": "calendar",
+    "correction_type": "attendee_change",
+    "utterance": "Invite Sarah to the standup, actually invite the whole team.",
+    "original_intent": {
+      "action": "invite",
+      "who": "Sarah"
+    },
+    "corrected_intent": {
+      "action": "invite",
+      "who": "team"
+    },
+    "expected_final": {
+      "who": "team"
+    }
+  },
+  {
+    "id": "sc13",
+    "domain": "finance",
+    "correction_type": "amount_change",
+    "utterance": "Withdraw two hundred \u2014 no, make it forty dollars.",
+    "original_intent": {
+      "action": "withdraw",
+      "amount": 200
+    },
+    "corrected_intent": {
+      "action": "withdraw",
+      "amount": 40
+    },
+    "expected_final": {
+      "amount": 40
+    }
+  },
+  {
+    "id": "sc14",
+    "domain": "travel",
+    "correction_type": "class_change",
+    "utterance": "Book economy, actually upgrade me to business.",
+    "original_intent": {
+      "action": "book_flight",
+      "cabin": "economy"
+    },
+    "corrected_intent": {
+      "action": "book_flight",
+      "cabin": "business"
+    },
+    "expected_final": {
+      "cabin": "business"
+    }
+  },
+  {
+    "id": "sc15",
+    "domain": "support",
+    "correction_type": "number_correction",
+    "utterance": "My order number is four-five-six \u2014 sorry, four-five-nine.",
+    "original_intent": {
+      "action": "lookup_order",
+      "order_id": "456"
+    },
+    "corrected_intent": {
+      "action": "lookup_order",
+      "order_id": "459"
+    },
+    "expected_final": {
+      "order_id": "459"
+    }
+  },
+  {
+    "id": "sc16",
+    "domain": "food",
+    "correction_type": "quantity_change",
+    "utterance": "Two coffees please, oh actually just one.",
+    "original_intent": {
+      "action": "order",
+      "item": "coffee",
+      "qty": 2
+    },
+    "corrected_intent": {
+      "action": "order",
+      "item": "coffee",
+      "qty": 1
+    },
+    "expected_final": {
+      "qty": 1
+    }
+  },
+  {
+    "id": "sc17",
+    "domain": "housing",
+    "correction_type": "location_change",
+    "utterance": "Find listings in Capitol Hill \u2014 actually look in Ballard instead.",
+    "original_intent": {
+      "action": "search_listings",
+      "area": "Capitol Hill"
+    },
+    "corrected_intent": {
+      "action": "search_listings",
+      "area": "Ballard"
+    },
+    "expected_final": {
+      "area": "Ballard"
+    }
+  },
+  {
+    "id": "sc18",
+    "domain": "calendar",
+    "correction_type": "cancel_and_restart",
+    "utterance": "Cancel my three o'clock \u2014 no wait, just move it to four.",
+    "original_intent": {
+      "action": "cancel_event",
+      "time": "15:00"
+    },
+    "corrected_intent": {
+      "action": "move_event",
+      "time": "16:00"
+    },
+    "expected_final": {
+      "action": "move_event",
+      "time": "16:00"
+    }
+  },
+  {
+    "id": "sc19",
+    "domain": "ecommerce",
+    "correction_type": "shipping_change",
+    "utterance": "Use standard shipping, actually I need it overnight.",
+    "original_intent": {
+      "action": "checkout",
+      "shipping": "standard"
+    },
+    "corrected_intent": {
+      "action": "checkout",
+      "shipping": "overnight"
+    },
+    "expected_final": {
+      "shipping": "overnight"
+    }
+  },
+  {
+    "id": "sc20",
+    "domain": "finance",
+    "correction_type": "payee_change",
+    "utterance": "Send fifty to Mike \u2014 sorry, send it to Michelle.",
+    "original_intent": {
+      "action": "send_money",
+      "to": "Mike",
+      "amount": 50
+    },
+    "corrected_intent": {
+      "action": "send_money",
+      "to": "Michelle",
+      "amount": 50
+    },
+    "expected_final": {
+      "to": "Michelle"
+    }
+  },
+  {
+    "id": "sc21",
+    "domain": "travel",
+    "correction_type": "destination_change",
+    "utterance": "One ticket to Portland, Oregon \u2014 wait, I meant Portland, Maine.",
+    "original_intent": {
+      "action": "book_flight",
+      "dest": "Portland, Oregon"
+    },
+    "corrected_intent": {
+      "action": "book_flight",
+      "dest": "Portland, Maine"
+    },
+    "expected_final": {
+      "dest": "Portland, Maine"
+    }
+  }
+]

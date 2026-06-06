@@ -1,0 +1,46 @@
+# Phase-A Speech-Lane Decision — Tasks
+
+> Each task maps to ≥1 acceptance criterion; each AC is covered by ≥1 task.
+> Owner `agent` = dispatchable to a `general-purpose` implementer (worktree-isolated); `lead` = this session / human judgment.
+
+| # | Task | ACs | Owner | Status |
+|---|---|---|---|---|
+| 1 | Build the realistic-audio test set: `data/realistic-audio/` + loader yielding ≥100 samples/branch across {clean, 15 dB-SNR noise, accent} subsets; port the 21 self-correction scenarios (FDB-v3 structure). | AC-3, AC-4, AC-5, AC-6 | agent | pending |
+| 2 | Extend `STSMetrics` (eval_sts.py:40) + `summary()` (eval_sts.py:51) + `_compute_scorecard` (eval_sts.py:125) with new fields: `turn_take_rate`, `interruption_avoidance`, `ttfa_p50/p95`, `self_correction_pass1`. | AC-3, AC-4, AC-5, AC-6 | agent | **done** ✅ |
+| 3 | Wire `DuplexStatePredictor` (speech_decoder.py:316) / `predict_state()` (fish_sts.py:641) state transitions into turn-take + interruption-avoidance metrics, using FDB-v3 definitions exactly (R5). | AC-3, AC-4 | agent | pending |
+| 4 | Aggregate existing per-turn `first_audio_ms` (realtime-ws.py:910) / `build_turn_record` (speech_metrics.py:23) into TTFA p50/p95 in the scorecard (no new timing hooks — D5). | AC-5 | agent | pending |
+| 5 | Add third lane to `eval_sts.py --pipeline` ({fish,cascaded,**vendor**}, currently @855) + thin `scripts/vendor_s2s_baseline.py` (gpt-realtime), flagged comparison-only / off the product hot path (R3, D7). | AC-1 | agent | pending |
+| 6 | Build `scripts/persona_consistency.py`: run a fixed persona prompt through the text path and each speech lane (→ASR re-transcribe→trait-score), cosine the trait vectors; reuse h-uman scorer if present else cosine≥0.85 default (R1). Demonstrate vendor lane cannot load Gemma+LoRA → fails AC-2 by construction. | AC-2 | agent | pending |
+| 7 | Self-correction Pass@1 probe across all lanes on the 21 scenarios; report as feasibility signal; assert fish lane exposes INTERRUPT state needed for future rollback (D6 — does not *preclude* L4 repair). | AC-6 | agent | **data+loader ✅** · live probe pending |
+| 8 | Add a config-level lane field + a `which-lane-active` health signal (extend `--tts` realtime-ws.py:1019 + verify `self._cascaded` auto-fallback sota_pipeline.py:452 is observable, not silent — D4). | AC-7 | agent | **logic ✅ (tested)** · runtime wiring pending |
+| 9 | On-device egress verification: assert no audio bytes leave the device and no per-minute external API is on the hot path for fish + cascade lanes (network-capture or static check). | AC-8 | agent | **done ✅** |
+| 10 | Run the full scoreboard → `proof-artifacts/lane-scoreboard.json` + markdown; author `specs/phase-a-speech-lane/DECISION.md` with the chosen primary lane, the evidence, and the **AC-9 reversal trigger** (exact thresholds + window to revisit). | AC-1, AC-9 | lead | pending |
+| 11 | Spawn `spec-verifier` against this spec; for each AC, prove satisfaction from the scoreboard + artifacts; `RESULT_spec-verifier=PASS` required before closing Phase A. | all | lead | pending |
+
+## Dependencies
+
+- Task 2 depends on Task 1 (needs the data to compute against). Field scaffolding can start in parallel; integration waits on 1.
+- Tasks 3, 4, 7 depend on Task 2 (metric fields must exist).
+- Task 5 depends on Task 2 (third lane reports into the same metric schema).
+- Task 6 is largely independent (persona probe) — can run in parallel with 1–5; AC-2 vendor-disqualification needs Task 5's vendor adapter only for the contrast row.
+- Task 10 depends on Tasks 2,3,4,5,6,7,8,9 (needs all metrics + lanes).
+- Task 11 depends on Task 10.
+
+## Suggested execution
+
+- **Parallel wave 1** (`/team`, worktree-isolated, no shared-state collisions): Task 1 (data), Task 6 (persona probe), Task 8 (lane config/health), Task 9 (egress check).
+- **Wave 2** (after Task 1 + the `STSMetrics` scaffold land, sequential on `eval_sts.py` to avoid same-file collisions — see `agent-task-sizing` + `verify-worktree-isolation` rules): Tasks 2 → 3 → 4 → 5 → 7.
+- **Wave 3** (lead): Task 10 (run + DECISION.md) → Task 11 (spec-verifier gate).
+
+> Note (`worktree-merge-before-cleanup`): Tasks 2–5,7 all touch `eval_sts.py` — do NOT fan these out as parallel worktree edits; sequence them or one agent owns the file. Wave-1 tasks touch distinct files and are safe to parallelize.
+
+## Progress log (2026-06-06)
+
+Implemented & verified (full suite **114 passed, 6 skipped**):
+
+- **Task 2 (AC-3/4/5/6 schema) ✅** — `scripts/eval_sts.py`: `STSMetrics` gains `turn_take`/`interruption_avoidance`/`ttfa_ms`/`self_correction`; `summary()` aggregates (`turn_take_rate`, `interruption_avoidance`, `ttfa_p50_ms`/`p95`, `self_correction_pass1`); `CONVERSATIONAL_GATES` + `_conversational_gates()` score each against frontier thresholds (turn-take ≥0.95, interruption >0.135, TTFA <400 ms, self-corr >0.60) with **tri-state pass** (None = unmeasured). Tests: `tests/test_eval_sts_metrics.py` (4). Backward-compatible.
+- **Task 9 (AC-8 egress) ✅** — `tests/test_ondevice_egress.py` (3): static contract that the fish+codec+cascade hot-path modules import no cloud SDKs and carry no external vendor endpoint literals. Vendor baseline intentionally exempt.
+- **Task 7 data (AC-6) ✅ partial** — `specs/phase-a-speech-lane/self_correction_scenarios.json` (21 mid-utterance corrections, 7 domains, 15 correction types; tracked as `.json` because `.gitignore` blocks `*.jsonl` for privacy) + `scripts/self_correction.py` loader/validator + `tests/test_self_correction_scenarios.py` (3). The rendered AUDIO for these scenarios lands under `data/` (gitignored, Task 1). Live Pass@1 probe across lanes still needs a model run.
+- **Task 8 logic (AC-7) ✅ partial** — `scripts/lane_select.py` + `tests/test_lane_select.py` (6): resolves the existing `--tts` flag onto {fish, cascade, vendor}, enforces vendor-never-auto-primary, and emits a `lane_health()` `which-lane-active` signal that flags fallback. **Not yet called from `realtime-ws.py`** (per integration-done contract, this is logic-complete, not wired — 1-line hook into the `/health` payload + session.created remains).
+
+**Remaining (need model / data download / cloud key):** Tasks 1 (LibriSpeech+noise set), 3/4/5 (live metric wiring + vendor adapter), 6 (persona probe), 8-wiring, 10 (run + DECISION.md), 11 (spec-verifier).
