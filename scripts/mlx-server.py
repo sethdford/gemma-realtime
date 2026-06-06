@@ -804,6 +804,9 @@ def prepare_prompt_lm(messages, skip_thinking_primer=None):
       - None  (default): preserve legacy behavior — skip iff a no-think
                           instruction is configured.
       - True / False:    explicit override from the caller.
+
+    Returns (prompt, modified_messages) where modified_messages includes any
+    injected system instructions for accurate echo detection.
     """
     if skip_thinking_primer is None:
         skip_thinking_primer = _no_think_instruction() is not None
@@ -826,11 +829,15 @@ def prepare_prompt_lm(messages, skip_thinking_primer=None):
             parts.append(f"<start_of_turn>{role}\n{text}<end_of_turn>")
         parts.append("<start_of_turn>model\n")
         prompt = "\n".join(parts)
-    return prompt
+    return prompt, messages
 
 
 def prepare_prompt_vlm(messages):
-    """Format messages using mlx_vlm's template (multimodal path)."""
+    """Format messages using mlx_vlm's template (multimodal path).
+    
+    Returns (formatted_prompt, images, modified_messages) where modified_messages
+    includes any injected system instructions for accurate echo detection.
+    """
     from mlx_vlm.prompt_utils import apply_chat_template
 
     messages = _maybe_inject_no_think_instruction(messages)
@@ -858,7 +865,7 @@ def prepare_prompt_vlm(messages):
     else:
         prompt_text = ""
 
-    return apply_chat_template(processor, config, prompt_text, num_images=len(all_images)), all_images
+    return apply_chat_template(processor, config, prompt_text, num_images=len(all_images)), all_images, messages
 
 
 def strip_stop_tokens(text):
@@ -1673,7 +1680,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
         from mlx_lm import stream_generate as lm_stream_generate
         from mlx_lm.sample_utils import make_sampler
         _prepare_cache_for_request(messages)
-        prompt = prepare_prompt_lm(messages, skip_thinking_primer)
+        prompt, modified_messages = prepare_prompt_lm(messages, skip_thinking_primer)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
         _rp = _repetition_logits_processors()
@@ -1704,11 +1711,11 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
         # runaway guard, and salvage heuristic all live in finalize_generation
         # so the buffered streaming path (_handle_stream_buffered) applies the
         # IDENTICAL logic. See m3_live_path_extractor_strip.md "runaway" arc.
-        stripped, _runaway = finalize_generation(full, messages)
+        stripped, _runaway = finalize_generation(full, modified_messages)
         return stripped, prompt_toks_out, gen_toks_out
 
     from mlx_vlm import generate as vlm_generate
-    formatted, images = prepare_prompt_vlm(messages)
+    formatted, images, modified_messages = prepare_prompt_vlm(messages)
     extra = _kv_kwargs()
     if images:
         extra["images"] = images
@@ -1745,7 +1752,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
             from mlx_lm import stream_generate as lm_stream_generate
             from mlx_lm.sample_utils import make_sampler
             _prepare_cache_for_request(messages)
-            prompt = prepare_prompt_lm(messages, skip_thinking_primer)
+            prompt, _ = prepare_prompt_lm(messages, skip_thinking_primer)
             extra = _kv_kwargs()
             extra["sampler"] = make_sampler(temp=temperature)
             _rp = _repetition_logits_processors()
@@ -1794,7 +1801,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
         from mlx_lm.sample_utils import make_sampler
 
         _prepare_cache_for_request(messages)
-        prompt = prepare_prompt_lm(messages, skip_thinking_primer)
+        prompt, _ = prepare_prompt_lm(messages, skip_thinking_primer)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
         _rp = _repetition_logits_processors()
@@ -1826,7 +1833,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
 
     # Multimodal fallback via mlx_vlm
     from mlx_vlm import stream_generate as vlm_stream_generate
-    formatted, images = prepare_prompt_vlm(messages)
+    formatted, images, _ = prepare_prompt_vlm(messages)
     extra = _kv_kwargs()
     if images:
         extra["images"] = images
@@ -2086,7 +2093,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 raw_parts.append(text)
 
         full = "".join(raw_parts).strip()
-        clean, is_runaway = finalize_generation(full, messages)
+        modified_messages = _maybe_inject_no_think_instruction(messages)
+        clean, is_runaway = finalize_generation(full, modified_messages)
 
         if clean:
             content_chunk = {
