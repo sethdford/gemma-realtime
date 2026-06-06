@@ -5,7 +5,7 @@
 
 | # | Task | ACs | Owner | Status |
 |---|---|---|---|---|
-| 1 | Build the realistic-audio test set: `data/realistic-audio/` + loader yielding ≥100 samples/branch across {clean, 15 dB-SNR noise, accent} subsets; port the 21 self-correction scenarios (FDB-v3 structure). | AC-3, AC-4, AC-5, AC-6 | agent | pending |
+| 1 | Build the realistic-audio test set: `data/realistic-audio/` + loader yielding ≥100 samples/branch across {clean, 15 dB-SNR noise, accent} subsets; port the 21 self-correction scenarios (FDB-v3 structure). | AC-3, AC-4, AC-5, AC-6 | agent | **scenario audio rendered ✅** (21 wavs, whisper-verified) · noise/accent + ≥100/branch pending |
 | 2 | Extend `STSMetrics` (eval_sts.py:40) + `summary()` (eval_sts.py:51) + `_compute_scorecard` (eval_sts.py:125) with new fields: `turn_take_rate`, `interruption_avoidance`, `ttfa_p50/p95`, `self_correction_pass1`. | AC-3, AC-4, AC-5, AC-6 | agent | **done** ✅ |
 | 3 | Wire `DuplexStatePredictor` (speech_decoder.py:316) / `predict_state()` (fish_sts.py:641) state transitions into turn-take + interruption-avoidance metrics, using FDB-v3 definitions exactly (R5). | AC-3, AC-4 | agent | **scorer core ✅** · live state-seq runner pending |
 | 4 | Aggregate existing per-turn `first_audio_ms` (realtime-ws.py:910) / `build_turn_record` (speech_metrics.py:23) into TTFA p50/p95 in the scorecard (no new timing hooks — D5). | AC-5 | agent | **aggregation ✅** (conversational_runner) · live `first_audio_ms` capture pending |
