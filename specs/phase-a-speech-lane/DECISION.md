@@ -16,10 +16,11 @@
 | **cascade · Gemma-31b-8bit** | **0.762 (16/21)** | 16–178 s | preserved (shared Gemma+LoRA) | live, on-device; `lane-scoreboard-cascade.json` |
 | **on-device brain · Gemma-E2B-4bit (reasoning)** | **0.619 (13/21)** | 4–10 s | preserved (shared Gemma+LoRA) | live, in-process; fish-brain proxy; `lane-scoreboard-cascade-e2b.json` |
 | **on-device brain · Gemma-E2B-4bit (NO-THINK / real-time)** | **0.619 (13/21)** | **0.2 s** | preserved (shared Gemma+LoRA) | live; **same accuracy at ~25× speed**; `lane-scoreboard-cascade-e2b-nothink.json` |
+| **★ fish primary brain · Gemma-E4B-4bit (whisper-small, NO-THINK)** | **0.667 (14/21)** | **0.3 s** | preserved (shared Gemma+LoRA) | the ACTUAL fish brain, real-time; `lane-scoreboard-cascade-e4b-small-nothink.json` |
 | **fish · frozen-Gemma-E4B S2S** | *pending live run* (E2B proxy ⇒ brain capacity validated) | — | preserved (shared Gemma+LoRA) | S2S stack not exercised this session |
 | **vendor · gpt-realtime** | n/a | — | **FAIL by construction** | cannot load LoRA persona |
 
-**Frontier reference:** FDB-v3 GPT-Realtime self-correction **0.588**; cascaded baseline **0.176**. **Both our on-device brains beat the frontier** — and the 2B-class E2B beating the deployed voice frontier (0.619 > 0.588) is the headline SOTA result.
+**Frontier reference:** FDB-v3 GPT-Realtime self-correction **0.588**; cascaded baseline **0.176**. **Every on-device brain we measured beats the frontier** — 31b 0.762, **E4B (the real fish brain) 0.667 @ 0.3 s**, E2B 0.619 @ 0.2 s. The headline SOTA result: the actual on-device primary brain (E4B) self-corrects **above the deployed cloud voice frontier at real-time speed (0.3 s)**; ASR is now the cascade lane's binding constraint (whisper-small fixed sc15 but truncated sc09/sc17), which is itself an argument for true S2S (fish) skipping the lossy transcribe step.
 
 ### Brain-size finding (resolves the primary fish risk)
 

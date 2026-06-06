@@ -84,3 +84,9 @@ Implemented & verified (full suite **114 passed, 6 skipped**):
 3. **Conversational fixtures rendered** — 8 turn-take/backchannel/barge-in clips (`conversational_scenarios.json` → `data/realistic-audio/conversational/`), reusable AC-3/4 input.
 
 **Net:** fish-as-primary validated on brain capacity + latency (via E2B proxy). Remaining is TRAINING (fish adapters + duplex predictor), not architecture or decision. Scorers/aggregation/runner all ready.
+
+### Progress log (2026-06-06, cont. 7) — REAL fish-brain (E4B) at real-time
+
+- **E4B (the actual fish primary brain) + whisper-small + no-think = 0.667 (14/21) @ 0.3 s/call** — beats the cloud frontier (0.588) at real-time speed. `lane-scoreboard-cascade-e4b-small-nothink.json`.
+- Full on-device brain ladder, all > frontier: 31b 0.762 (16–178 s) · **E4B 0.667 (0.3 s)** · E2B 0.619 (0.2 s).
+- ASR is the cascade lane's binding constraint: whisper-small fixed sc15 (459) but truncated sc09/sc17 — an argument for true S2S (fish) skipping the lossy transcribe step. Remaining misses are mostly format/schema strictness (correct meaning, exact-string fail), not reasoning.
