@@ -991,7 +991,93 @@ def _is_pure_deliberation(raw):
     return len(non_bullet_reply) == 0
 
 
-def finalize_generation(full):
+def _is_input_echo(reply, messages):
+    """Return True if `reply` merely echoes the INPUT rather than answering it —
+    a prompt echo, a prior-history echo, or a system-prompt leak.
+
+    Pure function (no I/O) — directly unit-testable. Used as a guard in
+    finalize_generation: when generation truncates mid/post-deliberation, the
+    strip extractor (or the runaway salvage) can surface a fragment that is
+    actually the user's own message, a previous turn, or a span of the system
+    prompt rather than a committed reply. Emitting that is worse than empty
+    (h-uman's fallback handles an empty turn). Observed live 2026-06-04 at tight
+    caps: reply == "did you eat yet?" (prompt echo) and "Their recent messages
+    are short; match t..." (system-prompt leak).
+
+    Detection (all on a casefold + whitespace-normalized basis):
+      - reply == last USER message, but ONLY when that message is >=3 words, so a
+        genuine "ok"/"yeah" answer to "ok"/"yeah" is NOT a false-positive;
+      - reply exactly equals any PRIOR (non-final) turn of >=2 words, or is
+        contained in one when the reply itself is >=3 words (history echo, e.g.
+        the model parroting its own earlier "starving lol");
+      - reply shares a >=6-word contiguous span with any SYSTEM message
+        (system-prompt leak).
+    Returns False on empty/malformed input.
+    """
+    if not reply or not messages:
+        return False
+
+    def _norm(s):
+        return " ".join(str(s or "").split()).casefold()
+
+    def _content(m):
+        c = m.get("content", "") if isinstance(m, dict) else ""
+        if isinstance(c, list):  # multimodal parts -> join text fragments
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return c
+
+    r = _norm(reply)
+    if not r:
+        return False
+    r_words = r.split()
+
+    sys_texts, user_texts, other_texts = [], [], []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "")
+        text = _content(m)
+        if role == "system":
+            sys_texts.append(text)
+        elif role == "user":
+            user_texts.append(text)
+        else:
+            other_texts.append(text)
+
+    # 1. Prompt echo: reply == last user message (only if that message is >=3 words).
+    if user_texts:
+        last_user = _norm(user_texts[-1])
+        if len(last_user.split()) >= 3 and r == last_user:
+            return True
+
+    # 2. History echo: reply repeats a prior turn (all user turns but the last,
+    #    plus every assistant/other turn). Exact match needs >=2 words; the
+    #    contained-in case needs the reply itself to be >=3 words.
+    for t in user_texts[:-1] + other_texts:
+        tn = _norm(t)
+        tn_words = tn.split()
+        if len(tn_words) >= 2 and r == tn:
+            return True
+        if len(r_words) >= 3 and len(tn_words) >= 3 and r in tn:
+            return True
+
+    # 3. System-prompt leak: reply shares a >=6-word contiguous span with a
+    #    system message.
+    SPAN = 6
+    if len(r_words) >= SPAN:
+        for st in sys_texts:
+            sw = _norm(st).split()
+            if len(sw) < SPAN:
+                continue
+            sys_spans = {tuple(sw[i:i + SPAN]) for i in range(len(sw) - SPAN + 1)}
+            if any(tuple(r_words[j:j + SPAN]) in sys_spans
+                   for j in range(len(r_words) - SPAN + 1)):
+                return True
+
+    return False
+
+
+def finalize_generation(full, messages=None):
     """Strip thought blocks from a fully-accumulated raw generation.
 
     SHARED by the non-streaming path (generate_response) and the buffered
@@ -1016,9 +1102,25 @@ def finalize_generation(full):
     if not full:
         return "", False
     import re as _re
+
+    def _guard(text):
+        # Reject input-echo / system-prompt-leak as runaway: when `messages` is
+        # supplied and the candidate merely echoes the prompt/history or leaks a
+        # system-prompt span, return empty (better empty than garbage — same
+        # philosophy as the _is_pure_deliberation guard below). messages=None
+        # preserves legacy behavior + existing tests.
+        if text and messages is not None and _is_input_echo(text, messages):
+            try:
+                print(f"  [echo-guard] reply echoes input / leaks system prompt; "
+                      f"returning empty: {text[:80]!r}", flush=True)
+            except Exception:
+                pass
+            return "", True
+        return text, False
+
     stripped = strip_thought_channels(full)
     if stripped:
-        return stripped, False
+        return _guard(stripped)
 
     # Extractor came up empty — diagnose, then decide runaway vs salvage.
     # DIAGNOSTIC: dump full raw output when GEMMA_DUMP_EMPTY_EXTRACT is set.
@@ -1061,7 +1163,7 @@ def finalize_generation(full):
                       f"({len(full)} chars): {picked[:80]!r}", flush=True)
             except Exception:
                 pass
-            return picked, False  # resolved -> caller emits the salvaged reply
+            return _guard(picked)  # resolved -> caller emits the salvaged reply (unless echo)
         try:
             print(f"  [runaway-detected] pure deliberation, no extractable candidate "
                   f"({len(full)} chars); returning empty", flush=True)
@@ -1086,7 +1188,7 @@ def finalize_generation(full):
               f"({len(full)} chars): {salvaged[:80]!r}", flush=True)
     except Exception:
         pass
-    return salvaged, False
+    return _guard(salvaged)
 
 
 def _resolve_should_buffer(req_flag, env_value, no_think_active):
@@ -1544,15 +1646,34 @@ def _record_system_cache_boundary(messages):
         pass
 
 
-def generate_response(messages, max_tokens=256, temperature=0.7):
-    """Non-streaming: generate the full response at once."""
+def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_primer=None):
+    """Non-streaming: generate the full response at once.
+
+    `skip_thinking_primer` mirrors stream_response: it is forwarded to
+    prepare_prompt_lm so the non-stream `/v1/chat/completions` path makes the
+    SAME primer decision the streaming path does, instead of always relying on
+    prepare_prompt_lm's bare default. This matters for a server with no-think
+    OFF where a casual caller sends stream_strip=false — that request now drops
+    Gemma 4's forced `<|channel>thought` opener here too.
+
+    NOTE (verified live 2026-06-01, seth-lora-v4-repair-20260525): dropping the
+    primer does NOT by itself cut tokens for this adapter — it was trained to
+    deliberate and emits ~150-300 tokens of markdown-bullet reasoning regardless
+    (see _thinking_headroom_tokens). Under GEMMA_DISABLE_THINKING the primer is
+    already skipped on both paths, so this arg is a no-op there; the non-stream
+    token cost is the adapter's deliberation + the intentional thinking headroom,
+    not a missing flag. Kept for path consistency + the no-think-off case above.
+
+    None = legacy default (skip iff a no-think instruction is configured);
+    True/False = explicit per-request override. See _request_skip_thinking_primer.
+    """
     has_imgs = _has_images(messages)
 
     if use_lm_path and not has_imgs:
         from mlx_lm import stream_generate as lm_stream_generate
         from mlx_lm.sample_utils import make_sampler
         _prepare_cache_for_request(messages)
-        prompt = prepare_prompt_lm(messages)
+        prompt = prepare_prompt_lm(messages, skip_thinking_primer)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
         _rp = _repetition_logits_processors()
@@ -1583,7 +1704,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7):
         # runaway guard, and salvage heuristic all live in finalize_generation
         # so the buffered streaming path (_handle_stream_buffered) applies the
         # IDENTICAL logic. See m3_live_path_extractor_strip.md "runaway" arc.
-        stripped, _runaway = finalize_generation(full)
+        stripped, _runaway = finalize_generation(full, messages)
         return stripped, prompt_toks_out, gen_toks_out
 
     from mlx_vlm import generate as vlm_generate
@@ -1965,7 +2086,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 raw_parts.append(text)
 
         full = "".join(raw_parts).strip()
-        clean, is_runaway = finalize_generation(full)
+        clean, is_runaway = finalize_generation(full, messages)
 
         if clean:
             content_chunk = {
@@ -2041,8 +2162,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         # HEADROOM_TOKENS tunable.
         internal_max = max_tokens + _thinking_headroom_tokens()
 
+        # Make the SAME primer decision the streaming path makes (line ~1857)
+        # rather than leaning on prepare_prompt_lm's bare default: casual tiers
+        # (stream_strip=false) and no-think config drop Gemma's forced
+        # `<|channel>thought` opener. Under no-think this is already the default
+        # on both paths (no-op); its value is a no-think-OFF server honoring a
+        # casual caller's stream_strip=false. Thinking-enabled callers unchanged.
+        skip_primer = _request_skip_thinking_primer(req)
         with model_lock:
-            text, prompt_toks, gen_toks = generate_response(messages, internal_max, temperature)
+            text, prompt_toks, gen_toks = generate_response(
+                messages, internal_max, temperature,
+                skip_thinking_primer=skip_primer,
+            )
 
         elapsed = time.time() - t0
         self._send_json(200, {
