@@ -41,3 +41,44 @@ def self_correction_pass1(pairs: Iterable[tuple[dict, dict]]) -> float | None:
         return None
     passed = sum(1 for final_intent, scenario in pairs if score_self_correction(final_intent, scenario))
     return passed / len(pairs)
+
+
+# ── Duplex states (must match speech_decoder.DuplexStatePredictor) ─────────────
+LISTEN, SPEAK, INTERRUPT = 0, 1, 2
+
+
+def score_turn_take(states: Iterable[int], should_respond: bool) -> bool:
+    """Did the agent take/yield the turn correctly (AC-3)?
+
+    ``states`` is the duplex-predictor state sequence for one turn. If the agent
+    *should* respond, passing means a SPEAK state appears; if it should yield
+    (e.g. a backchannel turn), passing means it never took the floor (no SPEAK).
+    """
+    spoke = SPEAK in list(states)
+    return spoke if should_respond else (not spoke)
+
+
+def turn_take_rate(turns: Iterable[tuple[Iterable[int], bool]]) -> float | None:
+    """Mean turn-take correctness over (states, should_respond) turns. None if empty."""
+    turns = list(turns)
+    if not turns:
+        return None
+    return sum(1 for states, should in turns if score_turn_take(states, should)) / len(turns)
+
+
+def score_interruption_avoidance(states_during_bargein: Iterable[int]) -> bool:
+    """For a NON-terminal barge-in (backchannel / noise that should NOT stop the
+    agent): True iff the agent kept speaking — no INTERRUPT/LISTEN (AC-4).
+
+    Feed only non-terminal barge-in windows; terminal (genuine) interruptions are
+    a separate responsiveness metric, out of scope for the avoidance gate.
+    """
+    return not any(s in (INTERRUPT, LISTEN) for s in states_during_bargein)
+
+
+def interruption_avoidance_rate(events: Iterable[Iterable[int]]) -> float | None:
+    """Fraction of non-terminal barge-ins the agent correctly held through. None if empty."""
+    events = list(events)
+    if not events:
+        return None
+    return sum(1 for w in events if score_interruption_avoidance(w)) / len(events)

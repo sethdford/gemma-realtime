@@ -71,3 +71,46 @@ def test_scores_against_real_fixture_perfect_and_zero():
     # An agent that locks in the original intent scores 0.0 (the failure mode).
     worst = [(s["original_intent"], s) for s in scenarios]
     assert self_correction_pass1(worst) == 0.0
+
+
+# ── Turn-take (AC-3) ──────────────────────────────────────────────────────────
+from conversational_scoring import (  # noqa: E402
+    LISTEN, SPEAK, INTERRUPT,
+    score_turn_take, turn_take_rate,
+    score_interruption_avoidance, interruption_avoidance_rate,
+)
+
+
+def test_turn_take_should_respond():
+    # Agent should respond and did (a SPEAK appears) -> pass.
+    assert score_turn_take([LISTEN, LISTEN, SPEAK, SPEAK], should_respond=True) is True
+    # Should respond but stayed silent -> fail.
+    assert score_turn_take([LISTEN, LISTEN, LISTEN], should_respond=True) is False
+
+
+def test_turn_take_should_yield():
+    # Backchannel turn: agent should NOT take the floor; staying in LISTEN passes.
+    assert score_turn_take([LISTEN, LISTEN], should_respond=False) is True
+    # Barged in when it should have stayed quiet -> fail.
+    assert score_turn_take([LISTEN, SPEAK], should_respond=False) is False
+
+
+def test_turn_take_rate_aggregates():
+    turns = [([SPEAK], True), ([LISTEN], True), ([LISTEN], False), ([SPEAK], False)]
+    # 1st pass, 2nd fail (should respond, didn't), 3rd pass, 4th fail -> 2/4
+    assert turn_take_rate(turns) == 0.5
+    assert turn_take_rate([]) is None
+
+
+# ── Interruption avoidance (AC-4) ─────────────────────────────────────────────
+def test_interruption_avoidance_holds_through_backchannel():
+    # Non-terminal barge-in (backchannel): correct behavior = keep speaking.
+    assert score_interruption_avoidance([SPEAK, SPEAK, SPEAK]) is True
+    # Wrongly yielded to a backchannel -> not avoided.
+    assert score_interruption_avoidance([SPEAK, INTERRUPT, LISTEN]) is False
+
+
+def test_interruption_avoidance_rate():
+    events = [[SPEAK, SPEAK], [SPEAK, INTERRUPT], [SPEAK, SPEAK]]  # 2/3 held
+    assert abs(interruption_avoidance_rate(events) - (2 / 3)) < 1e-9
+    assert interruption_avoidance_rate([]) is None

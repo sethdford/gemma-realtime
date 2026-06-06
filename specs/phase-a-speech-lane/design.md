@@ -41,6 +41,28 @@ Phase A is a **measurement-driven decision**, not a build. We extend the *existi
 - **D6 — AC-6 is a feasibility probe in Phase A** (per approved default). We measure baseline self-correction Pass@1 on all lanes (to confirm the gap) and assert the fish lane's `DuplexStatePredictor` exposes the INTERRUPT state needed for a future rollback engine — proving the lane *doesn't preclude* L4 repair. Full rollback engine = Phase B. Rejected: building rollback now (scope creep past a decision spec).
 - **D7 — gpt-realtime as the vendor baseline** (per approved default; serves AC-1/AC-2). Strongest L3 (FDB-v3 Pass@1 0.600, tool F1 0.876) → hardest contrast. Rejected: Nova 2 Sonic (cheapest, but a weaker expressivity contrast).
 
+## Addendum (2026-06-06, from the live smoke run)
+
+Running `eval_sts.py --pipeline cascaded --bundle smoke` on-device confirmed it is
+a **batch TTS/STS quality** harness: per-sample timing exposes `elapsed` (total
+utterance synth) + `dur` only — **no first-audio timestamp**. Therefore the four
+conversational gates do NOT come from this loop:
+
+- **TTFA, turn-take, interruption, self-correction** require a **separate
+  streaming/conversational runner** that drives the `duplex-predictor` adapter
+  (LISTEN/SPEAK/INTERRUPT) and captures `first_audio_ms` from the streaming path
+  (consistent with D5). `eval_sts.py` keeps reporting the *quality* gates (WER,
+  AQ, speaker-sim, total latency) + emits the conversational gates as `null`
+  (correctly unmeasured) until the streaming runner populates them.
+- **Persona probe default (AC-2):** a heuristic **trait-vector cosine** — a fixed
+  trait set scored from text via word-boundary lexical markers (per
+  `substring-classifier-pitfalls`), cosine ≥ 0.85 = "same persona." No h-uman
+  scorer exists to reuse, so this is the spec default. Pure/testable without a model.
+
+Scoring cores built this round (model-free, unit-tested): `conversational_scoring.py`
+(self-correction + turn-take + interruption) and `persona_consistency.py`. The live
+model-driving glue (audio→states, lane runs) is the remaining integration boundary.
+
 ## Risks
 
 - **R1 — Persona trait-scorer doesn't exist yet** (Explore: "NOT FOUND" in scripts/ or tests/). Mitigation: AC-2 default threshold (cosine ≥ 0.85) on a defined trait vector; if h-uman has a scorer elsewhere, wire it; else build a minimal one in `persona_consistency.py`. This is the critical-path new code.
