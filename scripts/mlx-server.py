@@ -803,6 +803,22 @@ def _maybe_inject_no_think_instruction(messages):
     return out
 
 
+def _thinking_suppressed_value():
+    """The `enable_thinking` value that SUPPRESSES an auto-primed thought block.
+
+    The polarity is inverted on Gemma 4 relative to every other family:
+      - Gemma 4: `enable_thinking=False` force-prepends the thought channel, so
+        `True` is what suppresses it (see prepare_prompt_lm's docstring).
+      - GLM-4.5, Qwen3, and the rest: the flag reads literally — `False`
+        suppresses, `True` asks the model to reason out loud.
+
+    Sending Gemma's polarity to GLM-4.5-Air made every reply open with a
+    `<think>` block and burn its token budget deliberating (measured on the
+    :8745 rehearsal, 2026-07-25 — 106 tokens at 1.3 tok/s, reply never reached).
+    """
+    return "gemma" in (model_id or "").lower()
+
+
 def prepare_prompt_lm(messages, skip_thinking_primer=None):
     """Format messages using mlx_lm's native chat template (fast text path).
 
@@ -839,7 +855,7 @@ def prepare_prompt_lm(messages, skip_thinking_primer=None):
     if skip_thinking_primer:
         # Template-level suppression of the thought-channel opener.
         # See module docstring + `_maybe_inject_no_think_instruction()`.
-        template_kwargs["enable_thinking"] = True
+        template_kwargs["enable_thinking"] = _thinking_suppressed_value()
     if hasattr(processor, "apply_chat_template"):
         prompt = processor.apply_chat_template(messages, **template_kwargs)
     else:
@@ -1742,6 +1758,37 @@ def _ensure_shadow_slots():
     return _lcp_shadow_slots
 
 
+def _invalidate_cross_turn_caches(reason):
+    """Drop ALL cross-turn cache state — KV contents and bookkeeping.
+
+    Must run after any weight mutation (LoRA adapter swap or revert): every
+    cached KV entry was computed under the OLD weights, so reusing it — via
+    the legacy system-hash trim or live LCP slot reuse — would blend stale
+    activations into new-weight generation. Found live 2026-07-25: the swap
+    endpoint changed weights while the legacy system-boundary cache and the
+    LCP slots kept their KV.
+    """
+    global _cached_system_hash, _cached_system_ntokens
+    global _lcp_shadow_slots, _lcp_pending_tokens, _lcp_pending_slot
+
+    _cached_system_hash = None
+    _cached_system_ntokens = 0
+    _lcp_shadow_slots = None
+    _lcp_pending_tokens = None
+    _lcp_pending_slot = None
+    if lm_cache_slots:
+        for idx, slot in enumerate(lm_cache_slots):
+            n = _cache_offset(slot["cache"])
+            if n > 0 and _trim_cache(slot["cache"], n) != n:
+                _reinit_cache_slot(idx)  # trim untrustworthy — rebuild the slot
+            slot["prev_tokens"] = None
+    elif lm_prompt_cache is not None:
+        _trim_cache(lm_prompt_cache, _cache_offset(lm_prompt_cache))
+    if turbo_cache is not None:
+        _trim_cache(turbo_cache, _cache_offset(turbo_cache))
+    print(f"  [cache] cross-turn caches invalidated ({reason})", flush=True)
+
+
 def _prepare_cache_for_request(messages):
     """Trim cache back to system prompt boundary for cross-turn reuse.
 
@@ -2519,6 +2566,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         old_adapter = adapter_path_global
         new_adapter = str(resolved)
         # Serialize against inference. Block; adapter swap is rare.
+        # The finally below runs on every path (success, revert, revert-
+        # failure): once _apply_adapter_weights has been attempted, cached
+        # KV can no longer be trusted to match the live weights.
         with model_lock:
             try:
                 n_tensors = _apply_adapter_weights(new_adapter)
@@ -2552,6 +2602,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "reverted_to": old_adapter,
                 })
                 return
+            finally:
+                _invalidate_cross_turn_caches("adapter swap")
 
     def do_POST(self):
         if self.path == "/v1/adapters/swap":

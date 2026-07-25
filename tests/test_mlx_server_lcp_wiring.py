@@ -188,6 +188,67 @@ def test_partial_trim_reinitializes_only_that_slot(srv):
     assert srv.lm_prompt_cache is srv.lm_cache_slots[0]["cache"]
 
 
+def test_invalidate_cross_turn_caches_resets_everything(srv):
+    # Arm the shadow simulation FIRST (its legacy call invalidates the
+    # active slot's bookkeeping), then live slot state, then legacy fields.
+    srv.lcp_mode = "shadow"
+    srv._plan_cache_for_prompt([{"role": "system", "content": "s"}], P1)
+    srv.lcp_mode = "live"
+    _prefill(srv, srv._plan_cache_for_prompt([], P1), generated=11)
+    srv._cached_system_hash = 12345
+    srv._cached_system_ntokens = 77
+    assert srv.lm_cache_slots[0]["prev_tokens"] is not None
+    assert srv._lcp_shadow_slots is not None
+
+    srv._invalidate_cross_turn_caches("test")
+
+    # KV computed under old weights must be unreachable everywhere.
+    for slot in srv.lm_cache_slots:
+        assert slot["prev_tokens"] is None
+        assert srv._cache_offset(slot["cache"]) == 0
+    assert srv._lcp_shadow_slots is None
+    assert srv._cached_system_hash is None
+    assert srv._cached_system_ntokens == 0
+    assert srv._lcp_pending_tokens is None
+
+
+def test_invalidate_is_safe_with_no_cache_state(srv):
+    srv.lm_prompt_cache = None
+    srv.lm_cache_slots = None
+    srv._invalidate_cross_turn_caches("test")  # must not raise
+
+
+def test_adapter_swap_invalidates_caches(srv, tmp_path):
+    # The wiring test: the HTTP swap handler itself must reset cache state,
+    # because swapped LoRA weights make every cached KV entry stale.
+    import io
+    import json as _json
+
+    _prefill(srv, srv._plan_cache_for_prompt([], P1), generated=11)
+    srv._cached_system_hash = 12345
+    srv._cached_system_ntokens = 77
+    assert srv._cache_offset(srv.lm_cache_slots[0]["cache"]) > 0
+
+    (tmp_path / "adapters.safetensors").write_bytes(b"")
+    srv._apply_adapter_weights = lambda path: 42  # weights swap "succeeds"
+
+    body = _json.dumps({"adapter_path": str(tmp_path)}).encode()
+    handler = object.__new__(srv.ChatHandler)
+    handler.headers = {"Content-Length": str(len(body))}
+    handler.rfile = io.BytesIO(body)
+    responses = []
+    handler._send_json = lambda code, obj: responses.append((code, obj))
+
+    handler._handle_adapter_swap()
+
+    assert responses and responses[0][0] == 200
+    for slot in srv.lm_cache_slots:
+        assert slot["prev_tokens"] is None
+        assert srv._cache_offset(slot["cache"]) == 0
+    assert srv._cached_system_hash is None
+    assert srv._cached_system_ntokens == 0
+
+
 def test_legacy_path_invalidates_active_slot_bookkeeping(srv):
     _prefill(srv, srv._plan_cache_for_prompt([], P1))
     assert srv.lm_cache_slots[0]["prev_tokens"] is not None
