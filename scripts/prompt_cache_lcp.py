@@ -19,6 +19,18 @@ Modes (mirrors h-uman's off/shadow/live gate discipline):
 
 MODES = ("off", "shadow", "live")
 
+# Below this LCP, reusing a slot isn't worth evicting whatever it holds —
+# interleaved callers on :8741 share only a ~6-9 token chat-template
+# preamble, and evicting the daemon's ~16KB persona head to save that
+# preamble is exactly the failure the slot pool exists to prevent.
+DEFAULT_SLOT_FLOOR = 64
+
+# Each slot pins real KV memory (a 5K-token prompt at kv_bits=8 on a 31B
+# model is on the order of a GB), so the pool stays small no matter what
+# the config asks for.
+MAX_SLOTS = 4
+DEFAULT_SLOTS = 2
+
 
 def parse_mode(raw, default="shadow"):
     """Parse an LCP mode string. Unknown values fail closed to 'off'."""
@@ -75,3 +87,51 @@ def plan_reuse(prev_tokens, new_tokens, cache_size):
     if reuse <= 0:
         return 0, cache_size
     return reuse, cache_size - reuse
+
+
+def parse_slots(raw, default=DEFAULT_SLOTS):
+    """Parse the slot-pool size, clamped to [1, MAX_SLOTS]."""
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(n, MAX_SLOTS))
+
+
+def choose_slot(slot_prev_tokens, slot_last_used, new_tokens, floor=DEFAULT_SLOT_FLOOR):
+    """Pick which cache slot serves a new request.
+
+    slot_prev_tokens: per-slot token lists (None/[] = empty slot)
+    slot_last_used:   per-slot monotonic use counters (higher = more recent)
+    new_tokens:       the new request's full prompt token ids
+    floor:            minimum LCP worth reusing a slot for
+
+    Returns (slot_idx, reuse):
+      reuse > 0  — reuse `reuse` prefix tokens of slot slot_idx
+      reuse == 0 — reset slot slot_idx and prefill from scratch
+
+    Eviction policy: if no slot clears the floor, recycle an EMPTY slot
+    first, else the least-recently-used one — never the best-LCP slot.
+    This is what lets a big stable-head slot survive interleaved
+    small-probe traffic that only matches the chat-template preamble.
+    """
+    n = len(slot_prev_tokens)
+    if n == 0:
+        return 0, 0
+    cap = max(0, len(new_tokens) - 1)
+
+    best_idx, best_lcp = 0, -1
+    for i, prev in enumerate(slot_prev_tokens):
+        lcp = min(common_prefix_len(prev, new_tokens), cap) if prev else 0
+        # Tie-break to the most recently used so the LRU slot stays
+        # available for eviction.
+        if lcp > best_lcp or (lcp == best_lcp and slot_last_used[i] > slot_last_used[best_idx]):
+            best_idx, best_lcp = i, lcp
+    if best_lcp >= floor and best_lcp > 0:
+        return best_idx, best_lcp
+
+    for i, prev in enumerate(slot_prev_tokens):
+        if not prev:
+            return i, 0
+    lru_idx = min(range(n), key=lambda i: slot_last_used[i])
+    return lru_idx, 0

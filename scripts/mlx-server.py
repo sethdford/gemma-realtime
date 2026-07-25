@@ -166,6 +166,8 @@ def _load_human_config():
             defaults["prompt_cache"] = bool(mlx["prompt_cache"])
         if "prompt_cache_lcp" in mlx:
             defaults["prompt_cache_lcp"] = str(mlx["prompt_cache_lcp"])
+        if mlx.get("prompt_cache_slots") is not None:
+            defaults["prompt_cache_slots"] = mlx["prompt_cache_slots"]
         if "iosurface_kv" in mlx:
             defaults["iosurface_kv"] = bool(mlx["iosurface_kv"])
         if mlx.get("iosurface_kv_bytes") is not None:
@@ -299,9 +301,20 @@ lm_quantized_kv_group_size = 64
 # whole-system-hash scheme above hits 0% on h-uman's per-turn prompts).
 # Modes: off (legacy only) / shadow (legacy + measurement log) / live
 # (trim to longest common token prefix, prefill only the suffix).
+#
+# Multi-slot pool (2026-07-25): :8741 serves interleaved callers — the
+# daemon's ~4K-token persona turns mixed with 162-547-token probes — so a
+# single slot only ever matches the chat-template preamble (6-9 tokens
+# measured in shadow). N small slots let the big-head slot survive the
+# probe traffic; lm_prompt_cache always points at the ACTIVE slot's cache
+# list so _kv_kwargs/health/legacy paths need no knowledge of the pool.
 lcp_mode = "off"
-_lcp_prev_tokens = None   # prompt tokens whose KV the cache currently holds
+lm_cache_slot_count = 2   # config mlx_local.prompt_cache_slots, clamped 1..4
+lm_cache_slots = None     # [{"cache": list, "prev_tokens": list|None, "last_used": int}]
+_lcp_shadow_slots = None  # shadow-mode simulation of the pool (token lists only)
 _lcp_pending_tokens = None  # this request's tokens; promoted at prefill-done
+_lcp_pending_slot = None    # slot index the pending tokens belong to
+_lcp_request_counter = 0    # monotonic clock for slot LRU
 _lcp_last = {}            # last request's stats, surfaced via /health
 
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
@@ -1556,7 +1569,7 @@ def _init_lm_prompt_cache():
     (Gemma 4 sliding-window attention) raises NotImplementedError on
     quantization, so we detect that and disable kv_bits for that path.
     """
-    global lm_prompt_cache, lm_cache_supports_quant
+    global lm_prompt_cache, lm_cache_supports_quant, lm_cache_slots
     if turbo_cache is not None or model is None or use_lm_path is False:
         return None
     try:
@@ -1577,7 +1590,10 @@ def _init_lm_prompt_cache():
         tag = f" (kv_bits={int(kv_bits)})" if kv_bits is not None and lm_cache_supports_quant else ""
         if kv_bits is not None and not lm_cache_supports_quant:
             tag = f" (kv_bits requested but {cache_type} unsupported in stock mlx_lm — install TurboQuant+)"
-        print(f"  Stock mlx_lm prompt cache initialized: {len(lm_prompt_cache)} layers of {cache_type}{tag}", flush=True)
+        lm_cache_slots = None  # rebuild the slot pool around the fresh cache
+        slots = _ensure_cache_slots() or []
+        print(f"  Stock mlx_lm prompt cache initialized: {len(lm_prompt_cache)} layers of {cache_type}{tag}"
+              f" x {len(slots)} slot(s)", flush=True)
         return lm_prompt_cache
     except Exception as e:
         print(f"  Stock mlx_lm prompt cache init failed: {e}", flush=True)
@@ -1647,6 +1663,85 @@ def _active_prompt_cache():
     return None
 
 
+def _fresh_lm_cache():
+    """A new empty prompt-cache list matching the model's layer structure.
+
+    Falls back to cloning the layer-cache types of the existing list when no
+    model is loaded (wiring tests) — KVCache and friends are no-arg there.
+    Returns None if neither route works.
+    """
+    if model is not None:
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+            return make_prompt_cache(model)
+        except Exception:
+            return None
+    if lm_prompt_cache:
+        try:
+            return [type(c)() for c in lm_prompt_cache]
+        except Exception:
+            return None
+    return None
+
+
+def _ensure_cache_slots():
+    """Adopt lm_prompt_cache into the slot pool (idempotent).
+
+    Slot 0 wraps the current lm_prompt_cache; the remaining slots get fresh
+    empty caches. Empty caches hold no tensors, so an idle pool costs
+    nothing — memory is only pinned by slots that have actually prefilled.
+    """
+    global lm_cache_slots
+    if lm_prompt_cache is None:
+        return None
+    if lm_cache_slots:
+        return lm_cache_slots
+    slots = [{"cache": lm_prompt_cache, "prev_tokens": None, "last_used": 0}]
+    while len(slots) < max(1, int(lm_cache_slot_count)):
+        fresh = _fresh_lm_cache()
+        if fresh is None:
+            break
+        slots.append({"cache": fresh, "prev_tokens": None, "last_used": 0})
+    lm_cache_slots = slots
+    return lm_cache_slots
+
+
+def _lcp_active_slot():
+    """The slot whose cache lm_prompt_cache currently points at, or None."""
+    if not lm_cache_slots:
+        return None
+    for slot in lm_cache_slots:
+        if slot["cache"] is lm_prompt_cache:
+            return slot
+    return None
+
+
+def _reinit_cache_slot(idx):
+    """Fail-safe: rebuild one slot's cache after a trim we can't trust."""
+    global lm_prompt_cache
+    slot = lm_cache_slots[idx]
+    was_active = slot["cache"] is lm_prompt_cache
+    fresh = _fresh_lm_cache()
+    if fresh is not None:
+        slot["cache"] = fresh
+    else:
+        # Can't rebuild (no model, clone failed) — hard-reset what's there.
+        _trim_cache(slot["cache"], _cache_offset(slot["cache"]))
+    slot["prev_tokens"] = None
+    if was_active:
+        lm_prompt_cache = slot["cache"]
+
+
+def _ensure_shadow_slots():
+    """Shadow mode simulates the pool with token lists only — no KV, no
+    mutation of the real cache (which the legacy path keeps managing)."""
+    global _lcp_shadow_slots
+    n = max(1, int(lm_cache_slot_count))
+    if not _lcp_shadow_slots or len(_lcp_shadow_slots) != n:
+        _lcp_shadow_slots = [{"prev_tokens": None, "last_used": 0} for _ in range(n)]
+    return _lcp_shadow_slots
+
+
 def _prepare_cache_for_request(messages):
     """Trim cache back to system prompt boundary for cross-turn reuse.
 
@@ -1654,12 +1749,15 @@ def _prepare_cache_for_request(messages):
     re-process the new user/assistant tokens. If it changed (or this is
     the first request), the cache is fully reset.
     """
-    global _cached_system_hash, _cached_system_ntokens, _lcp_prev_tokens
+    global _cached_system_hash, _cached_system_ntokens
 
-    # Any legacy-managed request invalidates the LCP bookkeeping: after this
-    # function mutates the cache, _lcp_prev_tokens no longer describes the
-    # cache's token prefix.
-    _lcp_prev_tokens = None
+    # Any legacy-managed request invalidates the LCP bookkeeping for the
+    # slot it mutates: after this function runs, that slot's prev_tokens no
+    # longer describes its cache's token prefix. Only the ACTIVE slot is
+    # touched here — the others keep their KV state and bookkeeping.
+    _slot = _lcp_active_slot()
+    if _slot is not None:
+        _slot["prev_tokens"] = None
 
     cache_list = _active_prompt_cache()
     if cache_list is None:
@@ -1714,15 +1812,22 @@ def _encode_like_stream_generate(text):
 def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
     """Per-request cache management. Returns the payload for stream_generate:
     the prompt string (off/shadow — legacy hash path manages the cache) or a
-    token-id list (live — cache trimmed to the LCP, suffix to prefill).
+    token-id list (live — chosen slot trimmed to the LCP, suffix to prefill).
 
     Live mode applies only on the stock lm_prompt_cache (turbo cache trim
     semantics are unproven) and when the caller allows it (non-speculative
     paths). Everything else falls back to legacy, keeping today's behavior.
+
+    Slot routing (both shadow and live): choose_slot picks the slot with
+    the best LCP; below the floor it recycles an empty/LRU slot instead of
+    evicting the best one, so the daemon's big-head slot survives
+    interleaved small-probe traffic.
     """
-    global _lcp_prev_tokens, _lcp_pending_tokens, _lcp_last
+    global lm_prompt_cache, _lcp_pending_tokens, _lcp_pending_slot
+    global _lcp_last, _lcp_request_counter
 
     _lcp_pending_tokens = None
+    _lcp_pending_slot = None
     live_ok = (
         lcp_mode == "live" and allow_lcp
         and turbo_cache is None and lm_prompt_cache is not None
@@ -1733,55 +1838,79 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
         return prompt_text
 
     if lcp_mode == "shadow":
-        # Measure what LCP would reuse, then run the legacy path unchanged.
+        # Measure what the multi-slot pool would reuse, then run the legacy
+        # path unchanged. The simulation lives entirely in token lists, so
+        # legacy cache mutation can't corrupt it.
         try:
-            from prompt_cache_lcp import plan_reuse
+            from prompt_cache_lcp import choose_slot
             tokens = _encode_like_stream_generate(prompt_text)
-            prev = _lcp_prev_tokens
-            cache_size = _cache_offset(_active_prompt_cache() or [])
-            reuse, _ = plan_reuse(prev, tokens, cache_size)
+            sim = _ensure_shadow_slots()
+            slot_idx, reuse = choose_slot(
+                [s["prev_tokens"] for s in sim],
+                [s["last_used"] for s in sim], tokens)
+            _lcp_request_counter += 1
             _lcp_last = {"mode": "shadow", "would_reuse": reuse,
-                         "prompt_tokens": len(tokens)}
+                         "prompt_tokens": len(tokens),
+                         "slot": slot_idx, "slots": len(sim),
+                         "slot_hit": reuse > 0}
             print(f"  [lcp shadow] would reuse {reuse}/{len(tokens)} prompt toks "
-                  f"(cache={cache_size})", flush=True)
-            _prepare_cache_for_request(messages)  # legacy (invalidates prev)
-            _lcp_prev_tokens = tokens  # rearm measurement for next request
+                  f"(slot {slot_idx}, best-of-{len(sim)}, "
+                  f"{'hit' if reuse > 0 else 'miss'})", flush=True)
+            _prepare_cache_for_request(messages)  # legacy manages the real cache
+            sim[slot_idx] = {"prev_tokens": tokens,
+                             "last_used": _lcp_request_counter}
         except Exception as e:
             print(f"  [lcp shadow] measurement failed: {e}", flush=True)
             _prepare_cache_for_request(messages)
         return prompt_text
 
-    # live
-    from prompt_cache_lcp import plan_reuse
+    # live — route the request to the best slot, or recycle an empty/LRU one
+    from prompt_cache_lcp import choose_slot, plan_reuse
     tokens = _encode_like_stream_generate(prompt_text)
-    cache_list = lm_prompt_cache
-    cache_size = _cache_offset(cache_list)
-    reuse, trim_amount = plan_reuse(_lcp_prev_tokens, tokens, cache_size)
+    slots = _ensure_cache_slots()
+    slot_idx, planned = choose_slot(
+        [s["prev_tokens"] for s in slots],
+        [s["last_used"] for s in slots], tokens)
+    slot = slots[slot_idx]
+    lm_prompt_cache = slot["cache"]  # _kv_kwargs routes this into stream_generate
+    cache_size = _cache_offset(slot["cache"])
+    if planned > 0:
+        reuse, trim_amount = plan_reuse(slot["prev_tokens"], tokens, cache_size)
+    else:
+        reuse, trim_amount = 0, cache_size  # recycle the slot as a fresh cache
     if trim_amount > 0:
-        trimmed = _trim_cache(cache_list, trim_amount)
+        trimmed = _trim_cache(slot["cache"], trim_amount)
         if trimmed != trim_amount:
             # Fail-safe: partial/failed trim would leave KV state that does
-            # not match our bookkeeping — rebuild the cache and prefill all.
+            # not match our bookkeeping — rebuild THIS slot and prefill all.
             print(f"  [lcp live] trim {trim_amount} honored as {trimmed} — "
-                  f"reinitializing cache", flush=True)
-            _init_lm_prompt_cache()
+                  f"reinitializing slot {slot_idx}", flush=True)
+            _reinit_cache_slot(slot_idx)
             reuse = 0
-    _lcp_prev_tokens = None  # invalid until prefill completes
+    _lcp_request_counter += 1
+    slot["prev_tokens"] = None  # invalid until prefill completes
+    slot["last_used"] = _lcp_request_counter
     _lcp_pending_tokens = tokens
-    _lcp_last = {"mode": "live", "reused": reuse, "prompt_tokens": len(tokens)}
-    print(f"  [lcp live] reusing {reuse}/{len(tokens)} prompt toks, "
+    _lcp_pending_slot = slot_idx
+    _lcp_last = {"mode": "live", "reused": reuse, "prompt_tokens": len(tokens),
+                 "slot": slot_idx, "slots": len(slots)}
+    print(f"  [lcp live] reusing {reuse}/{len(tokens)} prompt toks "
+          f"(slot {slot_idx}, best-of-{len(slots)}), "
           f"prefilling {len(tokens) - reuse}", flush=True)
     return tokens[reuse:]
 
 
 def _after_prefill(messages):
     """Post-prefill bookkeeping for whichever cache scheme handled this
-    request: promote pending LCP tokens, or record the legacy system
-    boundary."""
-    global _lcp_prev_tokens, _lcp_pending_tokens
+    request: promote pending LCP tokens to their slot, or record the legacy
+    system boundary."""
+    global _lcp_pending_tokens, _lcp_pending_slot
     if _lcp_pending_tokens is not None:
-        _lcp_prev_tokens = _lcp_pending_tokens
+        if (lm_cache_slots and _lcp_pending_slot is not None
+                and 0 <= _lcp_pending_slot < len(lm_cache_slots)):
+            lm_cache_slots[_lcp_pending_slot]["prev_tokens"] = _lcp_pending_tokens
         _lcp_pending_tokens = None
+        _lcp_pending_slot = None
         return
     _record_system_cache_boundary(messages)
 
@@ -2019,8 +2148,16 @@ class ChatHandler(BaseHTTPRequestHandler):
                 health["turboquant_plus"] = turbo_cache is not None
             health["lm_prompt_cache_active"] = lm_prompt_cache is not None
             health["prompt_cache_lcp"] = lcp_mode
+            health["prompt_cache_lcp_slots"] = lm_cache_slot_count
             if _lcp_last:
                 health["prompt_cache_lcp_last"] = dict(_lcp_last)
+            if lm_cache_slots:
+                health["prompt_cache_lcp_slot_state"] = [
+                    {"prev_tokens": len(s["prev_tokens"] or []),
+                     "offset": _cache_offset(s["cache"]),
+                     "last_used": s["last_used"],
+                     "active": s["cache"] is lm_prompt_cache}
+                    for s in lm_cache_slots]
             if _cached_system_ntokens > 0 and _active_prompt_cache() is not None:
                 health["cached_system_tokens"] = _cached_system_ntokens
                 health["prompt_cache"] = "active"
@@ -2463,7 +2600,7 @@ def _env_int(name: str, default: int) -> int:
 
 def main():
     global kv_bits, kv_quant_scheme, prompt_cache_state, hw_info, speculative_draft_tokens
-    global server_realtime_mode, lcp_mode
+    global server_realtime_mode, lcp_mode, lm_cache_slot_count
 
     hc = _load_human_config()
     _apply_mlx_local_env_from_hc(hc)
@@ -2525,6 +2662,14 @@ Examples:
         help="Token-LCP cross-turn cache reuse: off (legacy hash only), "
              "shadow (legacy + log what LCP would reuse; default), live "
              "(trim to common prefix, prefill only the suffix).",
+    )
+    parser.add_argument(
+        "--prompt-cache-slots", type=int,
+        default=os.environ.get("MLX_PROMPT_CACHE_SLOTS",
+                               hc.get("prompt_cache_slots", 2)),
+        help="LCP cache slot-pool size (1-4, default 2). Each slot pins real "
+             "KV memory once prefilled, so keep this small; 2 covers the "
+             "big-daemon-plus-small-probes traffic on one port.",
     )
     parser.add_argument(
         "--speculative-draft", default=hc.get("speculative_draft"),
@@ -2600,11 +2745,12 @@ Examples:
         except ImportError:
             print("Prompt cache: not available (mlx_vlm.generate.PromptCacheState missing)", flush=True)
 
-    from prompt_cache_lcp import parse_mode as _lcp_parse_mode
+    from prompt_cache_lcp import parse_mode as _lcp_parse_mode, parse_slots as _lcp_parse_slots
     lcp_mode = "off" if args.no_prompt_cache else _lcp_parse_mode(args.prompt_cache_lcp)
+    lm_cache_slot_count = _lcp_parse_slots(args.prompt_cache_slots)
     print(f"Prompt cache LCP mode: {lcp_mode}"
-          + (" (token-prefix reuse ACTIVE)" if lcp_mode == "live" else
-             " (measurement only)" if lcp_mode == "shadow" else ""),
+          + (f" ({lm_cache_slot_count} slots, token-prefix reuse ACTIVE)" if lcp_mode == "live" else
+             f" ({lm_cache_slot_count} slots simulated, measurement only)" if lcp_mode == "shadow" else ""),
           flush=True)
 
     load_model(args.model, adapter_path=args.adapter_path)

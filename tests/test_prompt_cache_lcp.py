@@ -9,7 +9,15 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from prompt_cache_lcp import MODES, common_prefix_len, parse_mode, plan_reuse
+from prompt_cache_lcp import (
+    DEFAULT_SLOT_FLOOR,
+    MODES,
+    choose_slot,
+    common_prefix_len,
+    parse_mode,
+    parse_slots,
+    plan_reuse,
+)
 
 
 # ── parse_mode ──────────────────────────────────────────────────────────
@@ -97,3 +105,91 @@ def test_new_prompt_shorter_than_lcp_cap():
 
 def test_empty_new_prompt_resets():
     assert plan_reuse([1, 2], [], 2) == (0, 2)
+
+
+# ── parse_slots ─────────────────────────────────────────────────────────
+
+def test_parse_slots_default_and_clamping():
+    assert parse_slots(None) == 2
+    assert parse_slots("") == 2
+    assert parse_slots(3) == 3
+    assert parse_slots("3") == 3
+    assert parse_slots(0) == 1                 # floor at 1 (single-slot v1)
+    assert parse_slots(99) == 4                # each slot is real KV memory
+    assert parse_slots("garbage") == 2
+
+
+# ── choose_slot ─────────────────────────────────────────────────────────
+#
+# The pool exists so the daemon's big-persona-head slot SURVIVES interleaved
+# small-probe traffic on :8741. Every scenario below is a distillation of
+# that traffic shape.
+
+BIG = list(range(1000, 6000))                  # 5000-token daemon prompt
+PROBE = list(range(30))                        # small judge/gate probe
+PREAMBLE = BIG[:9]                             # shared chat-template preamble
+
+
+def test_choose_slot_picks_max_lcp_above_floor():
+    # Slot 0 holds the big head, slot 1 a probe. A same-caller big prompt
+    # (same head, new tail) must route to slot 0 with the full head reuse.
+    new = BIG[:4000] + list(range(90000, 90100))
+    idx, reuse = choose_slot([BIG, PROBE], [1, 2], new)
+    assert idx == 0
+    assert reuse == 4000
+
+
+def test_choose_slot_below_floor_prefers_empty_slot():
+    # A probe sharing only the 9-token preamble with the big slot must NOT
+    # evict it while an empty slot exists.
+    new = PREAMBLE + list(range(70000, 70020))
+    idx, reuse = choose_slot([BIG, None], [1, 0], new)
+    assert idx == 1
+    assert reuse == 0                          # fresh reset, no reuse
+
+
+def test_choose_slot_below_floor_no_empty_evicts_lru_not_best():
+    # Pool full, probe matches both slots only at the preamble (< floor).
+    # The LRU slot (the older probe) is recycled; the big slot survives
+    # even though it has the (marginally) longer LCP.
+    new = PREAMBLE + list(range(80000, 80020))
+    old_probe = PREAMBLE + list(range(60000, 60020))
+    idx, reuse = choose_slot([BIG, old_probe], [5, 2], new)
+    assert idx == 1                            # last_used 2 < 5 → LRU
+    assert reuse == 0
+
+
+def test_choose_slot_identical_prompt_caps_at_len_minus_one():
+    idx, reuse = choose_slot([BIG, None], [1, 0], list(BIG))
+    assert idx == 0
+    assert reuse == len(BIG) - 1               # mlx_lm needs 1 token to prefill
+
+
+def test_choose_slot_all_empty_uses_first_slot():
+    assert choose_slot([None, None, None], [0, 0, 0], BIG) == (0, 0)
+
+
+def test_choose_slot_tie_breaks_to_most_recent():
+    # Two slots with an identical qualifying LCP: prefer the most recently
+    # used so the LRU slot stays available for eviction.
+    head = list(range(200))
+    a = head + [11, 12, 13]
+    b = head + [21, 22, 23]
+    new = head + [31, 32, 33]
+    idx, reuse = choose_slot([a, b], [1, 2], new)
+    assert idx == 1
+    assert reuse == 200
+
+
+def test_choose_slot_floor_is_inclusive():
+    prev = list(range(DEFAULT_SLOT_FLOOR)) + [500]
+    new = list(range(DEFAULT_SLOT_FLOOR)) + [600]
+    idx, reuse = choose_slot([prev, None], [1, 0], new)
+    assert (idx, reuse) == (0, DEFAULT_SLOT_FLOOR)
+
+
+def test_choose_slot_short_prompt_never_reuses_negative():
+    # A 1-token prompt can never reuse (cap = len-1 = 0) → fresh slot.
+    idx, reuse = choose_slot([BIG, None], [1, 0], [BIG[0]])
+    assert reuse == 0
+    assert idx == 1                            # empty slot, big survives

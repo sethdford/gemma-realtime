@@ -3,6 +3,12 @@
 Exercises _plan_cache_for_prompt/_after_prefill against real mlx_lm KVCache
 objects (offset bookkeeping only — no model, no tensors) with a stub
 tokenizer. Requires mlx_lm; skipped where it isn't installed.
+
+Multi-slot upgrade: :8741 serves interleaved callers (the h-uman daemon's
+~4K-token persona turns mixed with 162-547-token probes), so a single slot
+degrades to reusing only the chat-template preamble. The pool exists so the
+daemon's big-head slot SURVIVES the interleaved probe traffic — that's the
+central scenario tested here.
 """
 import importlib.util
 import os
@@ -43,30 +49,37 @@ def srv():
     return srv
 
 
-HEAD = "persona head words " * 50            # 150 stable tokens
+HEAD = "persona head words " * 50            # 150 stable tokens (>= slot floor)
 P1 = HEAD + "alpha one memory sections here"
 P2 = HEAD + "beta two totally different middle content"
+PROBE_B = "judge this reply yes or no"       # 6 tokens, well below the floor
+PROBE_C = "gate check tiny probe request"    # ditto, different content
+
+
+def _ntok(text):
+    return len(FakeProc().encode(text))
 
 
 def _prefill(srv, payload, generated=0):
-    """Simulate prefill+generation: cache offset grows by prompt+generated."""
+    """Simulate prefill+generation: active cache offset grows by prompt+generated."""
     srv.lm_prompt_cache[0].offset += len(payload) + generated
     srv._after_prefill([])
 
 
+# ── v1 behaviors that must survive the multi-slot refactor ─────────────
+
 def test_first_request_prefills_everything(srv):
     payload = srv._plan_cache_for_prompt([], P1)
     assert isinstance(payload, list)
-    assert len(payload) == len(FakeProc().encode(P1))
+    assert len(payload) == _ntok(P1)
 
 
 def test_stable_head_reused_across_varying_tails(srv):
     payload1 = srv._plan_cache_for_prompt([], P1)
     _prefill(srv, payload1, generated=20)
 
-    toks2 = FakeProc().encode(P2)
     payload2 = srv._plan_cache_for_prompt([], P2)
-    reuse = len(toks2) - len(payload2)
+    reuse = _ntok(P2) - len(payload2)
     assert reuse == 150                      # the head (divergence at word 151)
     assert srv.lm_prompt_cache[0].offset == reuse  # generated tail trimmed off
 
@@ -78,7 +91,8 @@ def test_identical_prompt_leaves_one_token(srv):
     assert len(payload2) == 1
 
 
-def test_no_overlap_fully_resets(srv):
+def test_single_slot_no_overlap_fully_resets(srv):
+    srv.lm_cache_slot_count = 1              # v1-equivalent configuration
     payload1 = srv._plan_cache_for_prompt([], P1)
     _prefill(srv, payload1, generated=3)
     srv._plan_cache_for_prompt([], "zzz completely different prompt")
@@ -91,7 +105,7 @@ def test_shadow_mode_returns_string_and_measures(srv):
     out = srv._plan_cache_for_prompt([{"role": "system", "content": "s"}], P1)
     assert out == P1                          # legacy path manages the cache
     assert srv._lcp_last["mode"] == "shadow"
-    assert srv._lcp_last["prompt_tokens"] == len(FakeProc().encode(P1))
+    assert srv._lcp_last["prompt_tokens"] == _ntok(P1)
 
 
 def test_off_mode_returns_string(srv):
@@ -100,16 +114,84 @@ def test_off_mode_returns_string(srv):
     assert out == P1
 
 
-def test_legacy_path_invalidates_lcp_bookkeeping(srv):
-    payload1 = srv._plan_cache_for_prompt([], P1)
-    _prefill(srv, payload1)
-    assert srv._lcp_prev_tokens is not None
-    # A legacy-managed request (e.g. speculative path) must clear prev tokens
-    srv._prepare_cache_for_request([{"role": "system", "content": "s"}])
-    assert srv._lcp_prev_tokens is None
-
-
 def test_turbo_cache_disables_live_reuse(srv):
     srv.turbo_cache = [KVCache()]            # any active turbo cache
     out = srv._plan_cache_for_prompt([{"role": "system", "content": "s"}], P1)
     assert out == P1                          # falls back to legacy string path
+
+
+# ── multi-slot: the interleaved-traffic scenario ────────────────────────
+
+def test_probe_routes_to_empty_slot_and_leaves_big_cache_untouched(srv):
+    payload1 = srv._plan_cache_for_prompt([], P1)
+    _prefill(srv, payload1, generated=20)
+    big_cache = srv.lm_prompt_cache
+    big_offset = big_cache[0].offset
+
+    payload_b = srv._plan_cache_for_prompt([], PROBE_B)
+    assert len(payload_b) == _ntok(PROBE_B)   # full prefill, no reuse
+    assert srv._lcp_last["slot"] == 1
+    assert srv.lm_prompt_cache is not big_cache   # routed away from big slot
+    assert big_cache[0].offset == big_offset      # big KV state untouched
+
+
+def test_interleaved_big_small_keeps_big_slot_reuse_high(srv):
+    # big A, small B, big A', small C, big A'' — the soak sequence.
+    _prefill(srv, srv._plan_cache_for_prompt([], P1), generated=20)   # A
+    _prefill(srv, srv._plan_cache_for_prompt([], PROBE_B), generated=5)   # B
+
+    payload = srv._plan_cache_for_prompt([], P2)                      # A'
+    assert _ntok(P2) - len(payload) == 150     # shared head fully reused
+    assert srv._lcp_last["slot"] == 0
+    _prefill(srv, payload, generated=9)
+
+    _prefill(srv, srv._plan_cache_for_prompt([], PROBE_C), generated=5)   # C
+    assert srv._lcp_last["slot"] == 1          # LRU probe slot recycled
+
+    payload = srv._plan_cache_for_prompt([], P1)                      # A''
+    assert _ntok(P1) - len(payload) == 150     # big slot survived both probes
+    assert srv._lcp_last["slot"] == 0
+
+
+def test_live_reports_slot_stats(srv):
+    srv._plan_cache_for_prompt([], P1)
+    assert srv._lcp_last["mode"] == "live"
+    assert srv._lcp_last["slot"] == 0
+    assert srv._lcp_last["slots"] == 2
+
+
+def test_shadow_simulates_slot_pool(srv):
+    srv.lcp_mode = "shadow"
+    msgs = [{"role": "system", "content": "s"}]
+    srv._plan_cache_for_prompt(msgs, P1)       # A  → sim slot 0
+    srv._plan_cache_for_prompt(msgs, PROBE_B)  # B  → sim slot 1
+    assert srv._lcp_last["slot"] == 1
+    assert srv._lcp_last["would_reuse"] == 0
+
+    srv._plan_cache_for_prompt(msgs, P2)       # A' → sim slot 0, head hit
+    assert srv._lcp_last["slot"] == 0
+    assert srv._lcp_last["slots"] == 2
+    assert srv._lcp_last["would_reuse"] == 150
+    assert srv._lcp_last["slot_hit"] is True
+
+
+# ── fail-safes ──────────────────────────────────────────────────────────
+
+def test_partial_trim_reinitializes_only_that_slot(srv):
+    _prefill(srv, srv._plan_cache_for_prompt([], P1), generated=20)
+    srv._trim_cache = lambda cache_list, n: 0  # trim silently fails
+
+    payload = srv._plan_cache_for_prompt([], P2)
+    assert len(payload) == _ntok(P2)           # reuse abandoned, prefill all
+    assert srv._lcp_last["reused"] == 0
+    assert srv.lm_prompt_cache[0].offset == 0  # slot rebuilt fresh
+    assert srv.lm_prompt_cache is srv.lm_cache_slots[0]["cache"]
+
+
+def test_legacy_path_invalidates_active_slot_bookkeeping(srv):
+    _prefill(srv, srv._plan_cache_for_prompt([], P1))
+    assert srv.lm_cache_slots[0]["prev_tokens"] is not None
+    # A legacy-managed request (e.g. speculative path) mutates the active
+    # slot's cache — its prev-token bookkeeping must be dropped.
+    srv._prepare_cache_for_request([{"role": "system", "content": "s"}])
+    assert srv.lm_cache_slots[0]["prev_tokens"] is None
