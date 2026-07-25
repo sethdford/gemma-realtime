@@ -164,6 +164,8 @@ def _load_human_config():
                 pass
         if "prompt_cache" in mlx:
             defaults["prompt_cache"] = bool(mlx["prompt_cache"])
+        if "prompt_cache_lcp" in mlx:
+            defaults["prompt_cache_lcp"] = str(mlx["prompt_cache_lcp"])
         if "iosurface_kv" in mlx:
             defaults["iosurface_kv"] = bool(mlx["iosurface_kv"])
         if mlx.get("iosurface_kv_bytes") is not None:
@@ -292,6 +294,15 @@ _cached_system_ntokens = 0
 lm_prompt_cache = None
 lm_cache_quantized_start = 0
 lm_quantized_kv_group_size = 64
+
+# Token-level LCP prompt-cache reuse (see prompt_cache_lcp.py for why the
+# whole-system-hash scheme above hits 0% on h-uman's per-turn prompts).
+# Modes: off (legacy only) / shadow (legacy + measurement log) / live
+# (trim to longest common token prefix, prefill only the suffix).
+lcp_mode = "off"
+_lcp_prev_tokens = None   # prompt tokens whose KV the cache currently holds
+_lcp_pending_tokens = None  # this request's tokens; promoted at prefill-done
+_lcp_last = {}            # last request's stats, surfaced via /health
 
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
 THINKING_TOKENS = frozenset({"|", "|\n", "\n|", "\n"})
@@ -1327,6 +1338,17 @@ class StreamThoughtFilter:
     def __init__(self, mode: str = "strip"):
         self.buf = ""
         self.mode = mode
+        # Bullet-deliberation hold state. seth-lora-v4-repair deliberates in
+        # bare markdown bullets that carry NO channel markers, so the marker
+        # strip below can't catch them and they leak token-by-token to the
+        # client (confirmed live 2026-05-28). When the FIRST non-marker content
+        # of a response is a markdown bullet, we switch to hold-and-strip: keep
+        # buffering, emit nothing, and let flush() run the full
+        # strip_thought_channels extractor on the complete text. Clean
+        # reply-first responses (no leading bullet) are unaffected and still
+        # stream incrementally.
+        self._emitted_any = False
+        self._holding_bullets = False
 
     def feed(self, chunk):
         if not chunk:
@@ -1350,6 +1372,27 @@ class StreamThoughtFilter:
         return 0
 
     def _feed_strip(self):
+        # Once committed to holding bullet deliberation, emit nothing until
+        # flush() — the full text is needed to extract the real reply.
+        if self._holding_bullets:
+            return ""
+        # Before the first emit, decide whether this response opens with
+        # markdown-bullet deliberation. Defer the decision until we have a few
+        # post-marker chars (or a newline) so a lone leading "*" token isn't
+        # misjudged mid-stream.
+        if not self._emitted_any:
+            probe = self.buf.replace(self.OPEN, "").replace(self.CLOSE, "").lstrip()
+            if probe and (len(probe) >= 4 or "\n" in self.buf):
+                # A markdown bullet is "*" followed by whitespace (or another
+                # "*"). "*emphasis*" replies start with "*"+letter and are NOT
+                # held. probe is already lstrip'd, so index 0 is the first
+                # non-space char.
+                if probe[0] == "*" and (len(probe) < 2 or probe[1] in " \t\n*"):
+                    self._holding_bullets = True
+                    return ""
+            elif probe:
+                # Not enough leading content to classify yet — keep buffering.
+                return ""
         keep = self._tail_could_be_marker_prefix()
         emit_end = len(self.buf) - keep if keep > 0 else len(self.buf)
         if emit_end <= 0:
@@ -1357,6 +1400,8 @@ class StreamThoughtFilter:
         emit = self.buf[:emit_end]
         self.buf = self.buf[emit_end:]
         emit = emit.replace(self.OPEN, "").replace(self.CLOSE, "")
+        if emit.strip():
+            self._emitted_any = True
         return emit
 
     def _feed_discard(self):
@@ -1403,6 +1448,11 @@ class StreamThoughtFilter:
             return ""
         out = self.buf
         self.buf = ""
+        if self._holding_bullets:
+            # Bullet deliberation was detected and held; extract the real reply
+            # from the complete text using the same logic the non-stream and
+            # buffered-stream paths use, so no deliberation leaks.
+            return strip_thought_channels(out)
         return out.replace(self.OPEN, "").replace(self.CLOSE, "")
 
 
@@ -1604,7 +1654,12 @@ def _prepare_cache_for_request(messages):
     re-process the new user/assistant tokens. If it changed (or this is
     the first request), the cache is fully reset.
     """
-    global _cached_system_hash, _cached_system_ntokens
+    global _cached_system_hash, _cached_system_ntokens, _lcp_prev_tokens
+
+    # Any legacy-managed request invalidates the LCP bookkeeping: after this
+    # function mutates the cache, _lcp_prev_tokens no longer describes the
+    # cache's token prefix.
+    _lcp_prev_tokens = None
 
     cache_list = _active_prompt_cache()
     if cache_list is None:
@@ -1646,6 +1701,91 @@ def _record_system_cache_boundary(messages):
         pass
 
 
+def _encode_like_stream_generate(text):
+    """Tokenize exactly the way mlx_lm.stream_generate tokenizes str prompts:
+    add special tokens only when the text doesn't already start with BOS.
+    Keeping this identical is what makes passing token ids in live mode a
+    no-op on model input."""
+    bos = getattr(processor, "bos_token", None)
+    add_special = bos is None or not text.startswith(bos)
+    return list(processor.encode(text, add_special_tokens=add_special))
+
+
+def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
+    """Per-request cache management. Returns the payload for stream_generate:
+    the prompt string (off/shadow — legacy hash path manages the cache) or a
+    token-id list (live — cache trimmed to the LCP, suffix to prefill).
+
+    Live mode applies only on the stock lm_prompt_cache (turbo cache trim
+    semantics are unproven) and when the caller allows it (non-speculative
+    paths). Everything else falls back to legacy, keeping today's behavior.
+    """
+    global _lcp_prev_tokens, _lcp_pending_tokens, _lcp_last
+
+    _lcp_pending_tokens = None
+    live_ok = (
+        lcp_mode == "live" and allow_lcp
+        and turbo_cache is None and lm_prompt_cache is not None
+    )
+
+    if lcp_mode == "off" or (lcp_mode == "live" and not live_ok):
+        _prepare_cache_for_request(messages)
+        return prompt_text
+
+    if lcp_mode == "shadow":
+        # Measure what LCP would reuse, then run the legacy path unchanged.
+        try:
+            from prompt_cache_lcp import plan_reuse
+            tokens = _encode_like_stream_generate(prompt_text)
+            prev = _lcp_prev_tokens
+            cache_size = _cache_offset(_active_prompt_cache() or [])
+            reuse, _ = plan_reuse(prev, tokens, cache_size)
+            _lcp_last = {"mode": "shadow", "would_reuse": reuse,
+                         "prompt_tokens": len(tokens)}
+            print(f"  [lcp shadow] would reuse {reuse}/{len(tokens)} prompt toks "
+                  f"(cache={cache_size})", flush=True)
+            _prepare_cache_for_request(messages)  # legacy (invalidates prev)
+            _lcp_prev_tokens = tokens  # rearm measurement for next request
+        except Exception as e:
+            print(f"  [lcp shadow] measurement failed: {e}", flush=True)
+            _prepare_cache_for_request(messages)
+        return prompt_text
+
+    # live
+    from prompt_cache_lcp import plan_reuse
+    tokens = _encode_like_stream_generate(prompt_text)
+    cache_list = lm_prompt_cache
+    cache_size = _cache_offset(cache_list)
+    reuse, trim_amount = plan_reuse(_lcp_prev_tokens, tokens, cache_size)
+    if trim_amount > 0:
+        trimmed = _trim_cache(cache_list, trim_amount)
+        if trimmed != trim_amount:
+            # Fail-safe: partial/failed trim would leave KV state that does
+            # not match our bookkeeping — rebuild the cache and prefill all.
+            print(f"  [lcp live] trim {trim_amount} honored as {trimmed} — "
+                  f"reinitializing cache", flush=True)
+            _init_lm_prompt_cache()
+            reuse = 0
+    _lcp_prev_tokens = None  # invalid until prefill completes
+    _lcp_pending_tokens = tokens
+    _lcp_last = {"mode": "live", "reused": reuse, "prompt_tokens": len(tokens)}
+    print(f"  [lcp live] reusing {reuse}/{len(tokens)} prompt toks, "
+          f"prefilling {len(tokens) - reuse}", flush=True)
+    return tokens[reuse:]
+
+
+def _after_prefill(messages):
+    """Post-prefill bookkeeping for whichever cache scheme handled this
+    request: promote pending LCP tokens, or record the legacy system
+    boundary."""
+    global _lcp_prev_tokens, _lcp_pending_tokens
+    if _lcp_pending_tokens is not None:
+        _lcp_prev_tokens = _lcp_pending_tokens
+        _lcp_pending_tokens = None
+        return
+    _record_system_cache_boundary(messages)
+
+
 def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_primer=None):
     """Non-streaming: generate the full response at once.
 
@@ -1672,8 +1812,8 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
     if use_lm_path and not has_imgs:
         from mlx_lm import stream_generate as lm_stream_generate
         from mlx_lm.sample_utils import make_sampler
-        _prepare_cache_for_request(messages)
         prompt = prepare_prompt_lm(messages, skip_thinking_primer)
+        prompt = _plan_cache_for_prompt(messages, prompt)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
         _rp = _repetition_logits_processors()
@@ -1690,7 +1830,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
         ):
             if not prefill_done:
                 _compact_turbo_cache()
-                _record_system_cache_boundary(messages)
+                _after_prefill(messages)
                 prefill_done = True
             prompt_toks_out = getattr(resp, "prompt_tokens", prompt_toks_out)
             gen_toks_out = getattr(resp, "generation_tokens", gen_toks_out)
@@ -1793,8 +1933,8 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
         from mlx_lm import stream_generate as lm_stream_generate
         from mlx_lm.sample_utils import make_sampler
 
-        _prepare_cache_for_request(messages)
         prompt = prepare_prompt_lm(messages, skip_thinking_primer)
+        prompt = _plan_cache_for_prompt(messages, prompt)
         extra = _kv_kwargs()
         extra["sampler"] = make_sampler(temp=temperature)
         _rp = _repetition_logits_processors()
@@ -1809,7 +1949,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
         ):
             if not prefill_done:
                 _compact_turbo_cache()
-                _record_system_cache_boundary(messages)
+                _after_prefill(messages)
                 prefill_done = True
             prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
             gen_toks = getattr(resp, "generation_tokens", gen_toks)
@@ -1878,6 +2018,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                 health["kv_quant_scheme"] = kv_quant_scheme
                 health["turboquant_plus"] = turbo_cache is not None
             health["lm_prompt_cache_active"] = lm_prompt_cache is not None
+            health["prompt_cache_lcp"] = lcp_mode
+            if _lcp_last:
+                health["prompt_cache_lcp_last"] = dict(_lcp_last)
             if _cached_system_ntokens > 0 and _active_prompt_cache() is not None:
                 health["cached_system_tokens"] = _cached_system_ntokens
                 health["prompt_cache"] = "active"
@@ -2320,7 +2463,7 @@ def _env_int(name: str, default: int) -> int:
 
 def main():
     global kv_bits, kv_quant_scheme, prompt_cache_state, hw_info, speculative_draft_tokens
-    global server_realtime_mode
+    global server_realtime_mode, lcp_mode
 
     hc = _load_human_config()
     _apply_mlx_local_env_from_hc(hc)
@@ -2374,6 +2517,14 @@ Examples:
     parser.add_argument(
         "--no-prompt-cache", action="store_true",
         help="Disable cross-turn prompt cache reuse.",
+    )
+    parser.add_argument(
+        "--prompt-cache-lcp",
+        default=os.environ.get("MLX_PROMPT_CACHE_LCP",
+                               hc.get("prompt_cache_lcp", "shadow")),
+        help="Token-LCP cross-turn cache reuse: off (legacy hash only), "
+             "shadow (legacy + log what LCP would reuse; default), live "
+             "(trim to common prefix, prefill only the suffix).",
     )
     parser.add_argument(
         "--speculative-draft", default=hc.get("speculative_draft"),
@@ -2448,6 +2599,13 @@ Examples:
             print("Prompt cache: cross-turn system prompt caching enabled (trim-and-reuse)", flush=True)
         except ImportError:
             print("Prompt cache: not available (mlx_vlm.generate.PromptCacheState missing)", flush=True)
+
+    from prompt_cache_lcp import parse_mode as _lcp_parse_mode
+    lcp_mode = "off" if args.no_prompt_cache else _lcp_parse_mode(args.prompt_cache_lcp)
+    print(f"Prompt cache LCP mode: {lcp_mode}"
+          + (" (token-prefix reuse ACTIVE)" if lcp_mode == "live" else
+             " (measurement only)" if lcp_mode == "shadow" else ""),
+          flush=True)
 
     load_model(args.model, adapter_path=args.adapter_path)
 
