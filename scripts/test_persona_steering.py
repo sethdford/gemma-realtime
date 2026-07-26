@@ -15,6 +15,66 @@ def _reset(installed, vectors=None):
     ps._STATE.update({"installed": installed, "vectors": vectors or {}, "active": {}})
 
 
+def _write_vec(path, n_layers, hidden):
+    """Write a <trait>.safetensors shaped [n_layers, hidden] under path."""
+    import mlx.core as mx
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(path), {"v": mx.zeros((n_layers, hidden))})
+
+
+# ── model-namespaced vectors ─────────────────────────────────────────────
+# A trait vector is [n_layers, hidden] for ONE architecture. The loader used a
+# single flat directory, so when production flipped gemma-4-31b-it-4bit (60
+# layers) -> GLM-4.5-Air-4bit (46) on 2026-07-26, the gemma vectors kept being
+# loaded and every model load logged `probe FAIL ... (60, 5376) != [46, hidden]`
+# while the server ran unsteered. Keyed by base, a flip strands nothing.
+
+def test_model_slug_strips_org_prefix():
+    assert ps.model_slug("mlx-community/GLM-4.5-Air-4bit") == "GLM-4.5-Air-4bit"
+    assert ps.model_slug("GLM-4.5-Air-4bit") == "GLM-4.5-Air-4bit"
+    assert ps.model_slug(None) == ""
+
+
+def test_vectors_are_loaded_from_the_per_model_dir(tmp=None):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        _write_vec(root / "GLM-4.5-Air-4bit" / "formality.safetensors", 46, 4096)
+        got = ps.load_vectors(root, model_id="mlx-community/GLM-4.5-Air-4bit")
+        assert set(got) == {"formality"}, got
+        assert tuple(got["formality"].shape) == (46, 4096)
+
+
+def test_other_models_vectors_are_not_loaded():
+    # The bug: gemma vectors served to a GLM process. With a per-model dir
+    # present for GLM, gemma's must not be reachable.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        _write_vec(root / "GLM-4.5-Air-4bit" / "formality.safetensors", 46, 4096)
+        _write_vec(root / "gemma-4-31b-it-4bit" / "warmth.safetensors", 60, 5376)
+        got = ps.load_vectors(root, model_id="mlx-community/GLM-4.5-Air-4bit")
+        assert "warmth" not in got, f"leaked another base's vectors: {list(got)}"
+        assert tuple(got["formality"].shape) == (46, 4096)
+
+
+def test_legacy_flat_dir_still_loads():
+    # Back-compat: existing installs keep working when no per-model dir exists.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        _write_vec(root / "formality.safetensors", 60, 5376)
+        got = ps.load_vectors(root, model_id="mlx-community/gemma-4-31b-it-4bit")
+        assert tuple(got["formality"].shape) == (60, 5376)
+
+
+def test_missing_dir_yields_no_vectors():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        got = ps.load_vectors(Path(d) / "nope", model_id="whatever/x")
+        assert got == {}, got
+
+
 def test_set_active_noop_when_not_installed():
     _reset(False)
     ps.set_active({"formality": 1.0})
@@ -79,7 +139,12 @@ def main():
     tests = [test_set_active_noop_when_not_installed, test_set_active_drops_unknown_traits,
              test_set_active_drops_zero_and_nonfinite, test_set_active_clamps_to_safe_envelope,
              test_set_active_coerces_numeric_strings,
-             test_clear_active, test_empty_active_means_noop_path, test_layer_band_parsing]
+             test_clear_active, test_empty_active_means_noop_path, test_layer_band_parsing,
+             test_model_slug_strips_org_prefix,
+             test_vectors_are_loaded_from_the_per_model_dir,
+             test_other_models_vectors_are_not_loaded,
+             test_legacy_flat_dir_still_loads,
+             test_missing_dir_yields_no_vectors]
     print("Testing persona_steering.py")
     print("=" * 60)
     p = f = 0

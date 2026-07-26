@@ -2866,9 +2866,13 @@ Examples:
     # gated (declines on shape/version mismatch) and default-off — no behavior
     # change until a request carries a "steering" field. Never breaks generation.
     try:
-        _steer_vecs = ps.load_vectors(os.path.expanduser("~/.human/persona_vectors"))
+        # Pass the base model id: vectors are only valid for the architecture
+        # they were extracted from, so they live in a per-model subdirectory.
+        _steer_vecs = ps.load_vectors(
+            os.path.expanduser("~/.human/persona_vectors"), model_id=args.model)
         if use_lm_path and _steer_vecs:
-            ps.install_steering(ps.get_layers(model), _steer_vecs)
+            ps.install_steering(ps.get_layers(model), _steer_vecs,
+                                model_id=args.model)
         elif _steer_vecs and not use_lm_path:
             print("[steering] vectors present but vlm path active; steering off", flush=True)
     except Exception as _steer_ex:  # noqa: BLE001

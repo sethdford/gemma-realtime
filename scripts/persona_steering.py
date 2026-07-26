@@ -46,21 +46,57 @@ def get_layers(model):
     raise RuntimeError("could not locate transformer layers on model")
 
 
-def load_vectors(out_dir):
-    """Load {trait: mx.array[n_layers, hidden]} from <out_dir>/<trait>.safetensors.
+def model_slug(model_id):
+    """Filesystem-safe key for a model id ('mlx-community/GLM-4.5-Air-4bit' ->
+    'GLM-4.5-Air-4bit'). Steering vectors are only valid for the base they were
+    extracted from, so they are keyed by this."""
+    if not model_id:
+        return ""
+    return str(model_id).rstrip("/").split("/")[-1]
+
+
+def load_vectors(out_dir, model_id=None):
+    """Load {trait: mx.array[n_layers, hidden]} for the model actually loaded.
+
+    Vectors are keyed by base model: <out_dir>/<model_slug>/<trait>.safetensors.
+    A trait vector is [n_layers, hidden] for ONE architecture and is meaningless
+    for any other, so a flat shared directory cannot be correct across a base
+    flip. When production moved gemma-4-31b-it-4bit -> GLM-4.5-Air-4bit on
+    2026-07-26, the flat directory kept serving the gemma vectors: every load
+    logged `probe FAIL: formality shape (60, 5376) != [46, hidden]` and the
+    server ran unsteered. Namespacing means each base keeps its own vectors and
+    a flip strands nothing.
+
+    Falls back to the legacy flat <out_dir>/*.safetensors when no per-model
+    directory exists, so existing installs keep working — but says so, because
+    a flat directory is exactly the state that silently breaks on the next flip.
+
     Missing dir or files -> {} (steering simply stays off)."""
     import mlx.core as mx
     out_dir = Path(out_dir)
+    slug = model_slug(model_id)
+    src = out_dir / slug if slug else out_dir
+    if slug and not src.is_dir():
+        if out_dir.is_dir() and any(out_dir.glob("*.safetensors")):
+            print(f"[steering] no vectors for '{slug}'; falling back to legacy "
+                  f"un-namespaced {out_dir}. If the probe fails below, these "
+                  f"vectors belong to a different base — re-extract with "
+                  f"extract_persona_vectors.py --model <this base> "
+                  f"--out-dir {out_dir / slug}", flush=True)
+        src = out_dir
     vectors = {}
-    if not out_dir.is_dir():
+    if not src.is_dir():
         return vectors
-    for f in sorted(out_dir.glob("*.safetensors")):
+    for f in sorted(src.glob("*.safetensors")):
         try:
             d = mx.load(str(f))
             if "v" in d:
                 vectors[f.stem] = d["v"]
         except Exception as ex:  # noqa: BLE001
             print(f"[steering] skip {f.name}: {ex}", flush=True)
+    if vectors:
+        print(f"[steering] loaded {len(vectors)} trait vector(s) from {src}",
+              flush=True)
     return vectors
 
 
@@ -79,7 +115,7 @@ def _layer_band(n_layers):
         return 0, n_layers
 
 
-def install_steering(layers, vectors):
+def install_steering(layers, vectors, model_id=None):
     """Class-patch the layer type to apply active steering to its residual output.
     Returns True if installed (probe passed), False if declined."""
     import mlx.core as mx
@@ -92,8 +128,17 @@ def install_steering(layers, vectors):
     hidden = None
     for trait, v in vectors.items():
         if v.ndim != 2 or v.shape[0] != n_layers:
+            # Name the model and the remedy. The bare shape-mismatch form of this
+            # message went unnoticed from the 2026-07-26 base flip onward: it is
+            # true but not actionable, so "steering is on" stayed a silent no-op
+            # discoverable only by grepping a 25 MB log.
+            slug = model_slug(model_id) or "<unknown base>"
             print(f"[steering] probe FAIL: {trait} shape {tuple(v.shape)} != "
-                  f"[{n_layers}, hidden]; running unsteered", flush=True)
+                  f"[{n_layers}, hidden] for '{slug}' — these vectors were "
+                  f"extracted from a DIFFERENT base ({v.shape[0]} layers). "
+                  f"Running unsteered. Fix: extract_persona_vectors.py "
+                  f"--model {model_id or '<base>'} --out-dir "
+                  f"~/.human/persona_vectors/{slug}", flush=True)
             return False
         hidden = v.shape[1] if hidden is None else hidden
         if v.shape[1] != hidden:
