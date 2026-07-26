@@ -686,7 +686,48 @@ def _no_think_instruction():
     """
     if os.environ.get("GEMMA_DISABLE_THINKING", "").strip().lower() not in ("1", "true", "yes"):
         return None
+    # Model-family gate (2026-07-26). The wording below is Gemma-specific -- it
+    # names Gemma 4's markdown-bullet deliberation and was tuned against the
+    # seth-lora-v4-repair adapter. The env var, however, is set unconditionally
+    # in ~/Library/LaunchAgents/ai.human.mlx-server.plist, so after production
+    # flipped to GLM-4.5-Air-4bit on 2026-07-26 this instruction was being
+    # prepended to every GLM turn: a Gemma-worded directive aimed at a model
+    # with an entirely different thinking mechanism (GLM uses the
+    # enable_thinking chat-template flag, handled separately below), injected
+    # into a system prompt already 78% over the 16 KB cap and losing its tail.
+    #
+    # Applies to gemma bases only. HU_NO_THINK_ANY_MODEL=1 restores the old
+    # unconditional behavior if a future non-gemma base turns out to want it.
+    if os.environ.get("HU_NO_THINK_ANY_MODEL", "").strip().lower() in ("1", "true", "yes"):
+        return _NO_THINK_INSTRUCTION
+    if not _is_gemma_base(model_id):
+        return None
     return _NO_THINK_INSTRUCTION
+
+
+def _is_gemma_base(name):
+    """True when `name` identifies a Gemma base.
+
+    Word-ish match rather than a bare substring: a repo id such as
+    "org/not-gemma-clone" should not be treated as Gemma just because the
+    letters appear (~/.claude/rules/substring-classifier-pitfalls.md). Checking
+    for the 'gemma' token bounded by a non-alphanumeric or string edge is
+    enough for the mlx-community naming scheme.
+    """
+    if not name:
+        return False
+    low = str(name).casefold()
+    idx = 0
+    while True:
+        i = low.find("gemma", idx)
+        if i < 0:
+            return False
+        before_ok = i == 0 or not low[i - 1].isalnum()
+        after = i + 5
+        after_ok = after == len(low) or not low[after].isalnum()
+        if before_ok and after_ok:
+            return True
+        idx = i + 1
 
 
 def _thinking_headroom_tokens():
