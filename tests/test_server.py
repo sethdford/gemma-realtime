@@ -1036,6 +1036,74 @@ class TestStreamThoughtFilterBulletHold(unittest.TestCase):
         self.assertIn("the answer", out)
 
 
+class TestDeliberationResidueNeverEmitted(unittest.TestCase):
+    """Pins the 2026-07-26 10:57 production leak.
+
+    Two messages reached Seth's real-estate agent mid-negotiation:
+        "concern."
+        "What specific aspect of their decision would you like to discuss?"
+
+    Reconstructed byte-exactly (daemon logged response_len=74): GLM emitted
+    unmarked multi-line deliberation containing a parenthetical, the markdown-
+    bullet salvage path called _extract_reply_from_body, and its parenthetical
+    rule took text.rsplit(")")[1] — everything after the LAST ")" — yielding the
+    74-byte mid-sentence fragment. The splitter then cut it on the sentence
+    boundary and sent both halves.
+
+    Empty is the correct output here: the daemon retries degenerate output via a
+    slim request and then falls back to cloud (doctor: response_pipeline).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_residue", os.path.join(SCRIPTS_DIR, "mlx-server.py"))
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_the_brea_leak_is_blocked(self):
+        raw = ("*   Brea says the litigation scared the buyer away\n"
+               "*   I should acknowledge the litigation (which she raised twice) concern. "
+               "What specific aspect of their decision would you like to discuss?")
+        out = self.mod.strip_thought_channels(raw)
+        self.assertEqual(out, "", f"deliberation residue emitted: {out!r}")
+        self.assertNotIn("concern.", out)
+
+    def test_parenthetical_rule_still_handles_the_documented_gemma_shape(self):
+        # `"Yeah!" (Classic, fits constraint).Yeah!` is the shape the rule exists
+        # for — a QUOTED candidate before the paren. It must keep working.
+        raw = '*   "Yeah, what\'s up?" (Classic, fits constraint).Yeah, what\'s up?'
+        self.assertEqual(self.mod.strip_thought_channels(raw), "Yeah, what's up?")
+
+    def test_parenthetical_in_plain_prose_is_not_a_reply_boundary(self):
+        # No quoted candidate => the rsplit(")") shortcut must NOT fire.
+        raw = ("*   noting the timeline\n"
+               "*   we talked about it (twice now) and I still think friday works")
+        out = self.mod.strip_thought_channels(raw)
+        self.assertIn("friday works", out)
+        self.assertTrue(out.startswith("we talked"), f"got {out!r}")
+
+    def test_sentence_tail_head_is_refused(self):
+        # A lowercase word terminated one token in is someone else's sentence end.
+        self.assertTrue(self.mod._looks_like_deliberation_residue(
+            "concern. What specific aspect would you like?"))
+
+    def test_genuine_lowercase_reply_is_not_refused(self):
+        # Seth's real replies are lowercase and often unpunctuated — lowercase
+        # alone must never be treated as a fragment signal.
+        for good in ("yeah should be. what's up?", "nah which game?",
+                     "already eating, but down for tomorrow night", "probably saturday. why?"):
+            self.assertFalse(self.mod._looks_like_deliberation_residue(good), good)
+            self.assertEqual(self.mod.strip_thought_channels(good), good)
+
+    def test_deliberation_openers_are_refused(self):
+        for bad in ("I should acknowledge the concern", "Reply should be short",
+                    "Response A is more natural", "The user is asking about pricing",
+                    "Candidate: yeah sounds good", "Draft: on my way"):
+            self.assertTrue(self.mod._looks_like_deliberation_residue(bad), bad)
+
+
 class TestGlmThinkBlockStripping(unittest.TestCase):
     """GLM `<think>` deliberation must never reach the client.
 

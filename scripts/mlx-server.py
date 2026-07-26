@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -909,16 +910,54 @@ def strip_stop_tokens(text):
     return text, False
 
 
+# Deliberation residue that must never be emitted as a reply. These are the
+# openers of a model TALKING ABOUT the reply rather than making it.
+_DELIB_OPENER_RE = re.compile(
+    r"^\s*(?:i\s+(?:should|will|could|need|think\s+i)|reply\s+should|response\s+[ab]\b"
+    r"|the\s+user|user\s+(?:asked|says|wants)|persona\b|candidate\b|option\s+[ab]\b"
+    r"|draft\b|let\s+me\s+(?:craft|write|think))",
+    re.I)
+
+# A tail that begins by CLOSING someone else's sentence — "concern. What ..." —
+# i.e. a lowercase word immediately terminated by .!? then more text. A genuine
+# casual reply can start lowercase ("yeah should be"), so lowercase alone is not
+# the signal; the signal is the sentence boundary sitting one word in.
+_FRAGMENT_HEAD_RE = re.compile(r"^[a-z][a-z'’-]*[.!?](?:\s|$)")
+
+
+def _looks_like_deliberation_residue(text):
+    """True when a salvage heuristic produced something that is not a reply.
+
+    Returning empty is SAFE: the daemon retries degenerate output via a slim
+    request and then falls back to cloud (doctor: response_pipeline). Emitting
+    is not — on 2026-07-26 10:57 this exact shape reached Seth's real-estate
+    agent mid-negotiation as two messages, "concern." then "What specific aspect
+    of their decision would you like to discuss?" """
+    if not text:
+        return False
+    return bool(_DELIB_OPENER_RE.match(text) or _FRAGMENT_HEAD_RE.match(text))
+
+
 def _extract_reply_from_body(text):
     """From a fragment that may have parentheticals, label prefixes, or
-    surrounding quotes, extract the cleanest version of the actual reply."""
-    import re
+    surrounding quotes, extract the cleanest version of the actual reply.
+
+    Returns "" when the salvage yields deliberation residue rather than a reply.
+    """
     text = text.strip()
     if not text:
         return text
     # Parenthetical evaluation followed by the reply — take what's after `)`.
-    # gemma-4 thinking often emits: `"Yeah!" (Classic, fits constraint).Yeah!`
-    if ")" in text:
+    # gemma-4 thinking emits exactly: `"Yeah!" (Classic, fits constraint).Yeah!`
+    #
+    # REQUIRE that documented shape (a QUOTED candidate before the paren) before
+    # splitting on `)`. Unconditionally taking rsplit(")")[1] treats any
+    # parenthetical in ordinary deliberation prose as the reply boundary, which
+    # is how "...the litigation (which she raised twice) concern. What specific
+    # aspect..." became the 74-byte fragment sent to a real contact on
+    # 2026-07-26. The quote requirement keeps the rule to the case it was
+    # written for.
+    if ")" in text and re.search(r'["“][^"”]+["”]\s*\(', text):
         tail = text.rsplit(")", 1)[1].strip()
         tail = re.sub(r"^[.,;:!?\s]+", "", tail).strip()
         if tail:
@@ -932,7 +971,14 @@ def _extract_reply_from_body(text):
         if text.startswith(a) and text.endswith(b) and len(text) >= 2:
             text = text[1:-1]
             break
-    return text.strip()
+    text = text.strip()
+    # Final gate: never hand back deliberation residue or a sentence tail.
+    # Empty routes to the daemon's retry + cloud fallback; emitting routes to a
+    # real human's phone.
+    if _looks_like_deliberation_residue(text):
+        print(f"[thought-strip] refusing deliberation residue: {text[:60]!r}", flush=True)
+        return ""
+    return text
 
 
 def strip_thought_channels(text):
@@ -1058,7 +1104,24 @@ def _is_pure_deliberation(raw):
     return len(non_bullet_reply) == 0
 
 
-def _is_input_echo(reply, messages):
+def _sys_span_cover_min():
+    """Minimum fraction of a reply that must be verbatim system-prompt text
+    before the echo-guard calls it a leak. Override with
+    HU_ECHO_GUARD_COVER_MIN (0.0 = old span-only behavior, 1.0 = exact-dump
+    only). Clamped to [0.0, 1.0]; a malformed value falls back to the default."""
+    raw = os.environ.get("HU_ECHO_GUARD_COVER_MIN", "").strip()
+    if not raw:
+        return 0.5
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+_SYS_SPAN_COVER_MIN = _sys_span_cover_min()
+
+
+def _is_input_echo(reply, messages, detail=None):
     """Return True if `reply` merely echoes the INPUT rather than answering it —
     a prompt echo, a prior-history echo, or a system-prompt leak.
 
@@ -1098,6 +1161,20 @@ def _is_input_echo(reply, messages):
         return False
     r_words = r.split()
 
+    # Diagnostics only — records WHICH rule fired and how much of the reply it
+    # covered. The True/False verdict is unchanged; `detail` defaults to None so
+    # every existing caller behaves exactly as before. Added 2026-07-26: the
+    # guard was blanking 9/12 research-agent replies and the 80-char log prefix
+    # could not distinguish "guard too strict" from "model regurgitating input".
+    def _note(rule, covered=None):
+        if detail is None:
+            return
+        detail["rule"] = rule
+        detail["reply_words"] = len(r_words)
+        if covered is not None:
+            detail["covered_words"] = covered
+            detail["covered_frac"] = round(covered / max(1, len(r_words)), 3)
+
     sys_texts, user_texts, other_texts = [], [], []
     for m in messages:
         if not isinstance(m, dict):
@@ -1115,6 +1192,7 @@ def _is_input_echo(reply, messages):
     if user_texts:
         last_user = _norm(user_texts[-1])
         if len(last_user.split()) >= 3 and r == last_user:
+            _note("prompt_echo", covered=len(r_words))
             return True
 
     # 2. History echo: reply repeats a prior turn (all user turns but the last,
@@ -1124,12 +1202,23 @@ def _is_input_echo(reply, messages):
         tn = _norm(t)
         tn_words = tn.split()
         if len(tn_words) >= 2 and r == tn:
+            _note("history_echo_exact", covered=len(r_words))
             return True
         if len(r_words) >= 3 and len(tn_words) >= 3 and r in tn:
+            _note("history_echo_contained", covered=len(r_words))
             return True
 
     # 3. System-prompt leak: reply shares a >=6-word contiguous span with a
     #    system message.
+    # A >=SPAN-word overlap with the system prompt is necessary but NOT
+    # sufficient to call a reply a leak. Measured live 2026-07-26 on GLM-4.5-Air
+    # with a 29 KB system prompt: legitimate replies scored frac 0.165 and 0.244
+    # (a 79-word research finding sharing 13 words; a 41-word outreach plan
+    # sharing 10) while a verbatim system-prompt dump scores 1.0. Span-only
+    # gating blanked 9 of 12 completions, including real Seth-voice replies
+    # ("Idk yet, she hasn't mentioned it"). Requiring the overlap to cover a
+    # MAJORITY of the reply separates "quotes its source" from "is the source".
+    # Tunable without a code change; default is the measured-safe value.
     SPAN = 6
     if len(r_words) >= SPAN:
         for st in sys_texts:
@@ -1137,9 +1226,23 @@ def _is_input_echo(reply, messages):
             if len(sw) < SPAN:
                 continue
             sys_spans = {tuple(sw[i:i + SPAN]) for i in range(len(sw) - SPAN + 1)}
-            if any(tuple(r_words[j:j + SPAN]) in sys_spans
-                   for j in range(len(r_words) - SPAN + 1)):
-                return True
+            hit_starts = [j for j in range(len(r_words) - SPAN + 1)
+                          if tuple(r_words[j:j + SPAN]) in sys_spans]
+            if hit_starts:
+                # Coverage = how many of the reply's words sit inside a matching
+                # span. A leak is near-100% verbatim; a legitimate reply that
+                # merely QUOTES its source is a minority fraction.
+                covered = set()
+                for j in hit_starts:
+                    covered.update(range(j, j + SPAN))
+                frac = len(covered) / max(1, len(r_words))
+                if frac >= _SYS_SPAN_COVER_MIN:
+                    _note("system_span", covered=len(covered))
+                    return True
+                # Below threshold: a real reply that happens to share a phrase
+                # with the (up to 29 KB) system prompt. Record for observability
+                # but SEND it.
+                _note("system_span_below_threshold", covered=len(covered))
 
     return False
 
@@ -1176,13 +1279,31 @@ def finalize_generation(full, messages=None):
         # system-prompt span, return empty (better empty than garbage — same
         # philosophy as the _is_pure_deliberation guard below). messages=None
         # preserves legacy behavior + existing tests.
-        if text and messages is not None and _is_input_echo(text, messages):
+        _echo_detail = {}
+        if text and messages is not None and _is_input_echo(text, messages, _echo_detail):
             try:
                 print(f"  [echo-guard] reply echoes input / leaks system prompt; "
-                      f"returning empty: {text[:80]!r}", flush=True)
+                      f"returning empty: rule={_echo_detail.get('rule', '?')} "
+                      f"reply_words={_echo_detail.get('reply_words', '?')} "
+                      f"covered={_echo_detail.get('covered_words', '?')} "
+                      f"frac={_echo_detail.get('covered_frac', '?')} "
+                      f"| {text[:240]!r}", flush=True)
             except Exception:
                 pass
             return "", True
+        if _echo_detail.get("rule") == "system_span_below_threshold":
+            # A reply that shares a phrase with the system prompt but is mostly
+            # original — SENT. Logged (counts only, no reply text) so the
+            # threshold stays monitorable: a drift toward frac~0.5 here is the
+            # signal to revisit HU_ECHO_GUARD_COVER_MIN.
+            try:
+                print(f"  [echo-guard] near-miss SENT: overlap "
+                      f"{_echo_detail.get('covered_words')}/"
+                      f"{_echo_detail.get('reply_words')} words "
+                      f"frac={_echo_detail.get('covered_frac')} "
+                      f"< {_SYS_SPAN_COVER_MIN}", flush=True)
+            except Exception:
+                pass
         return text, False
 
     stripped = strip_thought_channels(full)
