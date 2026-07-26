@@ -936,9 +936,29 @@ def _extract_reply_from_body(text):
 
 
 def strip_thought_channels(text):
-    """Strip Gemma 4 thought blocks from output.
+    """Strip model thought blocks from output.
 
-    Handles TWO formats observed empirically (2026-05-25 audit):
+    Handles THREE families. GLM's `<think>` form was added 2026-07-26 when
+    production flipped to GLM-4.5-Air: before that, the ONLY thing preventing
+    GLM deliberation from reaching recipients was the `enable_thinking`
+    polarity in _thinking_suppressed_value(), i.e. a single point of failure
+    guarding a failure mode with precedent (2026-07-11: the daemon sent raw
+    deliberation to real contacts). This function is the universal output
+    funnel, so scrubbing here is defence in depth behind that flag, not a
+    replacement for it.
+
+    0. GLM `<think> ... </think>` (GLM-4.5-Air and siblings). Three shapes,
+       stripped in this order:
+         a. closed pair                  — `<think>A</think>B` -> `B`
+         b. orphan CLOSER, no opener     — `A</think>B`        -> `B`
+            (the chat template can PRIME the opener, so generation begins
+            already inside the thought and only the closer is emitted)
+         c. orphan OPENER, never closed  — `<think>A`          -> ``
+            (truncated mid-thought, e.g. max_tokens exhausted)
+       Shape (c) legitimately yields empty; that is the correct outcome and
+       the established contract of this function (see _is_pure_deliberation
+       and the empty-result salvage guard) — returning the deliberation text
+       instead IS the leak.
 
     1. Documented channel-marker format:
        `<|channel>thought ... <channel|> actual_response`
@@ -966,6 +986,13 @@ def strip_thought_channels(text):
        present.  This branch detects the markdown pattern and extracts.
     """
     import re
+    # GLM `<think>` family — closed pair, then orphan closer (template-primed
+    # opener), then orphan opener (truncated mid-thought). Order matters: a
+    # complete pair must be consumed as a pair before the orphan rules run.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Gemma channel-marker family.
     text = re.sub(r"<\|channel>thought.*?<channel\|>", "", text, flags=re.DOTALL)
     text = re.sub(r"<\|channel>thought.*$", "", text, flags=re.DOTALL)
     text = text.strip()
@@ -1364,6 +1391,15 @@ class StreamThoughtFilter:
     OPEN = "<|channel>thought"
     CLOSE = "<channel|>"
 
+    # GLM `<think>` markers (production base since 2026-07-26). These are NOT
+    # handled like OPEN/CLOSE: "strip" mode deliberately KEEPS Gemma thought
+    # content because Gemma puts the answer inside the block, whereas GLM emits
+    # `<think>reasoning</think>answer` — keeping the content there would stream
+    # the reasoning verbatim. So GLM markers trigger hold-and-extract (fail
+    # closed) rather than marker removal; see _feed_strip and flush.
+    GLM_OPEN = "<think>"
+    GLM_CLOSE = "</think>"
+
     def __init__(self, mode: str = "strip"):
         self.buf = ""
         self.mode = mode
@@ -1378,6 +1414,15 @@ class StreamThoughtFilter:
         # stream incrementally.
         self._emitted_any = False
         self._holding_bullets = False
+        # Set when a GLM `<think>`/`</think>` marker is seen. Same hold-and-
+        # extract contract as _holding_bullets: emit nothing, let flush() run
+        # the full strip_thought_channels extractor on the complete text.
+        self._holding_thought = False
+
+    def _must_hold(self):
+        """Emit nothing until flush() — the complete text is required to
+        extract the real reply without leaking deliberation."""
+        return self._holding_bullets or self._holding_thought
 
     def feed(self, chunk):
         if not chunk:
@@ -1390,20 +1435,30 @@ class StreamThoughtFilter:
         return self._feed_strip()
 
     def _max_marker_len(self):
-        return max(len(self.OPEN), len(self.CLOSE))
+        return max(len(self.OPEN), len(self.CLOSE),
+                   len(self.GLM_OPEN), len(self.GLM_CLOSE))
 
     def _tail_could_be_marker_prefix(self):
         m = self._max_marker_len()
+        markers = (self.OPEN, self.CLOSE, self.GLM_OPEN, self.GLM_CLOSE)
         for n in range(min(len(self.buf), m - 1), 0, -1):
             tail = self.buf[-n:]
-            if self.OPEN.startswith(tail) or self.CLOSE.startswith(tail):
+            # GLM markers included so a partially-arrived "<thi" is retained
+            # rather than emitted as literal text ahead of the hold decision.
+            if any(mk.startswith(tail) for mk in markers):
                 return n
         return 0
 
     def _feed_strip(self):
-        # Once committed to holding bullet deliberation, emit nothing until
-        # flush() — the full text is needed to extract the real reply.
-        if self._holding_bullets:
+        # Once committed to holding deliberation, emit nothing until flush() —
+        # the full text is needed to extract the real reply.
+        if self._must_hold():
+            return ""
+        # GLM think block: either marker is sufficient to commit to holding.
+        # The closer alone is the template-primed case (generation begins
+        # already inside the thought, so only `</think>` is ever emitted).
+        if self.GLM_OPEN in self.buf or self.GLM_CLOSE in self.buf:
+            self._holding_thought = True
             return ""
         # Before the first emit, decide whether this response opens with
         # markdown-bullet deliberation. Defer the decision until we have a few
@@ -1477,10 +1532,10 @@ class StreamThoughtFilter:
             return ""
         out = self.buf
         self.buf = ""
-        if self._holding_bullets:
-            # Bullet deliberation was detected and held; extract the real reply
-            # from the complete text using the same logic the non-stream and
-            # buffered-stream paths use, so no deliberation leaks.
+        if self._must_hold():
+            # Deliberation (bullet or GLM think block) was detected and held;
+            # extract the real reply from the complete text using the same logic
+            # the non-stream and buffered-stream paths use, so nothing leaks.
             return strip_thought_channels(out)
         return out.replace(self.OPEN, "").replace(self.CLOSE, "")
 
