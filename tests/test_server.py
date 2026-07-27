@@ -122,12 +122,18 @@ class TestNoThinkInjection(unittest.TestCase):
     def setUp(self):
         # Save + clear env so tests are deterministic regardless of host env.
         self._prev = os.environ.pop("GEMMA_DISABLE_THINKING", None)
+        # `_no_think_instruction()` has been gemma-gated since c738d10, and its
+        # wording is Gemma-specific — so these tests must pin a Gemma base or
+        # they assert against a family the instruction no longer applies to.
+        self._prev_model_id = getattr(self.mod, "model_id", None)
+        self.mod.model_id = "mlx-community/gemma-4-e4b-it-4bit"
 
     def tearDown(self):
         if self._prev is None:
             os.environ.pop("GEMMA_DISABLE_THINKING", None)
         else:
             os.environ["GEMMA_DISABLE_THINKING"] = self._prev
+        self.mod.model_id = self._prev_model_id
 
     # --- _no_think_instruction() returns None when env unset ---
     def test_instruction_returns_none_when_env_unset(self):
@@ -358,12 +364,16 @@ class TestNoThinkStructuredVariant(unittest.TestCase):
     def setUp(self):
         self._prev = os.environ.pop("GEMMA_DISABLE_THINKING", None)
         os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        # Gemma-gated since c738d10 — see TestNoThinkInjection.setUp.
+        self._prev_model_id = getattr(self.mod, "model_id", None)
+        self.mod.model_id = "mlx-community/gemma-4-e4b-it-4bit"
 
     def tearDown(self):
         if self._prev is None:
             os.environ.pop("GEMMA_DISABLE_THINKING", None)
         else:
             os.environ["GEMMA_DISABLE_THINKING"] = self._prev
+        self.mod.model_id = self._prev_model_id
 
     def test_casual_prompt_gets_casual_instruction(self):
         msgs = [{"role": "system", "content": "You are Seth."},
@@ -575,6 +585,14 @@ class TestStreamShouldBuffer(unittest.TestCase):
             k: os.environ.get(k)
             for k in ("HU_STREAM_BUFFER_STRIP", "GEMMA_DISABLE_THINKING")
         }
+        # _stream_should_buffer's model-default arm still keys off
+        # `_no_think_instruction()`, which is gemma-gated since c738d10.
+        # Deliberately NOT switched to `_no_think_requested()`: buffering exists
+        # to strip deliberation, and with the template flag now reaching GLM,
+        # GLM no longer deliberates — so defaulting it to unbuffered (lower
+        # TTFT) is correct. These tests pin the Gemma arm.
+        self._prev_model_id = getattr(self.mod, "model_id", None)
+        self.mod.model_id = "mlx-community/gemma-4-e4b-it-4bit"
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -582,6 +600,7 @@ class TestStreamShouldBuffer(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        self.mod.model_id = self._prev_model_id
 
     def test_override_force_on(self):
         for val in ("1", "true", "yes"):
@@ -1267,6 +1286,105 @@ class TestPersonaSteering(unittest.TestCase):
         active = self.ps._STATE["active"]
         # Values should be clamped (if vectors are installed; test has none)
         self.assertIsInstance(active, dict)
+
+
+class TestThinkingSuppressionReachesTemplate(unittest.TestCase):
+    """`enable_thinking` must reach the chat template for NON-Gemma bases too.
+
+    Regression for 2026-07-27. c738d10 gated the Gemma-WORDED no-think TEXT on a
+    Gemma base — correct, that wording is Gemma-specific and was bloating GLM's
+    already-over-cap system prompt. But `skip_thinking_primer` was derived from
+    that same predicate (`_no_think_instruction() is not None`), so once
+    production flipped to GLM-4.5-Air the template flag stopped being passed at
+    all and GLM silently resumed deliberating.
+
+    Measured on prod before the fix: 106 and 103 completion tokens for one-line
+    replies (~8 visible tokens). It never leaked — strip_thought_channels caught
+    it, see TestGlmThinkBlockStripping — so the only symptom was ~13x the decode
+    work per message. A latency bug with no visible output change is exactly the
+    kind that survives; hence this test asserts the kwarg the template RECEIVES,
+    not merely that some predicate returns True.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mlx_server_think_wiring", os.path.join(SCRIPTS_DIR, "mlx-server.py")
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    class _Recorder:
+        """Stands in for the tokenizer/processor; captures template kwargs."""
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(self, messages, **kw):
+            self.kwargs = dict(kw)
+            return "RENDERED_PROMPT"
+
+    def setUp(self):
+        self._saved_env = os.environ.get("GEMMA_DISABLE_THINKING")
+        self._saved_any = os.environ.get("HU_NO_THINK_ANY_MODEL")
+        self._saved_model_id = getattr(self.mod, "model_id", None)
+        self._saved_processor = getattr(self.mod, "processor", None)
+        os.environ.pop("HU_NO_THINK_ANY_MODEL", None)
+
+    def tearDown(self):
+        for key, val in (("GEMMA_DISABLE_THINKING", self._saved_env),
+                         ("HU_NO_THINK_ANY_MODEL", self._saved_any)):
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        self.mod.model_id = self._saved_model_id
+        self.mod.processor = self._saved_processor
+
+    def _render(self, model_id, disable_thinking):
+        if disable_thinking:
+            os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        else:
+            os.environ.pop("GEMMA_DISABLE_THINKING", None)
+        self.mod.model_id = model_id
+        rec = self._Recorder()
+        self.mod.processor = rec
+        self.mod.prepare_prompt_lm([{"role": "user", "content": "hey"}])
+        return rec.kwargs
+
+    def test_glm_base_receives_enable_thinking_false(self):
+        # THE regression. Pre-fix this dict had no "enable_thinking" key at all,
+        # so GLM's template took its `enable_thinking is not defined` branch and
+        # left the model free to deliberate.
+        kw = self._render("mlx-community/GLM-4.5-Air-4bit", disable_thinking=True)
+        self.assertIn("enable_thinking", kw)
+        # GLM reads the flag literally: False is what SUPPRESSES.
+        self.assertIs(kw["enable_thinking"], False)
+
+    def test_gemma_base_polarity_unchanged(self):
+        # Gemma's polarity is inverted (True suppresses). This must not regress.
+        kw = self._render("mlx-community/gemma-4-e4b-it-4bit", disable_thinking=True)
+        self.assertIn("enable_thinking", kw)
+        self.assertIs(kw["enable_thinking"], True)
+
+    def test_flag_absent_when_suppression_not_requested(self):
+        # Env unset => legacy no-op on every family: the kwarg is not sent,
+        # leaving each template's own default intact.
+        for base in ("mlx-community/GLM-4.5-Air-4bit",
+                     "mlx-community/gemma-4-e4b-it-4bit"):
+            kw = self._render(base, disable_thinking=False)
+            self.assertNotIn("enable_thinking", kw, base)
+
+    def test_glm_still_gets_no_gemma_worded_text(self):
+        # The c738d10 fix must survive: suppression is now requested for GLM,
+        # but the Gemma-specific INSTRUCTION TEXT must still not be injected.
+        os.environ["GEMMA_DISABLE_THINKING"] = "1"
+        self.mod.model_id = "mlx-community/GLM-4.5-Air-4bit"
+        self.assertTrue(self.mod._no_think_requested())
+        self.assertIsNone(self.mod._no_think_instruction())
+        msgs = [{"role": "user", "content": "hey"}]
+        self.assertEqual(self.mod._maybe_inject_no_think_instruction(msgs), msgs)
 
 
 if __name__ == "__main__":

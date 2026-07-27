@@ -664,6 +664,30 @@ def _system_prompt_requests_structured_output(messages):
     return False
 
 
+def _no_think_requested():
+    """True when the operator asked for thinking suppression, ANY base family.
+
+    Deliberately distinct from `_no_think_instruction()`, which returns the
+    Gemma-WORDED instruction TEXT and is therefore correctly gated to Gemma
+    bases. The suppression MECHANISM differs by family:
+      - Gemma 4:  system-instruction text  +  the enable_thinking template flag
+      - GLM-4.5:  the enable_thinking template flag ALONE (no text exists for it)
+
+    Deriving "should we suppress?" from "is there Gemma text to inject?"
+    conflates the two. The 2026-07-26 family gate (c738d10) correctly stopped
+    injecting Gemma wording into GLM prompts by returning None — but the same
+    predicate also fed `skip_thinking_primer`, so GLM silently stopped
+    receiving `enable_thinking=False` and resumed deliberating. Measured on
+    production 2026-07-27: 106 and 103 completion tokens for one-line replies
+    (~8 visible tokens). The deliberation never leaked — strip_thought_channels
+    caught it, see TestGlmThinkBlockStripping — it was pure latency.
+
+    Use THIS for "do we suppress thinking?"; use `_no_think_instruction()`
+    only to decide whether to inject the Gemma text.
+    """
+    return os.environ.get("GEMMA_DISABLE_THINKING", "").strip().lower() in ("1", "true", "yes")
+
+
 def _no_think_instruction():
     """Return the system-instruction text that suppresses Gemma 4 thinking mode.
 
@@ -684,7 +708,7 @@ def _no_think_instruction():
     Wording lives in `_NO_THINK_INSTRUCTION` above. Returns None if env var
     `GEMMA_DISABLE_THINKING` is unset (no-op, preserves current behavior).
     """
-    if os.environ.get("GEMMA_DISABLE_THINKING", "").strip().lower() not in ("1", "true", "yes"):
+    if not _no_think_requested():
         return None
     # Model-family gate (2026-07-26). The wording below is Gemma-specific -- it
     # names Gemma 4's markdown-bullet deliberation and was tuned against the
@@ -888,7 +912,10 @@ def prepare_prompt_lm(messages, skip_thinking_primer=None):
       - True / False:    explicit override from the caller.
     """
     if skip_thinking_primer is None:
-        skip_thinking_primer = _no_think_instruction() is not None
+        # `_no_think_requested()`, NOT `_no_think_instruction() is not None`:
+        # the template flag is the suppression mechanism for EVERY family,
+        # while the instruction text is Gemma-only. See _no_think_requested().
+        skip_thinking_primer = _no_think_requested()
     messages = _maybe_inject_no_think_instruction(messages)
     template_kwargs = {
         "tokenize": False,
@@ -1527,7 +1554,7 @@ def _request_skip_thinking_primer(req):
     """
     return _resolve_skip_thinking_primer(
         _request_stream_strip(req),
-        _no_think_instruction() is not None,
+        _no_think_requested(),
     )
 
 
