@@ -2156,7 +2156,8 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
         return prompt_text
 
     # live — route the request to the best slot, or recycle an empty/LRU one
-    from prompt_cache_lcp import choose_slot, plan_reuse
+    from prompt_cache_lcp import (choose_slot, plan_reuse, common_prefix_len,
+                                  DEFAULT_SLOT_FLOOR)
     tokens = _encode_like_stream_generate(prompt_text)
     slots = _ensure_cache_slots()
     slot_idx, planned = choose_slot(
@@ -2168,6 +2169,30 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
     if planned > 0:
         reuse, trim_amount = plan_reuse(slot["prev_tokens"], tokens, cache_size)
     else:
+        # EVICTION instrumentation (2026-07-27): live token-weighted reuse is 34%
+        # vs 60% in shadow, and the misses are LONG prompts (miss-median 1199 toks
+        # vs shadow's 232). choose_slot evicts by min(last_used) — pure LRU, size-
+        # INDIFFERENT — so any size dependence must come from traffic pattern, not
+        # from an eviction policy that prefers big entries. Log what we'd need to
+        # tell those apart: what died, how stale it was, and the whole pool, so a
+        # reader can check whether the victim was the OLDEST (LRU as designed) or
+        # happened to be the LARGEST (would mean the model above is wrong).
+        if cache_size > 0:
+            _ev_prev = len(slot["prev_tokens"] or ())
+            _ev_age = _lcp_request_counter - slot["last_used"]
+            _pool = ",".join(
+                "%d:%dt/%da" % (i, len(s["prev_tokens"] or ()),
+                                _lcp_request_counter - s["last_used"])
+                for i, s in enumerate(slots))
+            # Best prefix ANY slot offered. If this sits just under the floor the
+            # miss is a near-miss (a floor-tuning lever); if it's ~0 the prompt
+            # genuinely shares nothing and no slot count would have helped.
+            _best = max((common_prefix_len(s["prev_tokens"] or (), tokens)
+                         for s in slots), default=0)
+            print(f"  [lcp evict] slot {slot_idx}: dropping {cache_size} kv pos "
+                  f"({_ev_prev} prev toks), idle {_ev_age} reqs; "
+                  f"incoming {len(tokens)} toks; best_lcp {_best}/floor "
+                  f"{DEFAULT_SLOT_FLOOR}; pool[{_pool}]", flush=True)
         reuse, trim_amount = 0, cache_size  # recycle the slot as a fresh cache
     if trim_amount > 0:
         trimmed = _trim_cache(slot["cache"], trim_amount)
