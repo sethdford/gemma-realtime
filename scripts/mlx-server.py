@@ -311,6 +311,7 @@ lm_quantized_kv_group_size = 64
 # list so _kv_kwargs/health/legacy paths need no knowledge of the pool.
 lcp_mode = "off"
 lm_cache_slot_count = 2   # config mlx_local.prompt_cache_slots, clamped 1..4
+lcp_evict_policy = "value"  # HU_LCP_EVICT=lru rolls back to legacy LRU
 lm_cache_slots = None     # [{"cache": list, "prev_tokens": list|None, "last_used": int}]
 _lcp_shadow_slots = None  # shadow-mode simulation of the pool (token lists only)
 _lcp_pending_tokens = None  # this request's tokens; promoted at prefill-done
@@ -2157,32 +2158,38 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
 
     # live — route the request to the best slot, or recycle an empty/LRU one
     from prompt_cache_lcp import (choose_slot, plan_reuse, common_prefix_len,
-                                  DEFAULT_SLOT_FLOOR)
+                                  DEFAULT_SLOT_FLOOR, slot_evict_value)
     tokens = _encode_like_stream_generate(prompt_text)
     slots = _ensure_cache_slots()
     slot_idx, planned = choose_slot(
         [s["prev_tokens"] for s in slots],
-        [s["last_used"] for s in slots], tokens)
+        [s["last_used"] for s in slots], tokens,
+        policy=lcp_evict_policy)
     slot = slots[slot_idx]
     lm_prompt_cache = slot["cache"]  # _kv_kwargs routes this into stream_generate
     cache_size = _cache_offset(slot["cache"])
     if planned > 0:
         reuse, trim_amount = plan_reuse(slot["prev_tokens"], tokens, cache_size)
     else:
-        # EVICTION instrumentation (2026-07-27): live token-weighted reuse is 34%
-        # vs 60% in shadow, and the misses are LONG prompts (miss-median 1199 toks
-        # vs shadow's 232). choose_slot evicts by min(last_used) — pure LRU, size-
-        # INDIFFERENT — so any size dependence must come from traffic pattern, not
-        # from an eviction policy that prefers big entries. Log what we'd need to
-        # tell those apart: what died, how stale it was, and the whole pool, so a
-        # reader can check whether the victim was the OLDEST (LRU as designed) or
-        # happened to be the LARGEST (would mean the model above is wrong).
+        # EVICTION instrumentation (2026-07-27). This logging is what diagnosed
+        # the policy now in use: under the previous min(last_used) LRU, live
+        # token-weighted reuse was 34.4% against 59.6% in shadow, every observed
+        # eviction was at `idle 2 reqs` (3 slots — the pool cycled completely
+        # every 3 requests), and a 10-token probe evicted a 4143-token prefix.
+        # choose_slot now evicts the LEAST VALUABLE slot instead; `v` in the pool
+        # dump is slot_evict_value = cached toks / (age+1). Keep this log: it is
+        # how we confirm the victim is now the cheap slot rather than the big
+        # stale one, and how a regression would surface. HU_LCP_EVICT=lru
+        # restores the old behavior if this needs rolling back.
         if cache_size > 0:
             _ev_prev = len(slot["prev_tokens"] or ())
             _ev_age = _lcp_request_counter - slot["last_used"]
+            _now = max(s["last_used"] for s in slots)
             _pool = ",".join(
-                "%d:%dt/%da" % (i, len(s["prev_tokens"] or ()),
-                                _lcp_request_counter - s["last_used"])
+                "%d:%dt/%da/v%.0f" % (i, len(s["prev_tokens"] or ()),
+                                      _lcp_request_counter - s["last_used"],
+                                      slot_evict_value(s["prev_tokens"],
+                                                       _now - s["last_used"]))
                 for i, s in enumerate(slots))
             # Best prefix ANY slot offered. If this sits just under the floor the
             # miss is a near-miss (a floor-tuning lever); if it's ~0 the prompt
@@ -2921,7 +2928,7 @@ def _env_int(name: str, default: int) -> int:
 
 def main():
     global kv_bits, kv_quant_scheme, prompt_cache_state, hw_info, speculative_draft_tokens
-    global server_realtime_mode, lcp_mode, lm_cache_slot_count
+    global server_realtime_mode, lcp_mode, lm_cache_slot_count, lcp_evict_policy
 
     hc = _load_human_config()
     _apply_mlx_local_env_from_hc(hc)
@@ -3066,13 +3073,22 @@ Examples:
         except ImportError:
             print("Prompt cache: not available (mlx_vlm.generate.PromptCacheState missing)", flush=True)
 
-    from prompt_cache_lcp import parse_mode as _lcp_parse_mode, parse_slots as _lcp_parse_slots
+    from prompt_cache_lcp import (parse_mode as _lcp_parse_mode,
+                                  parse_slots as _lcp_parse_slots,
+                                  parse_evict_policy as _lcp_parse_evict)
     lcp_mode = "off" if args.no_prompt_cache else _lcp_parse_mode(args.prompt_cache_lcp)
     lm_cache_slot_count = _lcp_parse_slots(args.prompt_cache_slots)
+    # Eviction policy. Default 'value'; HU_LCP_EVICT=lru restores the legacy
+    # size-indifferent LRU as a one-env-var rollback (see slot_evict_value).
+    lcp_evict_policy = _lcp_parse_evict(os.environ.get("HU_LCP_EVICT"))
     print(f"Prompt cache LCP mode: {lcp_mode}"
           + (f" ({lm_cache_slot_count} slots, token-prefix reuse ACTIVE)" if lcp_mode == "live" else
              f" ({lm_cache_slot_count} slots simulated, measurement only)" if lcp_mode == "shadow" else ""),
           flush=True)
+    if lcp_mode in ("live", "shadow"):
+        print(f"Prompt cache eviction policy: {lcp_evict_policy}"
+              + ("  (least-valuable: cached toks / (age+1))" if lcp_evict_policy == "value"
+                 else "  (LEGACY size-indifferent LRU — rollback mode)"), flush=True)
 
     load_model(args.model, adapter_path=args.adapter_path)
 

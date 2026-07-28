@@ -98,22 +98,78 @@ def parse_slots(raw, default=DEFAULT_SLOTS):
     return max(1, min(n, MAX_SLOTS))
 
 
-def choose_slot(slot_prev_tokens, slot_last_used, new_tokens, floor=DEFAULT_SLOT_FLOOR):
+EVICT_POLICIES = ("value", "lru")
+
+
+def parse_evict_policy(raw, default="value"):
+    """Parse the eviction policy. Unknown values fall back to the default.
+
+    'lru' restores the pre-2026-07-27 behavior and exists as a one-env-var
+    rollback, not as a recommended setting — it is the policy the eviction
+    logging showed to be broken.
+    """
+    if raw is None:
+        return default
+    val = str(raw).strip().lower()
+    return val if val in EVICT_POLICIES else default
+
+
+def slot_evict_value(prev_tokens, age):
+    """How much we lose by discarding this slot. Higher = protect it harder.
+
+    This is GreedyDual-Size: value = cached tokens / (age + 1), where `age` is
+    how many requests ago the slot was last used. The numerator is the real
+    cost of eviction — the tokens we would have to re-prefill if this slot were
+    reused — and the denominator discounts by staleness as a proxy for how
+    likely that reuse is.
+
+    Why plain LRU was wrong (measured in prod 2026-07-27): eviction ran on
+    min(last_used), which is entirely size-indifferent, so a 10-token probe
+    evicted a 4143-token cached prefix. Every observed eviction was at `idle 2
+    reqs` with 3 slots — the pool cycled completely every 3 requests and
+    nothing survived long enough to be reused. Hit rate stayed high (74.8%)
+    because the surviving hits were trivia, while token-weighted reuse
+    collapsed to 34.4% against 59.6% in shadow.
+
+    The decay is self-limiting, so no entry is immortal and no arbitrary
+    staleness cutoff is needed: a 4227-token slot outranks a fresh 200-token
+    one only while 4227/(age+1) > 200, i.e. for about 20 idle requests. A
+    genuinely dead conversation ages out on its own.
+
+    Returns 0.0 for an empty slot so empty slots are always the first victims.
+    """
+    size = len(prev_tokens) if prev_tokens else 0
+    if size <= 0:
+        return 0.0
+    return size / (float(age) + 1.0)
+
+
+def choose_slot(slot_prev_tokens, slot_last_used, new_tokens,
+                floor=DEFAULT_SLOT_FLOOR, policy="value"):
     """Pick which cache slot serves a new request.
 
     slot_prev_tokens: per-slot token lists (None/[] = empty slot)
     slot_last_used:   per-slot monotonic use counters (higher = more recent)
     new_tokens:       the new request's full prompt token ids
     floor:            minimum LCP worth reusing a slot for
+    policy:           'value' (default) evicts the least valuable slot per
+                      slot_evict_value; 'lru' is the legacy rollback.
 
     Returns (slot_idx, reuse):
       reuse > 0  — reuse `reuse` prefix tokens of slot slot_idx
       reuse == 0 — reset slot slot_idx and prefill from scratch
 
     Eviction policy: if no slot clears the floor, recycle an EMPTY slot
-    first, else the least-recently-used one — never the best-LCP slot.
-    This is what lets a big stable-head slot survive interleaved
-    small-probe traffic that only matches the chat-template preamble.
+    first, then the LEAST VALUABLE one (fewest cached tokens, discounted by
+    staleness) — never the best-LCP slot. This is what lets a big stable-head
+    slot survive interleaved small-probe traffic that only matches the
+    chat-template preamble.
+
+    That last sentence was the stated intent from the start, but until
+    2026-07-27 the victim was chosen by min(last_used) — size-indifferent —
+    and prod logging showed it failing exactly as described: a 10-token probe
+    evicted a 4143-token prefix. Selecting the slot to REUSE is unchanged;
+    only the choice of victim moved.
     """
     n = len(slot_prev_tokens)
     if n == 0:
@@ -133,5 +189,16 @@ def choose_slot(slot_prev_tokens, slot_last_used, new_tokens, floor=DEFAULT_SLOT
     for i, prev in enumerate(slot_prev_tokens):
         if not prev:
             return i, 0
-    lru_idx = min(range(n), key=lambda i: slot_last_used[i])
-    return lru_idx, 0
+
+    if policy == "lru":
+        return min(range(n), key=lambda i: slot_last_used[i]), 0
+
+    # `now` is the newest counter seen: the current request has not been
+    # counted yet at selection time, so this is the best available clock.
+    now = max(slot_last_used)
+    victim = min(
+        range(n),
+        key=lambda i: (slot_evict_value(slot_prev_tokens[i], now - slot_last_used[i]),
+                       slot_last_used[i]),  # tie-break: oldest first, deterministic
+    )
+    return victim, 0

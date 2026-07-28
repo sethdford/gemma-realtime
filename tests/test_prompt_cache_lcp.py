@@ -13,6 +13,8 @@ from prompt_cache_lcp import (
     DEFAULT_SLOT_FLOOR,
     MODES,
     choose_slot,
+    slot_evict_value,
+    parse_evict_policy,
     common_prefix_len,
     parse_mode,
     parse_slots,
@@ -148,15 +150,104 @@ def test_choose_slot_below_floor_prefers_empty_slot():
     assert reuse == 0                          # fresh reset, no reuse
 
 
-def test_choose_slot_below_floor_no_empty_evicts_lru_not_best():
+def test_choose_slot_below_floor_no_empty_evicts_victim_not_best():
     # Pool full, probe matches both slots only at the preamble (< floor).
-    # The LRU slot (the older probe) is recycled; the big slot survives
-    # even though it has the (marginally) longer LCP.
+    # The probe slot is recycled; the big slot survives even though it has
+    # the (marginally) longer LCP.
+    # NOTE: this case does NOT discriminate between policies — the victim is
+    # both the least-recently-used AND the smallest, so 'lru' and 'value'
+    # agree. The discriminating cases are below.
     new = PREAMBLE + list(range(80000, 80020))
     old_probe = PREAMBLE + list(range(60000, 60020))
     idx, reuse = choose_slot([BIG, old_probe], [5, 2], new)
-    assert idx == 1                            # last_used 2 < 5 → LRU
+    assert idx == 1
     assert reuse == 0
+
+
+# ── eviction policy: value vs lru (2026-07-27) ──────────────────────────
+#
+# Prod logging showed plain LRU destroying exactly what the pool exists to
+# protect. Verbatim from mlx-server-launchd.log:
+#
+#   [lcp evict] slot 1: dropping 4240 kv pos (4227 prev toks), idle 2 reqs;
+#               incoming 219 toks; pool[0:166t/0a, 1:4227t/2a, 2:10t/1a]
+#
+# A 219-token request evicted a 4227-token cached prefix because that slot
+# happened to be the oldest. The tests below pin the fix against that exact
+# pool state.
+
+def test_value_policy_keeps_big_stale_head_over_small_fresh_probe():
+    # THE production scenario, replayed: the big head is the STALEST slot, so
+    # LRU targets it. Value must pick the 10-token slot instead.
+    head = list(range(1000, 5227))             # 4227 tokens, age 2 (stalest)
+    mid = list(range(20000, 20166))            # 166 tokens,  age 0
+    probe = list(range(30000, 30010))          # 10 tokens,   age 1
+    new = list(range(90000, 90219))            # 219 tokens, shares nothing
+    last_used = [5, 3, 4]                      # now=5 → ages [0, 2, 1]
+
+    idx, reuse = choose_slot([mid, head, probe], last_used, new)
+    assert idx == 2, "value policy must evict the 10-token slot"
+    assert reuse == 0
+
+    # And prove the policies actually disagree here — otherwise this test
+    # would pass without the fix and prove nothing.
+    legacy, _ = choose_slot([mid, head, probe], last_used, new, policy="lru")
+    assert legacy == 1, "legacy LRU evicts the 4227-token head (the bug)"
+
+
+def test_lru_policy_remains_available_as_rollback():
+    big = list(range(1000, 3000))
+    small = list(range(10))
+    # big is stale (age 2), small is fresh (age 0)
+    assert choose_slot([big, small], [1, 3], list(range(70000, 70050)),
+                       policy="lru")[0] == 0      # oldest
+    assert choose_slot([big, small], [1, 3], list(range(70000, 70050)),
+                       policy="value")[0] == 1    # least valuable
+
+
+def test_value_policy_still_prefers_an_empty_slot_first():
+    # An empty slot costs nothing to recycle and must always win.
+    big = list(range(1000, 3000))
+    idx, reuse = choose_slot([big, None], [3, 1], list(range(70000, 70050)))
+    assert idx == 1
+    assert reuse == 0
+
+
+def test_value_decays_so_no_slot_is_immortal():
+    # A big entry outranks a fresh small one only while size/(age+1) is
+    # larger. 4227 vs a fresh 200-token slot crosses over around age 20.
+    head = list(range(4227))
+    fresh = list(range(50000, 50200))          # 200 tokens, age 0
+    new = list(range(90000, 90100))
+
+    # age 10 → 4227/11 = 384 > 200: the head is still worth protecting.
+    assert choose_slot([head, fresh], [0, 10], new)[0] == 1
+    # age 30 → 4227/31 = 136 < 200: the stale head is now the victim.
+    assert choose_slot([head, fresh], [0, 30], new)[0] == 0
+
+
+def test_reuse_selection_is_unchanged_by_policy():
+    # Only the choice of VICTIM moved; a hit above the floor must be
+    # identical under both policies.
+    new = BIG[:4000] + list(range(90000, 90100))
+    assert (choose_slot([BIG, PROBE], [1, 2], new)
+            == choose_slot([BIG, PROBE], [1, 2], new, policy="lru"))
+
+
+def test_slot_evict_value_shape():
+    assert slot_evict_value(None, 0) == 0.0        # empty slots die first
+    assert slot_evict_value([], 5) == 0.0
+    assert slot_evict_value(list(range(100)), 0) == 100.0
+    assert slot_evict_value(list(range(100)), 1) == 50.0
+    assert slot_evict_value(list(range(100)), 9) == 10.0
+
+
+def test_parse_evict_policy_defaults_and_rejects_junk():
+    assert parse_evict_policy(None) == "value"
+    assert parse_evict_policy("lru") == "lru"
+    assert parse_evict_policy("VALUE") == "value"
+    assert parse_evict_policy("nonsense") == "value"   # unknown → default
+    assert parse_evict_policy("") == "value"
 
 
 def test_choose_slot_identical_prompt_caps_at_len_minus_one():
