@@ -3138,6 +3138,13 @@ Examples:
     print(f"\nServing on http://{args.host}:{args.port}/v1/chat/completions")
     print(f"Model: {args.model} ({model_id}{kv_info}{cache_info}{adapter_info}{spec_info})")
     print(f"Engine: {engine_tag} {'(fast text)' if use_lm_path else '(multimodal)'}")
+    # Which COPY of this file is running. human-serve.sh resolves a candidate
+    # chain, and the second candidate (~/Documents/gemma-realtime) is months
+    # stale — it has no enable_thinking fix, no LCP, no eviction policy. A stale
+    # copy starts and serves perfectly well, so the only symptom is a silent
+    # regression. Two wrong-file diagnoses in this project came from reading a
+    # copy that wasn't the one serving; print the path so it is never a guess.
+    print(f"Source: {os.path.realpath(__file__)}", flush=True)
     print(f"Health: http://{args.host}:{args.port}/health\n", flush=True)
 
     try:
