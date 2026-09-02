@@ -276,7 +276,15 @@ def detect_apple_silicon():
 model = None
 processor = None
 config = None
-model_lock = Lock()
+# Task 10 (h-uman 2026-09-01): live requests (X-HU-Priority: live) are admitted
+# ahead of batch machinery. Re-entrant; `with model_lock:` unchanged in meaning.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from priority_lock import PriorityLock as _PriorityLock, LIVE as _PRIO_LIVE
+model_lock = _PriorityLock()
+_EMBED_MODEL = None
+_EMBED_TOK = None
+_EMBED_MODEL_ID = "mlx-community/nomicai-modernbert-embed-base-8bit"
 model_id = None
 use_lm_path = False  # True = mlx_lm (fast text), False = mlx_vlm (multimodal)
 
@@ -2463,6 +2471,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path == "/health/queue":
+            self._send_json(200, model_lock.snapshot()); return
         if self.path == "/health":
             health = {"status": "ok", "model": model_id, "engine": "mlx_lm" if use_lm_path else "mlx_vlm"}
             if kv_bits is not None:
@@ -2881,14 +2891,66 @@ class ChatHandler(BaseHTTPRequestHandler):
             finally:
                 _invalidate_cross_turn_caches("adapter swap")
 
+    def _priority(self):
+        return _PRIO_LIVE if self.headers.get("X-HU-Priority", "").strip().lower() == "live" else "batch"
+
+    def _handle_embeddings(self):
+        """POST /v1/embeddings — OpenAI-shaped. Lazy-loads the nomic embedder
+        (~150 MB) inside THIS process so no second MLX loader ever runs
+        (h-uman rule: never two model instances). Errors are 4xx/5xx JSON,
+        never an empty 200 — a zero vector would score as a measurement."""
+        global _EMBED_MODEL, _EMBED_TOK
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length).decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid JSON"}); return
+        inp = req.get("input")
+        texts = [inp] if isinstance(inp, str) else inp
+        if not isinstance(texts, list) or not texts or not all(isinstance(t, str) and t.strip() for t in texts):
+            self._send_json(400, {"error": "input must be a non-empty string or list of strings"}); return
+        if len(texts) > 256:
+            self._send_json(413, {"error": "max 256 inputs per request"}); return
+        try:
+            import mlx.core as mx  # bound inside functions elsewhere in this file too
+            with model_lock.held(self._priority()):
+                if _EMBED_MODEL is None:
+                    from mlx_embeddings import load as _emb_load
+                    _EMBED_MODEL, _EMBED_TOK = _emb_load(_EMBED_MODEL_ID)
+                ins = _EMBED_TOK.batch_encode_plus(texts, return_tensors="mlx", padding=True,
+                                                   truncation=True, max_length=512)
+                out = _EMBED_MODEL(ins["input_ids"], attention_mask=ins.get("attention_mask"))
+                v = out.text_embeds if hasattr(out, "text_embeds") else out
+                v = v / mx.linalg.norm(v, axis=-1, keepdims=True)
+                mx.eval(v)
+                vecs = v.tolist()
+        except ImportError as e:
+            self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
+        except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
+            self._send_json(500, {"error": f"embedding failed: {type(e).__name__}: {e}"}); return
+        self._send_json(200, {"object": "list", "model": _EMBED_MODEL_ID,
+                              "data": [{"object": "embedding", "index": i, "embedding": vec} for i, vec in enumerate(vecs)],
+                              "usage": {"prompt_tokens": int(ins["input_ids"].size), "total_tokens": int(ins["input_ids"].size)}})
+
     def do_POST(self):
         if self.path == "/v1/adapters/swap":
             self._handle_adapter_swap()
             return
 
+        if self.path == "/v1/embeddings":
+            self._handle_embeddings()
+            return
+
         if self.path != "/v1/chat/completions":
             self._send_json(404, {"error": "not found"})
             return
+
+        # Admission order only: the body below still runs fully serialized
+        # under model_lock (re-entrant), exactly as before this wrapper.
+        with model_lock.held(self._priority()):
+            self._do_chat_completion()
+
+    def _do_chat_completion(self):
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -3124,7 +3186,10 @@ Examples:
         else:
             load_draft_model(draft_name, draft_adapter_path=args.speculative_draft_adapter)
 
-    class MLXHTTPServer(HTTPServer):
+    from socketserver import ThreadingMixIn
+
+    class MLXHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
         allow_reuse_address = True
         allow_reuse_port = True
 
