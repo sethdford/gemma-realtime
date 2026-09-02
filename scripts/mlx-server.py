@@ -40,7 +40,7 @@ import sys
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Lock
+from threading import Lock, Semaphore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import persona_steering as ps  # noqa: E402  (sibling module; activation steering)
@@ -276,12 +276,35 @@ def detect_apple_silicon():
 model = None
 processor = None
 config = None
-# Task 10 (h-uman 2026-09-01): live requests (X-HU-Priority: live) are admitted
-# ahead of batch machinery. Re-entrant; `with model_lock:` unchanged in meaning.
+# Task 10 (h-uman 2026-09-01, REOPENED 2026-09-02): interactive requests
+# (X-HU-Priority: interactive, or no header — the daemon's default) are
+# admitted ahead of batch machinery (X-HU-Priority: batch — the reindexer,
+# eval harnesses). model_lock stays for re-entrant `with model_lock:` call
+# sites inside generate/embed and is harmless now that only one thread ever
+# reaches them, but it is admission_queue below — not model_lock — that
+# actually orders and gates admission. See priority_lock.py's module
+# docstring for why: PriorityLock proves mutual exclusion, not thread
+# affinity, and thread affinity (not locking) was the root cause of the
+# 2026-09-02 SIGSEGV crash loop under ThreadingMixIn (891e1b0).
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from priority_lock import PriorityLock as _PriorityLock, LIVE as _PRIO_LIVE
+from priority_lock import (
+    PriorityLock as _PriorityLock, LIVE as _PRIO_LIVE, BATCH as _PRIO_BATCH,
+    AdmissionQueue as _AdmissionQueue, QueueFull as _QueueFull,
+    parse_priority_header as _parse_priority_header,
+    queue_full_http_response as _queue_full_http_response,
+)
 model_lock = _PriorityLock()
+# Batch cap bounds total in-flight+queued batch jobs so a runaway reindexer
+# or eval harness cannot wedge interactive traffic behind an unbounded
+# queue (the 2026-07-25 retry-amplification doom loop). Live cap is a much
+# larger safety net, not an expected operating limit. Both are overridable
+# for tuning without a code change; see _env_int below (defined later in
+# this file, called only at first use here — fine, Python resolves names at
+# call time).
+_ADMISSION_BATCH_CAP = int(_os.environ.get("HU_MLX_BATCH_QUEUE_CAP", "4"))
+_ADMISSION_LIVE_CAP = int(_os.environ.get("HU_MLX_LIVE_QUEUE_CAP", "64"))
+admission_queue = _AdmissionQueue(batch_cap=_ADMISSION_BATCH_CAP, live_cap=_ADMISSION_LIVE_CAP)
 _EMBED_MODEL = None
 _EMBED_TOK = None
 _EMBED_MODEL_ID = "mlx-community/nomicai-modernbert-embed-base-8bit"
@@ -2454,12 +2477,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] {args[0]}", flush=True)
 
-    def _send_json(self, code, obj):
+    def _send_json(self, code, obj, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -2471,8 +2496,16 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # do_GET runs on whichever accept thread took this connection and
+        # never touches the model — safe to answer even while the worker is
+        # mid-generation. /health/queue's real backlog is admission_queue
+        # now; model_lock.snapshot() is kept alongside it for continuity
+        # (it will read ~always-idle since only the worker ever holds it).
         if self.path == "/health/queue":
-            self._send_json(200, model_lock.snapshot()); return
+            self._send_json(200, {
+                "admission": admission_queue.snapshot(),
+                "model_lock": model_lock.snapshot(),
+            }); return
         if self.path == "/health":
             health = {"status": "ok", "model": model_id, "engine": "mlx_lm" if use_lm_path else "mlx_vlm"}
             if kv_bits is not None:
@@ -2814,14 +2847,34 @@ class ChatHandler(BaseHTTPRequestHandler):
         cache_tag = f" [TQ{kv_bits}b]" if kv_bits is not None else ""
         print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s){cache_tag} | {preview}...", flush=True)
 
+    def _reject_if_priority_class_over_cap(self, priority):
+        """Cheap pre-check, on the ACCEPT thread, before reading a
+        (possibly large) request body: if `priority`'s class is already at
+        its admission_queue cap, send 503 + Retry-After and return True. No
+        model-touching code has run when this fires. This is a best-effort
+        fast path only — submit_and_wait() re-checks the same caps
+        atomically, so a race here can only waste a body read, never let an
+        over-cap request through or wrongly reject one that would fit."""
+        if not admission_queue.can_admit(priority):
+            code, body, headers = _queue_full_http_response(
+                _QueueFull(f"{priority} queue at capacity"))
+            self._send_json(code, body, headers=headers)
+            return True
+        return False
+
     def _handle_adapter_swap(self):
         """POST /v1/adapters/swap — hot-swap LoRA adapter weights on the live model.
 
         Body: {"adapter_path": "/abs/path/to/dir-containing-adapters.safetensors"}
-        Serializes against /v1/chat/completions via model_lock. On failure mid-swap,
-        attempts to revert to the previously-active adapter.
+        Rare admin op — always submitted at BATCH priority (never cuts ahead
+        of real interactive traffic) through admission_queue, so it still
+        only ever runs on the single dedicated worker thread. On failure
+        mid-swap, attempts to revert to the previously-active adapter.
         """
         global adapter_path_global, tensors_loaded_global
+
+        if self._reject_if_priority_class_over_cap(_PRIO_BATCH):
+            return
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -2851,11 +2904,14 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         old_adapter = adapter_path_global
         new_adapter = str(resolved)
-        # Serialize against inference. Block; adapter swap is rare.
-        # The finally below runs on every path (success, revert, revert-
-        # failure): once _apply_adapter_weights has been attempted, cached
-        # KV can no longer be trusted to match the live weights.
-        with model_lock:
+
+        def _run_swap():
+            # The finally below runs on every path (success, revert, revert-
+            # failure): once _apply_adapter_weights has been attempted, cached
+            # KV can no longer be trusted to match the live weights. This
+            # entire closure executes on the single admission_queue worker
+            # thread — no other thread ever calls _apply_adapter_weights.
+            global adapter_path_global, tensors_loaded_global
             try:
                 n_tensors = _apply_adapter_weights(new_adapter)
                 adapter_path_global = new_adapter
@@ -2865,7 +2921,6 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "adapter_path": new_adapter,
                     "tensors_loaded": n_tensors,
                 })
-                return
             except Exception as e:
                 err = str(e)
                 print(f"[swap] FAILED applying {new_adapter}: {err}", flush=True)
@@ -2887,12 +2942,17 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "message": err,
                     "reverted_to": old_adapter,
                 })
-                return
             finally:
                 _invalidate_cross_turn_caches("adapter swap")
 
+        try:
+            admission_queue.submit_and_wait(_PRIO_BATCH, _run_swap, name="adapter_swap")
+        except _QueueFull as exc:
+            code, body, headers = _queue_full_http_response(exc)
+            self._send_json(code, body, headers=headers)
+
     def _priority(self):
-        return _PRIO_LIVE if self.headers.get("X-HU-Priority", "").strip().lower() == "live" else "batch"
+        return _parse_priority_header(self.headers.get("X-HU-Priority"))
 
     def _handle_embeddings(self):
         """POST /v1/embeddings — OpenAI-shaped. Lazy-loads the nomic embedder
@@ -2900,6 +2960,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         (h-uman rule: never two model instances). Errors are 4xx/5xx JSON,
         never an empty 200 — a zero vector would score as a measurement."""
         global _EMBED_MODEL, _EMBED_TOK
+        priority = self._priority()
+        if self._reject_if_priority_class_over_cap(priority):
+            return
         length = int(self.headers.get("Content-Length", 0))
         try:
             req = json.loads(self.rfile.read(length).decode("utf-8", errors="replace"))
@@ -2911,9 +2974,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "input must be a non-empty string or list of strings"}); return
         if len(texts) > 256:
             self._send_json(413, {"error": "max 256 inputs per request"}); return
-        try:
-            import mlx.core as mx  # bound inside functions elsewhere in this file too
-            with model_lock.held(self._priority()):
+
+        def _run_embed():
+            # Everything below — including the `import mlx.core` — executes
+            # solely on the single admission_queue worker thread.
+            global _EMBED_MODEL, _EMBED_TOK
+            try:
+                import mlx.core as mx  # bound inside functions elsewhere in this file too
                 if _EMBED_MODEL is None:
                     from mlx_embeddings import load as _emb_load
                     _EMBED_MODEL, _EMBED_TOK = _emb_load(_EMBED_MODEL_ID)
@@ -2940,13 +3007,19 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if still:
                     self._send_json(422, {"error": "nan embedding", "indices": still}); return
                 mx.clear_cache()  # embeddings must not grow the LLM process's Metal pool
-        except ImportError as e:
-            self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
-        except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
-            self._send_json(500, {"error": f"embedding failed: {type(e).__name__}: {e}"}); return
-        self._send_json(200, {"object": "list", "model": _EMBED_MODEL_ID,
-                              "data": [{"object": "embedding", "index": i, "embedding": vec} for i, vec in enumerate(vecs)],
-                              "usage": {"prompt_tokens": int(ins["input_ids"].size), "total_tokens": int(ins["input_ids"].size)}})
+            except ImportError as e:
+                self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
+            except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
+                self._send_json(500, {"error": f"embedding failed: {type(e).__name__}: {e}"}); return
+            self._send_json(200, {"object": "list", "model": _EMBED_MODEL_ID,
+                                  "data": [{"object": "embedding", "index": i, "embedding": vec} for i, vec in enumerate(vecs)],
+                                  "usage": {"prompt_tokens": int(ins["input_ids"].size), "total_tokens": int(ins["input_ids"].size)}})
+
+        try:
+            admission_queue.submit_and_wait(priority, _run_embed, name="embeddings")
+        except _QueueFull as exc:
+            code, body, headers = _queue_full_http_response(exc)
+            self._send_json(code, body, headers=headers)
 
     def do_POST(self):
         if self.path == "/v1/adapters/swap":
@@ -2961,12 +3034,17 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        # Admission order only: the body below still runs fully serialized
-        # under model_lock (re-entrant), exactly as before this wrapper.
-        with model_lock.held(self._priority()):
-            self._do_chat_completion()
-
-    def _do_chat_completion(self):
+        # Everything up to here (routing on self.path) touches nothing but
+        # the request line — safe on any accept thread. From here on, model
+        # access is gated entirely by admission_queue: this accept thread
+        # reads/parses the body (pure socket + JSON, no mlx), then blocks in
+        # submit_and_wait while the SINGLE persistent worker thread runs
+        # _do_chat_completion. See priority_lock.AdmissionQueue's docstring
+        # for why this — not just model_lock — is what makes concurrent
+        # accept threads safe here (thread AFFINITY, not just exclusion).
+        priority = self._priority()
+        if self._reject_if_priority_class_over_cap(priority):
+            return
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -2976,14 +3054,29 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return
 
-        t0 = time.time()
         resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        t0 = time.time()
+
+        try:
+            admission_queue.submit_and_wait(
+                priority, lambda: self._do_chat_completion(req, resp_id, t0),
+                name="chat_completion")
+        except _QueueFull as exc:
+            code, body_, headers = _queue_full_http_response(exc)
+            self._send_json(code, body_, headers=headers)
+
+    def _do_chat_completion(self, req, resp_id, t0):
+        """Runs ONLY on the admission_queue worker thread. `req` was already
+        read and JSON-parsed on the accept thread in do_POST — nothing here
+        touches the socket's read side, only generation + the write side."""
 
         # Activation steering: arm per-request trait coefficients from the
-        # optional "steering" field, then clear after. The server is
-        # single-threaded (HTTPServer), so requests are fully serialized — no
-        # cross-request leakage. No "steering" field => set_active({}) => the
-        # layer hook is a strict no-op (byte-identical to unsteered).
+        # optional "steering" field, then clear after. Exactly one thread —
+        # the admission_queue worker — ever runs chat-completion bodies, so
+        # this is still fully serialized and cross-request-leak-free even
+        # though multiple accept threads may be parsing/queued concurrently.
+        # No "steering" field => set_active({}) => the layer hook is a
+        # strict no-op (byte-identical to unsteered).
         ps.set_active(req.get("steering"))
         try:
             if req.get("stream", False):
@@ -3202,14 +3295,47 @@ Examples:
         else:
             load_draft_model(draft_name, draft_adapter_path=args.speculative_draft_adapter)
 
-    # 2026-09-02: ThreadingMixIn was reverted after SIGSEGV restarts — pre-lock MLX work
-    # (tokenizer / prompt cache / steering) assumes one request at a time. The
-    # PriorityLock and /v1/embeddings stay; live-ahead-of-batch needs a queue in
-    # front of a single worker, not concurrent handlers.
-    class MLXHTTPServer(HTTPServer):
-        pass
+    # Task 10 REOPENED (2026-09-02): ThreadingMixIn was reverted after a SIGSEGV
+    # crash loop (891e1b0) — but the actual root cause was thread AFFINITY, not
+    # concurrency: every accept-per-connection thread called straight into
+    # mx/Metal via _do_chat_completion, so different OS threads took turns
+    # inside mx over the process's lifetime. PriorityLock correctly serialized
+    # those calls; it never guaranteed they all came from the same thread.
+    #
+    # This time, accept threads do only socket I/O + JSON parsing + admission_
+    # queue.submit_and_wait (see do_GET/do_POST/_handle_embeddings/
+    # _handle_adapter_swap above) — never mx, never generate/embed, never a
+    # global the model touches. Every mx/model call in this file runs solely on
+    # admission_queue's one persistent worker thread. ThreadingMixIn is
+    # reintroduced ONLY for that reason, and bounded (not one-thread-per-
+    # connection-forever) via a semaphore so a connection flood can't spawn an
+    # unbounded number of threads. This has NOT been re-verified against the
+    # live model/Metal (the hard constraint on this task forbids starting or
+    # loading against :8741) — it is a design argument from the crash's actual
+    # mechanism, not an empirical re-test. Roll back to a bare `HTTPServer`
+    # (single accept thread — X-HU-Priority becomes inert again, but safe) if
+    # a crash recurs.
+    from socketserver import ThreadingMixIn
+
+    class MLXHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
         allow_reuse_address = True
         allow_reuse_port = True
+        block_on_close = True  # wait for in-flight accept threads on shutdown()
+
+        def __init__(self, *a, **kw):
+            self._accept_sem = Semaphore(_env_int("HU_MLX_MAX_ACCEPT_THREADS", 32))
+            super().__init__(*a, **kw)
+
+        def process_request(self, request, client_address):
+            self._accept_sem.acquire()
+            super().process_request(request, client_address)
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self._accept_sem.release()
 
     server = MLXHTTPServer((args.host, args.port), ChatHandler)
     tq_label = "TurboQuant+" if turbo_cache is not None else "quantized"
