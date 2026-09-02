@@ -2924,6 +2924,21 @@ class ChatHandler(BaseHTTPRequestHandler):
                 v = v / mx.linalg.norm(v, axis=-1, keepdims=True)
                 mx.eval(v)
                 vecs = v.tolist()
+                # NaN guard (2026-09-01): a long row poisons a padded batch in the
+                # 8-bit model. Re-embed NaN rows alone; anything still NaN is an
+                # error the caller must see, never a NaN token in the JSON.
+                bad = [i for i, vec in enumerate(vecs) if any(x != x for x in vec)]
+                for i in bad:
+                    one = _EMBED_TOK.batch_encode_plus([texts[i]], return_tensors="mlx", padding=True,
+                                                       truncation=True, max_length=512)
+                    o1 = _EMBED_MODEL(one["input_ids"], attention_mask=one.get("attention_mask"))
+                    v1 = o1.text_embeds if hasattr(o1, "text_embeds") else o1
+                    v1 = v1 / mx.linalg.norm(v1, axis=-1, keepdims=True)
+                    mx.eval(v1)
+                    vecs[i] = v1.tolist()[0]
+                still = [i for i in bad if any(x != x for x in vecs[i])]
+                if still:
+                    self._send_json(422, {"error": "nan embedding", "indices": still}); return
         except ImportError as e:
             self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
         except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
