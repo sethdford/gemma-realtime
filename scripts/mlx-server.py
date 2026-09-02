@@ -2939,6 +2939,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 still = [i for i in bad if any(x != x for x in vecs[i])]
                 if still:
                     self._send_json(422, {"error": "nan embedding", "indices": still}); return
+                mx.clear_cache()  # embeddings must not grow the LLM process's Metal pool
         except ImportError as e:
             self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
         except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
