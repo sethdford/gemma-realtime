@@ -3201,10 +3201,12 @@ Examples:
         else:
             load_draft_model(draft_name, draft_adapter_path=args.speculative_draft_adapter)
 
-    from socketserver import ThreadingMixIn
-
-    class MLXHTTPServer(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
+    # 2026-09-02: ThreadingMixIn was reverted after SIGSEGV restarts — pre-lock MLX work
+    # (tokenizer / prompt cache / steering) assumes one request at a time. The
+    # PriorityLock and /v1/embeddings stay; live-ahead-of-batch needs a queue in
+    # front of a single worker, not concurrent handlers.
+    class MLXHTTPServer(HTTPServer):
+        pass
         allow_reuse_address = True
         allow_reuse_port = True
 
