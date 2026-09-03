@@ -885,26 +885,42 @@ class TestAdapterServingStatus(unittest.TestCase):
         self.assertEqual(self.mod.tensors_loaded_global, 0)  # fail-loud observability
         self.assertFalse(self.mod.tensors_loaded_global > 0)  # -> adapter_applied == False
 
-    def test_adapter_applied_records_tensor_count(self):
+    def test_adapter_applied_records_bound_tensor_count(self):
+        """tensors_loaded_global must be the number of adapter tensors that
+        actually intersect the model's parameters AFTER LoRA injection — not
+        len(<safetensors>). The old len() report is how the persona adapter was
+        a silent no-op on :8741 from 2026-07-26 to 2026-09-03 (see
+        tests/test_mlx_server_adapter_binding.py for the full contract)."""
+        import json
         import tempfile
         import os as _os
         import mlx.core as mx
-        captured = {}
+        import mlx.nn as nn
 
-        class _FakeModel:
-            def load_weights(self, adapters, strict=False):
-                captured["n"] = len(adapters)
+        class _Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(2, 2, bias=False)
 
-        loader = lambda name: (_FakeModel(), object())
+        class _Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [_Block()]
+
+        loader = lambda name: (_Tiny(), object())
         with tempfile.TemporaryDirectory() as d:
+            with open(_os.path.join(d, "adapter_config.json"), "w") as f:
+                json.dump({"fine_tune_type": "lora", "num_layers": 1,
+                           "lora_parameters": {"rank": 1, "scale": 1.0, "dropout": 0.0}}, f)
             mx.save_safetensors(
                 _os.path.join(d, "adapters.safetensors"),
-                {"a": mx.zeros((2, 2)), "b": mx.zeros((2, 2))},
+                {"layers.0.proj.lora_a": mx.ones((2, 1)),
+                 "layers.0.proj.lora_b": mx.ones((1, 2)),
+                 "not.a.model.key": mx.zeros((2, 2))},   # must NOT be counted
             )
             self.mod.tensors_loaded_global = 0
             self.mod._load_with_adapter(loader, "base/model", d)
-        self.assertEqual(captured["n"], 2)                   # load_weights got 2 tensors
-        self.assertEqual(self.mod.tensors_loaded_global, 2)  # -> adapter_applied == True
+        self.assertEqual(self.mod.tensors_loaded_global, 2)  # bound keys only -> adapter_applied == True
 
 
 class EchoGuardTests(unittest.TestCase):
