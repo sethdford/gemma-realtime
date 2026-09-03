@@ -276,7 +276,15 @@ def detect_apple_silicon():
 model = None
 processor = None
 config = None
-model_lock = Lock()
+# Task 10 (h-uman 2026-09-01): live requests (X-HU-Priority: live) are admitted
+# ahead of batch machinery. Re-entrant; `with model_lock:` unchanged in meaning.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from priority_lock import PriorityLock as _PriorityLock, LIVE as _PRIO_LIVE
+model_lock = _PriorityLock()
+_EMBED_MODEL = None
+_EMBED_TOK = None
+_EMBED_MODEL_ID = "mlx-community/nomicai-modernbert-embed-base-8bit"
 model_id = None
 use_lm_path = False  # True = mlx_lm (fast text), False = mlx_vlm (multimodal)
 
@@ -389,29 +397,93 @@ def _check_ple_safety(model_name):
         print(f"  PLE-safe model confirmed: {model_name}", flush=True)
 
 
+def _remove_lora_layers(target):
+    """Strip every LoRA/DoRA wrapper from ``target``, restoring the base layers.
+
+    mlx_lm 0.31's ``remove_lora_layers`` only unwraps ``LoRALinear``. On a MoE
+    base (GLM-4.5-Air: ``mlp.switch_mlp`` is a SwitchLinear → LoRASwitchLinear)
+    the expert wrappers survive, and the next ``linear_to_lora_layers`` fails with
+    "Can't convert layer of type LoRASwitchLinear to LoRA" — i.e. every adapter
+    swap after the first would 500. Unwrap by attribute instead of by class so
+    Linear/SwitchLinear (``.linear``) and Embedding (``.embedding``) wrappers all
+    come off. Returns the number of wrappers removed.
+    """
+    from mlx.utils import tree_unflatten
+
+    restored = []
+    for name, module in target.named_modules():
+        if not type(module).__name__.startswith(("LoRA", "DoRA")):
+            continue
+        base = getattr(module, "linear", None) or getattr(module, "embedding", None)
+        if base is not None:
+            restored.append((name, base))
+    if restored:
+        target.update_modules(tree_unflatten(restored))
+    return len(restored)
+
+
+def _bind_adapter(target, adapter_dir):
+    """Inject LoRA layers per <adapter_dir>/adapter_config.json, load
+    adapters.safetensors into them, and return the number of adapter tensors
+    that are ACTUALLY bound (adapter keys ∩ model parameter keys after binding).
+
+    Why not plain ``model.load_weights(..., strict=False)``: mlx's
+    ``Module.update(strict=False)`` silently drops every key the module does
+    not already have. Without ``linear_to_lora_layers`` the base model has no
+    ``lora_a``/``lora_b`` parameters, so every adapter tensor was dropped and
+    the persona LoRA was a no-op (measured 2026-09-03: zero-delta twin vs real
+    adapter, 6/6 prompts byte-identical at temp 0).
+
+    Idempotent across swaps: any LoRA layers from a previous adapter are removed
+    first so a swap replaces rather than nests.
+
+    mlx_lm models expose ``.layers``; mlx_vlm models wrap the text stack under
+    ``.language_model`` and use their own adapter layout, so route accordingly.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from pathlib import Path
+
+    adapter_dir = str(adapter_dir)
+    adapter_file = Path(adapter_dir) / "adapters.safetensors"
+    if not adapter_file.is_file():
+        raise FileNotFoundError(str(adapter_file))
+
+    if hasattr(target, "layers"):
+        from mlx_lm.tuner.utils import load_adapters
+        _remove_lora_layers(target)
+        load_adapters(target, adapter_dir)
+    elif hasattr(target, "language_model"):
+        from mlx_vlm.trainer.utils import apply_lora_layers
+        apply_lora_layers(target, adapter_dir)
+    else:
+        raise RuntimeError(
+            f"cannot bind LoRA adapter: {type(target).__name__} has neither "
+            f".layers (mlx_lm) nor .language_model (mlx_vlm)")
+
+    adapter_keys = set(mx.load(str(adapter_file)).keys())
+    param_keys = {k for k, _ in tree_flatten(target.parameters())}
+    return len(adapter_keys & param_keys)
+
+
 def _load_with_adapter(load_fn, model_name, adapter_path):
-    """Load a model and apply LoRA adapter weights.
+    """Load a model and bind its LoRA adapter (see ``_bind_adapter``).
 
     Fail-loud invariant: when ``adapter_path`` is configured but the adapter cannot
-    be applied (no adapters.safetensors), the server must NOT silently fall back to
-    base weights. That silent fallback masked an inactive persona fine-tune for
-    weeks — /health reported a configured ``adapter`` path while the model was
-    actually serving base. We warn prominently and record
-    ``tensors_loaded_global = 0`` so the state is observable via /health
-    (``adapter_applied``).
+    be applied — adapters.safetensors missing, OR the adapter loads but binds ZERO
+    tensors (key layout / layer-count mismatch, or a LoRA-injection failure) — the
+    server must NOT silently claim the persona fine-tune is active. Both cases
+    record ``tensors_loaded_global = 0`` so /health reports
+    ``adapter_applied=false``, and print a prominent WARNING. That silent
+    fallback masked an inactive persona fine-tune for weeks (missing-file case)
+    and then again from 2026-07-26 to 2026-09-03 (zero-bound case).
     """
     global tensors_loaded_global
-    import mlx.core as mx
     from pathlib import Path
 
     model, tokenizer = load_fn(model_name)
     adapter_file = Path(adapter_path) / "adapters.safetensors"
-    if adapter_file.exists():
-        adapters = list(mx.load(str(adapter_file)).items())
-        model.load_weights(adapters, strict=False)
-        tensors_loaded_global = len(adapters)
-        print(f"  Applied {len(adapters)} LoRA weight tensors from {adapter_file}", flush=True)
-    else:
+    if not adapter_file.exists():
         tensors_loaded_global = 0
         print(
             f"  WARNING: adapter configured ({adapter_path}) but {adapter_file.name} "
@@ -419,18 +491,37 @@ def _load_with_adapter(load_fn, model_name, adapter_path):
             f"is NOT active. Check ~/.human/config.json mlx_local.adapter_path.",
             flush=True,
         )
+        return model, tokenizer
+
+    try:
+        bound = _bind_adapter(model, adapter_path)
+    except Exception as e:  # noqa: BLE001 — surface, then serve base observably
+        bound = 0
+        print(f"  WARNING: LoRA binding raised for {adapter_path}: {e}", flush=True)
+    tensors_loaded_global = bound
+    if bound > 0:
+        print(f"  Bound {bound} LoRA weight tensors from {adapter_file}", flush=True)
+    else:
+        print(
+            f"  WARNING: adapter {adapter_file} loaded but bound 0 tensors to the "
+            f"model — serving BASE weights. The persona fine-tune is NOT active "
+            f"(/health adapter_applied=false). Check adapter_config.json "
+            f"num_layers/lora_parameters against the base model.",
+            flush=True,
+        )
     return model, tokenizer
 
 
 def _apply_adapter_weights(adapter_path):
-    """Apply LoRA weights from <adapter_path>/adapters.safetensors to the live model.
+    """Bind LoRA weights from <adapter_path> to the live model (hot swap).
 
-    Caller MUST hold model_lock. Returns the number of tensors applied.
+    Caller MUST hold model_lock. Returns the number of tensors actually bound.
     Raises FileNotFoundError if adapters.safetensors is missing.
-    Raises any model.load_weights error (caller decides how to recover).
+    Raises RuntimeError if the adapter binds zero tensors — a swap that changes
+    nothing is a failure, not a success (the caller reverts to the prior adapter).
+    Raises any load_adapters error (caller decides how to recover).
     """
     global tensors_loaded_global
-    import mlx.core as mx
     from pathlib import Path
 
     if model is None:
@@ -438,10 +529,13 @@ def _apply_adapter_weights(adapter_path):
     adapter_file = Path(adapter_path) / "adapters.safetensors"
     if not adapter_file.exists():
         raise FileNotFoundError(str(adapter_file))
-    adapters = list(mx.load(str(adapter_file)).items())
-    model.load_weights(adapters, strict=False)
-    tensors_loaded_global = len(adapters)
-    return len(adapters)
+    bound = _bind_adapter(model, adapter_path)
+    tensors_loaded_global = bound
+    if bound == 0:
+        raise RuntimeError(
+            f"adapter {adapter_file} bound 0 of its tensors to the model "
+            f"(key layout / num_layers mismatch) — refusing to report success")
+    return bound
 
 
 def load_model(model_name, adapter_path=None):
@@ -2463,6 +2557,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path == "/health/queue":
+            self._send_json(200, model_lock.snapshot()); return
         if self.path == "/health":
             health = {"status": "ok", "model": model_id, "engine": "mlx_lm" if use_lm_path else "mlx_vlm"}
             if kv_bits is not None:
@@ -2844,7 +2940,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         # Serialize against inference. Block; adapter swap is rare.
         # The finally below runs on every path (success, revert, revert-
         # failure): once _apply_adapter_weights has been attempted, cached
-        # KV can no longer be trusted to match the live weights.
+        # KV can no longer be trusted to match the live weights (LoRA layers
+        # change the weights every cached prefix was computed against).
         with model_lock:
             try:
                 n_tensors = _apply_adapter_weights(new_adapter)
@@ -2866,6 +2963,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                         adapter_path_global = old_adapter
                         print(f"[swap] reverted to {old_adapter} ({n_reverted} tensors)", flush=True)
                     except Exception as revert_err:
+                        # Neither adapter is reliably bound; make /health say so.
+                        tensors_loaded_global = 0
                         print(f"[swap] REVERT FAILED: {revert_err}", flush=True)
                 else:
                     # No prior adapter to revert to. Clear the marker and tensor count;
@@ -2881,14 +2980,82 @@ class ChatHandler(BaseHTTPRequestHandler):
             finally:
                 _invalidate_cross_turn_caches("adapter swap")
 
+    def _priority(self):
+        return _PRIO_LIVE if self.headers.get("X-HU-Priority", "").strip().lower() == "live" else "batch"
+
+    def _handle_embeddings(self):
+        """POST /v1/embeddings — OpenAI-shaped. Lazy-loads the nomic embedder
+        (~150 MB) inside THIS process so no second MLX loader ever runs
+        (h-uman rule: never two model instances). Errors are 4xx/5xx JSON,
+        never an empty 200 — a zero vector would score as a measurement."""
+        global _EMBED_MODEL, _EMBED_TOK
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length).decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid JSON"}); return
+        inp = req.get("input")
+        texts = [inp] if isinstance(inp, str) else inp
+        if not isinstance(texts, list) or not texts or not all(isinstance(t, str) and t.strip() for t in texts):
+            self._send_json(400, {"error": "input must be a non-empty string or list of strings"}); return
+        if len(texts) > 256:
+            self._send_json(413, {"error": "max 256 inputs per request"}); return
+        try:
+            import mlx.core as mx  # bound inside functions elsewhere in this file too
+            with model_lock.held(self._priority()):
+                if _EMBED_MODEL is None:
+                    from mlx_embeddings import load as _emb_load
+                    _EMBED_MODEL, _EMBED_TOK = _emb_load(_EMBED_MODEL_ID)
+                ins = _EMBED_TOK.batch_encode_plus(texts, return_tensors="mlx", padding=True,
+                                                   truncation=True, max_length=512)
+                out = _EMBED_MODEL(ins["input_ids"], attention_mask=ins.get("attention_mask"))
+                v = out.text_embeds if hasattr(out, "text_embeds") else out
+                v = v / mx.linalg.norm(v, axis=-1, keepdims=True)
+                mx.eval(v)
+                vecs = v.tolist()
+                # NaN guard (2026-09-01): a long row poisons a padded batch in the
+                # 8-bit model. Re-embed NaN rows alone; anything still NaN is an
+                # error the caller must see, never a NaN token in the JSON.
+                bad = [i for i, vec in enumerate(vecs) if any(x != x for x in vec)]
+                for i in bad:
+                    one = _EMBED_TOK.batch_encode_plus([texts[i]], return_tensors="mlx", padding=True,
+                                                       truncation=True, max_length=512)
+                    o1 = _EMBED_MODEL(one["input_ids"], attention_mask=one.get("attention_mask"))
+                    v1 = o1.text_embeds if hasattr(o1, "text_embeds") else o1
+                    v1 = v1 / mx.linalg.norm(v1, axis=-1, keepdims=True)
+                    mx.eval(v1)
+                    vecs[i] = v1.tolist()[0]
+                still = [i for i in bad if any(x != x for x in vecs[i])]
+                if still:
+                    self._send_json(422, {"error": "nan embedding", "indices": still}); return
+                mx.clear_cache()  # embeddings must not grow the LLM process's Metal pool
+        except ImportError as e:
+            self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
+        except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
+            self._send_json(500, {"error": f"embedding failed: {type(e).__name__}: {e}"}); return
+        self._send_json(200, {"object": "list", "model": _EMBED_MODEL_ID,
+                              "data": [{"object": "embedding", "index": i, "embedding": vec} for i, vec in enumerate(vecs)],
+                              "usage": {"prompt_tokens": int(ins["input_ids"].size), "total_tokens": int(ins["input_ids"].size)}})
+
     def do_POST(self):
         if self.path == "/v1/adapters/swap":
             self._handle_adapter_swap()
             return
 
+        if self.path == "/v1/embeddings":
+            self._handle_embeddings()
+            return
+
         if self.path != "/v1/chat/completions":
             self._send_json(404, {"error": "not found"})
             return
+
+        # Admission order only: the body below still runs fully serialized
+        # under model_lock (re-entrant), exactly as before this wrapper.
+        with model_lock.held(self._priority()):
+            self._do_chat_completion()
+
+    def _do_chat_completion(self):
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -3124,7 +3291,12 @@ Examples:
         else:
             load_draft_model(draft_name, draft_adapter_path=args.speculative_draft_adapter)
 
+    # 2026-09-02: ThreadingMixIn was reverted after SIGSEGV restarts — pre-lock MLX work
+    # (tokenizer / prompt cache / steering) assumes one request at a time. The
+    # PriorityLock and /v1/embeddings stay; live-ahead-of-batch needs a queue in
+    # front of a single worker, not concurrent handlers.
     class MLXHTTPServer(HTTPServer):
+        pass
         allow_reuse_address = True
         allow_reuse_port = True
 
