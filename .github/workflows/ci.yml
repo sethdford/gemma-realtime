@@ -36,7 +36,7 @@ jobs:
 
       - name: Verify Fish STS architecture (no GPU needed)
         run: |
-          pip install mlx numpy safetensors
+          pip install "mlx[cpu]" numpy safetensors  # Linux: the mlx wheel alone has no backend (libmlx.so lives in mlx-cpu)
           python3 -c "
           import sys; sys.path.insert(0, 'scripts')
           from fish_sts import FishSpeechToSpeech, FishSTSConfig
