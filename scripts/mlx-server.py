@@ -397,29 +397,93 @@ def _check_ple_safety(model_name):
         print(f"  PLE-safe model confirmed: {model_name}", flush=True)
 
 
+def _remove_lora_layers(target):
+    """Strip every LoRA/DoRA wrapper from ``target``, restoring the base layers.
+
+    mlx_lm 0.31's ``remove_lora_layers`` only unwraps ``LoRALinear``. On a MoE
+    base (GLM-4.5-Air: ``mlp.switch_mlp`` is a SwitchLinear → LoRASwitchLinear)
+    the expert wrappers survive, and the next ``linear_to_lora_layers`` fails with
+    "Can't convert layer of type LoRASwitchLinear to LoRA" — i.e. every adapter
+    swap after the first would 500. Unwrap by attribute instead of by class so
+    Linear/SwitchLinear (``.linear``) and Embedding (``.embedding``) wrappers all
+    come off. Returns the number of wrappers removed.
+    """
+    from mlx.utils import tree_unflatten
+
+    restored = []
+    for name, module in target.named_modules():
+        if not type(module).__name__.startswith(("LoRA", "DoRA")):
+            continue
+        base = getattr(module, "linear", None) or getattr(module, "embedding", None)
+        if base is not None:
+            restored.append((name, base))
+    if restored:
+        target.update_modules(tree_unflatten(restored))
+    return len(restored)
+
+
+def _bind_adapter(target, adapter_dir):
+    """Inject LoRA layers per <adapter_dir>/adapter_config.json, load
+    adapters.safetensors into them, and return the number of adapter tensors
+    that are ACTUALLY bound (adapter keys ∩ model parameter keys after binding).
+
+    Why not plain ``model.load_weights(..., strict=False)``: mlx's
+    ``Module.update(strict=False)`` silently drops every key the module does
+    not already have. Without ``linear_to_lora_layers`` the base model has no
+    ``lora_a``/``lora_b`` parameters, so every adapter tensor was dropped and
+    the persona LoRA was a no-op (measured 2026-09-03: zero-delta twin vs real
+    adapter, 6/6 prompts byte-identical at temp 0).
+
+    Idempotent across swaps: any LoRA layers from a previous adapter are removed
+    first so a swap replaces rather than nests.
+
+    mlx_lm models expose ``.layers``; mlx_vlm models wrap the text stack under
+    ``.language_model`` and use their own adapter layout, so route accordingly.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from pathlib import Path
+
+    adapter_dir = str(adapter_dir)
+    adapter_file = Path(adapter_dir) / "adapters.safetensors"
+    if not adapter_file.is_file():
+        raise FileNotFoundError(str(adapter_file))
+
+    if hasattr(target, "layers"):
+        from mlx_lm.tuner.utils import load_adapters
+        _remove_lora_layers(target)
+        load_adapters(target, adapter_dir)
+    elif hasattr(target, "language_model"):
+        from mlx_vlm.trainer.utils import apply_lora_layers
+        apply_lora_layers(target, adapter_dir)
+    else:
+        raise RuntimeError(
+            f"cannot bind LoRA adapter: {type(target).__name__} has neither "
+            f".layers (mlx_lm) nor .language_model (mlx_vlm)")
+
+    adapter_keys = set(mx.load(str(adapter_file)).keys())
+    param_keys = {k for k, _ in tree_flatten(target.parameters())}
+    return len(adapter_keys & param_keys)
+
+
 def _load_with_adapter(load_fn, model_name, adapter_path):
-    """Load a model and apply LoRA adapter weights.
+    """Load a model and bind its LoRA adapter (see ``_bind_adapter``).
 
     Fail-loud invariant: when ``adapter_path`` is configured but the adapter cannot
-    be applied (no adapters.safetensors), the server must NOT silently fall back to
-    base weights. That silent fallback masked an inactive persona fine-tune for
-    weeks — /health reported a configured ``adapter`` path while the model was
-    actually serving base. We warn prominently and record
-    ``tensors_loaded_global = 0`` so the state is observable via /health
-    (``adapter_applied``).
+    be applied — adapters.safetensors missing, OR the adapter loads but binds ZERO
+    tensors (key layout / layer-count mismatch, or a LoRA-injection failure) — the
+    server must NOT silently claim the persona fine-tune is active. Both cases
+    record ``tensors_loaded_global = 0`` so /health reports
+    ``adapter_applied=false``, and print a prominent WARNING. That silent
+    fallback masked an inactive persona fine-tune for weeks (missing-file case)
+    and then again from 2026-07-26 to 2026-09-03 (zero-bound case).
     """
     global tensors_loaded_global
-    import mlx.core as mx
     from pathlib import Path
 
     model, tokenizer = load_fn(model_name)
     adapter_file = Path(adapter_path) / "adapters.safetensors"
-    if adapter_file.exists():
-        adapters = list(mx.load(str(adapter_file)).items())
-        model.load_weights(adapters, strict=False)
-        tensors_loaded_global = len(adapters)
-        print(f"  Applied {len(adapters)} LoRA weight tensors from {adapter_file}", flush=True)
-    else:
+    if not adapter_file.exists():
         tensors_loaded_global = 0
         print(
             f"  WARNING: adapter configured ({adapter_path}) but {adapter_file.name} "
@@ -427,18 +491,37 @@ def _load_with_adapter(load_fn, model_name, adapter_path):
             f"is NOT active. Check ~/.human/config.json mlx_local.adapter_path.",
             flush=True,
         )
+        return model, tokenizer
+
+    try:
+        bound = _bind_adapter(model, adapter_path)
+    except Exception as e:  # noqa: BLE001 — surface, then serve base observably
+        bound = 0
+        print(f"  WARNING: LoRA binding raised for {adapter_path}: {e}", flush=True)
+    tensors_loaded_global = bound
+    if bound > 0:
+        print(f"  Bound {bound} LoRA weight tensors from {adapter_file}", flush=True)
+    else:
+        print(
+            f"  WARNING: adapter {adapter_file} loaded but bound 0 tensors to the "
+            f"model — serving BASE weights. The persona fine-tune is NOT active "
+            f"(/health adapter_applied=false). Check adapter_config.json "
+            f"num_layers/lora_parameters against the base model.",
+            flush=True,
+        )
     return model, tokenizer
 
 
 def _apply_adapter_weights(adapter_path):
-    """Apply LoRA weights from <adapter_path>/adapters.safetensors to the live model.
+    """Bind LoRA weights from <adapter_path> to the live model (hot swap).
 
-    Caller MUST hold model_lock. Returns the number of tensors applied.
+    Caller MUST hold model_lock. Returns the number of tensors actually bound.
     Raises FileNotFoundError if adapters.safetensors is missing.
-    Raises any model.load_weights error (caller decides how to recover).
+    Raises RuntimeError if the adapter binds zero tensors — a swap that changes
+    nothing is a failure, not a success (the caller reverts to the prior adapter).
+    Raises any load_adapters error (caller decides how to recover).
     """
     global tensors_loaded_global
-    import mlx.core as mx
     from pathlib import Path
 
     if model is None:
@@ -446,10 +529,13 @@ def _apply_adapter_weights(adapter_path):
     adapter_file = Path(adapter_path) / "adapters.safetensors"
     if not adapter_file.exists():
         raise FileNotFoundError(str(adapter_file))
-    adapters = list(mx.load(str(adapter_file)).items())
-    model.load_weights(adapters, strict=False)
-    tensors_loaded_global = len(adapters)
-    return len(adapters)
+    bound = _bind_adapter(model, adapter_path)
+    tensors_loaded_global = bound
+    if bound == 0:
+        raise RuntimeError(
+            f"adapter {adapter_file} bound 0 of its tensors to the model "
+            f"(key layout / num_layers mismatch) — refusing to report success")
+    return bound
 
 
 def load_model(model_name, adapter_path=None):
@@ -2854,7 +2940,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         # Serialize against inference. Block; adapter swap is rare.
         # The finally below runs on every path (success, revert, revert-
         # failure): once _apply_adapter_weights has been attempted, cached
-        # KV can no longer be trusted to match the live weights.
+        # KV can no longer be trusted to match the live weights (LoRA layers
+        # change the weights every cached prefix was computed against).
         with model_lock:
             try:
                 n_tensors = _apply_adapter_weights(new_adapter)
@@ -2876,6 +2963,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                         adapter_path_global = old_adapter
                         print(f"[swap] reverted to {old_adapter} ({n_reverted} tensors)", flush=True)
                     except Exception as revert_err:
+                        # Neither adapter is reliably bound; make /health say so.
+                        tensors_loaded_global = 0
                         print(f"[swap] REVERT FAILED: {revert_err}", flush=True)
                 else:
                     # No prior adapter to revert to. Clear the marker and tensor count;
