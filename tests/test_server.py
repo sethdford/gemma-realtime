@@ -5,6 +5,7 @@ Unit tests run without any model loaded (fast, no GPU).
 Integration tests start the server with a small model and test real HTTP endpoints.
 """
 
+import importlib.util
 import json
 import os
 import signal
@@ -17,6 +18,31 @@ import urllib.request
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
+
+# mlx-server.py imports mlx.core + mlx_lm at module top level (via
+# _install_mlx_lm_patches). On hosts without them (the ubuntu `lint` CI job
+# only pip-installs pytest) every class that loads the server would ERROR in
+# setUpClass. Skip those classes instead so the run reports
+# "passed/skipped, 0 errors" and a real regression is distinguishable.
+_MLX_MISSING = [m for m in ("mlx", "mlx_lm") if importlib.util.find_spec(m) is None]
+
+
+def _load_server(module_name):
+    """Execute scripts/mlx-server.py as a FRESH module named `module_name`.
+
+    Each test class gets its own copy because several of them mutate module
+    globals; never cache the result here.
+    """
+    if _MLX_MISSING:
+        raise unittest.SkipTest(
+            f"{', '.join(_MLX_MISSING)} not installed; "
+            "skipping tests that load mlx-server.py")
+    spec = importlib.util.spec_from_file_location(
+        module_name, os.path.join(SCRIPTS_DIR, "mlx-server.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestStripStopTokens(unittest.TestCase):
@@ -112,12 +138,7 @@ class TestNoThinkInjection(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_for_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_for_test")
 
     def setUp(self):
         # Save + clear env so tests are deterministic regardless of host env.
@@ -219,12 +240,7 @@ class TestThinkingHeadroom(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_headroom_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_headroom_test")
 
     def setUp(self):
         self._prev = os.environ.pop("GEMMA_THINKING_HEADROOM_TOKENS", None)
@@ -285,12 +301,7 @@ class TestStructuredOutputDetection(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_structdetect_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_structdetect_test")
 
     def test_casual_chat_is_not_structured(self):
         msgs = [{"role": "system", "content": "You are Seth. Be brief and natural."},
@@ -354,12 +365,7 @@ class TestNoThinkStructuredVariant(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_structvariant_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_structvariant_test")
 
     def setUp(self):
         self._prev = os.environ.pop("GEMMA_DISABLE_THINKING", None)
@@ -422,12 +428,7 @@ class TestPureDeliberationGuard(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_pdelib_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_pdelib_test")
 
     def test_empty_is_not_deliberation(self):
         self.assertFalse(self.mod._is_pure_deliberation(""))
@@ -479,12 +480,7 @@ class TestFinalizeGeneration(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_finalize_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_finalize_test")
 
     def test_empty_returns_empty_not_runaway(self):
         clean, runaway = self.mod.finalize_generation("")
@@ -573,12 +569,7 @@ class TestStreamShouldBuffer(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_sbuf_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_sbuf_test")
 
     def setUp(self):
         self._saved = {
@@ -771,12 +762,7 @@ class TestStreamShouldBufferPrecedence(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_bufferprec_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_bufferprec_test")
 
     def setUp(self):
         self._prev_env = os.environ.pop("HU_STREAM_BUFFER_STRIP", None)
@@ -867,12 +853,7 @@ class TestAdapterServingStatus(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_adapter_status", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_adapter_status")
 
     def test_missing_adapter_records_zero_and_serves_base(self):
         import tempfile
@@ -935,12 +916,7 @@ class EchoGuardTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_for_echo_test", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_for_echo_test")
 
     SYS = ("You are Seth, texting from your own phone. Reply in your own voice: "
            "casual, short, lowercase. Their recent messages are short; match "
@@ -1023,12 +999,7 @@ class TestStreamThoughtFilterBulletHold(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_bullet_hold", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_bullet_hold")
 
     def _run(self, chunks, mode="strip"):
         f = self.mod.StreamThoughtFilter(mode=mode)
@@ -1091,11 +1062,7 @@ class TestDeliberationResidueNeverEmitted(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_residue", os.path.join(SCRIPTS_DIR, "mlx-server.py"))
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_residue")
 
     def test_the_brea_leak_is_blocked(self):
         raw = ("*   Brea says the litigation scared the buyer away\n"
@@ -1154,12 +1121,7 @@ class TestGlmThinkBlockStripping(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_glm_think", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_glm_think")
 
     # ── non-stream funnel ────────────────────────────────────────────────
     def test_closed_think_block_stripped_reply_survives(self):
@@ -1324,12 +1286,7 @@ class TestThinkingSuppressionReachesTemplate(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "mlx_server_think_wiring", os.path.join(SCRIPTS_DIR, "mlx-server.py")
-        )
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+        cls.mod = _load_server("mlx_server_think_wiring")
 
     class _Recorder:
         """Stands in for the tokenizer/processor; captures template kwargs."""
