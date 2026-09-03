@@ -57,6 +57,7 @@ Usage:
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
