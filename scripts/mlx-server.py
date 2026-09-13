@@ -931,6 +931,28 @@ def _thinking_headroom_tokens():
     return val if val >= 0 else 512
 
 
+def _reseed_sampling():
+    """Reseed MLX's sampler RNG from entropy before a generation.
+
+    MLX's default random state is THREAD-LOCAL and every new thread starts
+    from the same seed (verified 2026-09-13 in this venv: two spawned threads
+    reproduced the main thread's first draw exactly). ChatHandler runs each
+    request on a fresh ThreadingMixIn thread, so without this every request
+    sampled the same sequence and identical prompts returned identical text at
+    ANY temperature — three temp=5.0 calls came back byte-identical, and the
+    h-uman daemon's best-of-N, quality/AI-tell retries and every eval harness
+    were drawing one sample per prompt while believing they sampled at 0.7.
+
+    GEMMA_SAMPLING_RESEED=0 restores the deterministic behaviour for evals
+    that want reproducibility. Returns True when a reseed happened.
+    """
+    if os.environ.get("GEMMA_SAMPLING_RESEED", "1").strip().lower() in ("0", "false", "no"):
+        return False
+    import mlx.core as mx
+    mx.random.seed(int.from_bytes(os.urandom(8), "little"))
+    return True
+
+
 def _repetition_penalty():
     """Repetition penalty for the logits processor — suppresses the ultra-short-
     prompt runaway (m3_live_path_extractor_strip.md). With NO penalty, minimal
@@ -2700,6 +2722,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 256)
         temperature = req.get("temperature", 0.7)
+        _reseed_sampling()  # per-request thread => same seed otherwise
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -2898,6 +2921,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 256)
         temperature = req.get("temperature", 0.7)
+        _reseed_sampling()  # per-request thread => same seed otherwise
         # Gemma 4 (and especially the seth-lora-v4-repair adapter) emits
         # ~150-200 tokens of chain-of-thought deliberation BEFORE the visible
         # reply. The adapter was trained to deliberate and largely IGNORES the
