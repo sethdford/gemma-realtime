@@ -931,6 +931,31 @@ def _thinking_headroom_tokens():
     return val if val >= 0 else 512
 
 
+def _make_sampler(temperature):
+    """Temperature sampler that advances the CALLING thread's RNG.
+
+    mlx_lm.sample_utils.make_sampler's categorical path is @mx.compile'd with
+    inputs/outputs=mx.random.state captured on the MAIN thread at import time.
+    Called from the admission-queue worker thread it returns the SAME draw on
+    every call (measured 2026-09-13 in this venv: 6/6 identical on a spawned
+    thread, varying on main), so every token of every generation was sampled
+    with one frozen key — identical prompts gave identical text at any
+    temperature, and within a reply each token saw the same "random" number.
+    A plain mx.random.categorical reads and advances the current thread's
+    state (8/8 distinct draws on a spawned thread). temp <= 0 stays argmax,
+    matching make_sampler.
+    """
+    import mlx.core as mx
+    try:
+        temp = float(temperature)
+    except (TypeError, ValueError):
+        temp = 0.0
+    if temp <= 0.0:
+        return lambda logprobs: mx.argmax(logprobs, axis=-1)
+    inv = 1.0 / temp
+    return lambda logprobs: mx.random.categorical(logprobs * inv)
+
+
 def _reseed_sampling():
     """Reseed MLX's sampler RNG from entropy before a generation.
 
@@ -2432,7 +2457,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
         prompt = prepare_prompt_lm(messages, skip_thinking_primer)
         prompt = _plan_cache_for_prompt(messages, prompt)
         extra = _kv_kwargs()
-        extra["sampler"] = make_sampler(temp=temperature)
+        extra["sampler"] = _make_sampler(temperature)  # not the compiled one: see _make_sampler
         _rp = _repetition_logits_processors()
         if _rp:
             extra["logits_processors"] = _rp
@@ -2504,7 +2529,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
             _prepare_cache_for_request(messages)
             prompt = prepare_prompt_lm(messages, skip_thinking_primer)
             extra = _kv_kwargs()
-            extra["sampler"] = make_sampler(temp=temperature)
+            extra["sampler"] = _make_sampler(temperature)  # not the compiled one: see _make_sampler
             _rp = _repetition_logits_processors()
             if _rp:
                 extra["logits_processors"] = _rp
@@ -2553,7 +2578,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
         prompt = prepare_prompt_lm(messages, skip_thinking_primer)
         prompt = _plan_cache_for_prompt(messages, prompt)
         extra = _kv_kwargs()
-        extra["sampler"] = make_sampler(temp=temperature)
+        extra["sampler"] = _make_sampler(temperature)  # not the compiled one: see _make_sampler
         _rp = _repetition_logits_processors()
         if _rp:
             extra["logits_processors"] = _rp

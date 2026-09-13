@@ -62,6 +62,50 @@ def test_reseed_gives_each_request_thread_a_different_sequence(monkeypatch):
     assert out[0][1] != out[1][1]
 
 
+def _draws_on_spawned_thread(sampler, n=8):
+    """The worker-thread shape: a flat distribution sampled n times on a
+    fresh thread. Runs on the CPU device so the thread has a stream."""
+    import mlx.core as mx
+
+    out = []
+
+    def body():
+        mx.set_default_device(mx.cpu)
+        with mx.stream(mx.cpu):
+            logits = mx.log(mx.array([[0.2] * 100]))
+            out.extend(int(sampler(logits).item()) for _ in range(n))
+
+    t = threading.Thread(target=body)
+    t.start()
+    t.join()
+    return out
+
+
+def test_server_sampler_advances_on_a_spawned_thread():
+    """The failure mode: mlx_lm's compiled sampler froze on the worker thread
+    (one draw for every token). The server's own sampler must vary."""
+    srv = _load_server()
+    draws = _draws_on_spawned_thread(srv._make_sampler(1.0))
+    assert len(draws) == 8
+    assert len(set(draws)) >= 3, draws
+
+
+def test_server_sampler_is_argmax_at_zero_temperature():
+    import mlx.core as mx
+
+    srv = _load_server()
+    logits = mx.log(mx.array([[0.1, 0.7, 0.2]]))
+    assert int(srv._make_sampler(0.0)(logits).item()) == 1
+    assert int(srv._make_sampler(None)(logits).item()) == 1
+    assert int(srv._make_sampler("bogus")(logits).item()) == 1
+
+
+def test_generation_sites_use_the_server_sampler():
+    src = open(os.path.join(_SCRIPTS, "mlx-server.py"), encoding="utf-8").read()
+    assert "make_sampler(temp=temperature)" not in src
+    assert src.count("= _make_sampler(temperature)") == 3  # the three lm-path generation sites
+
+
 def test_both_request_handlers_reseed():
     """The call must sit on the request path, not just exist."""
     src = open(os.path.join(_SCRIPTS, "mlx-server.py"), encoding="utf-8").read()
