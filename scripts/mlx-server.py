@@ -672,6 +672,31 @@ def _extract_content(content):
     return " ".join(text_parts), images
 
 
+class _RequestError(Exception):
+    """A request the loaded model cannot serve. Raised inside the admission-queue
+    worker, re-raised on the accept thread by submit_and_wait, and answered there
+    as an HTTP error instead of an unhandled exception that drops the connection
+    (2026-09-07..12: 42 image inbounds -> AttributeError in prepare_prompt_vlm ->
+    "Server returned nothing" in the daemon)."""
+    def __init__(self, status, body):
+        super().__init__(body.get("error", {}).get("message", "request error"))
+        self.status = status
+        self.body = body
+
+
+def _reject_images_on_lm_path(messages, lm_path=None):
+    """The mlx_lm (text) path has no vision processor and no VLM config; an image
+    part would route into prepare_prompt_vlm and crash. Answer 422 so the daemon's
+    provider sees HU_ERR_PROVIDER_RESPONSE and takes its existing on-device ->
+    cloud fallback (the same path a dropped connection took, minus the crash)."""
+    lm = use_lm_path if lm_path is None else lm_path
+    if lm and _has_images(messages):
+        raise _RequestError(422, {"error": {
+            "message": "model is served on the text-only mlx_lm path and has no vision "
+                       "processor; send text-only messages or serve a VLM",
+            "type": "unsupported_modality", "param": "messages[].content[].image_url"}})
+
+
 def _has_images(messages):
     """Quick check whether any message contains image data."""
     for msg in messages:
@@ -2377,6 +2402,7 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
     True/False = explicit per-request override. See _request_skip_thinking_primer.
     """
     has_imgs = _has_images(messages)
+    _reject_images_on_lm_path(messages)
 
     if use_lm_path and not has_imgs:
         from mlx_lm import stream_generate as lm_stream_generate
@@ -3153,6 +3179,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         except _QueueFull as exc:
             code, body_, headers = _queue_full_http_response(exc)
             self._send_json(code, body_, headers=headers)
+        except _RequestError as exc:
+            self._send_json(exc.status, exc.body)
 
     def _do_chat_completion(self, req, resp_id, t0):
         """Runs ONLY on the admission_queue worker thread. `req` was already
