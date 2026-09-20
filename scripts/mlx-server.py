@@ -307,7 +307,24 @@ _ADMISSION_LIVE_CAP = int(_os.environ.get("HU_MLX_LIVE_QUEUE_CAP", "64"))
 admission_queue = _AdmissionQueue(batch_cap=_ADMISSION_BATCH_CAP, live_cap=_ADMISSION_LIVE_CAP)
 _EMBED_MODEL = None
 _EMBED_TOK = None
-_EMBED_MODEL_ID = "mlx-community/nomicai-modernbert-embed-base-8bit"
+_EMBED_MODEL_ID = os.environ.get("HU_EMBED_MODEL_ID", "mlx-community/nomicai-modernbert-embed-base-8bit")
+# Asymmetric embedders are trained with task prefixes; the daemon marks each
+# request "input_type": "query" | "document" (embedder_http.c) and we apply the
+# model's own prefixes here. nomic (symmetric) gets none. 2026-09-20 benchmark:
+# EmbeddingGemma-300m with these prefixes beat nomic on both retrieval sets.
+_EMBED_PREFIXES = {
+    "embeddinggemma": {"query": "task: search result | query: ", "document": "title: none | text: "},
+}
+
+
+def _embed_prefix(model_id, input_type):
+    """Prefix to prepend for (model, input_type); '' when the model has none.
+    Unknown/missing input_type is treated as 'document' (the index side), so an
+    old client that sends no marker still indexes consistently."""
+    fam = next((k for k in _EMBED_PREFIXES if k in (model_id or "").lower()), None)
+    if not fam:
+        return ""
+    return _EMBED_PREFIXES[fam].get(input_type if input_type in ("query", "document") else "document", "")
 model_id = None
 use_lm_path = False  # True = mlx_lm (fast text), False = mlx_vlm (multimodal)
 
@@ -3138,7 +3155,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "input must be a non-empty string or list of strings"}); return
         if len(texts) > 256:
             self._send_json(413, {"error": "max 256 inputs per request"}); return
-
+        input_type = req.get("input_type") or "document"
+        prefix = _embed_prefix(_EMBED_MODEL_ID, input_type)
+        if prefix:
+            texts = [prefix + t for t in texts]
         def _run_embed():
             # Everything below — including the `import mlx.core` — executes
             # solely on the single admission_queue worker thread.
@@ -3175,7 +3195,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self._send_json(501, {"error": f"mlx_embeddings unavailable: {e}"}); return
             except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
                 self._send_json(500, {"error": f"embedding failed: {type(e).__name__}: {e}"}); return
-            self._send_json(200, {"object": "list", "model": _EMBED_MODEL_ID,
+            self._send_json(200, {"object": "list", "model": _EMBED_MODEL_ID, "input_type": input_type,
                                   "data": [{"object": "embedding", "index": i, "embedding": vec} for i, vec in enumerate(vecs)],
                                   "usage": {"prompt_tokens": int(ins["input_ids"].size), "total_tokens": int(ins["input_ids"].size)}})
 
