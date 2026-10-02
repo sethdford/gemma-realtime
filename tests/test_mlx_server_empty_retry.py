@@ -21,6 +21,7 @@ Pinned here, model-free (a tiny LoRA-bound toy module + a mocked
 """
 import importlib.util
 import os
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -117,6 +118,26 @@ def _install(monkeypatch, fake):
     monkeypatch.setattr(mlx_lm, "stream_generate", fake)
 
 
+class _CacheLayer:
+    """Minimal stand-in for one layer of a KV cache list (offset 0 = empty)."""
+    offset = 0
+
+
+CACHE_KINDS = ["lm_prompt_cache", "turbo_cache"]
+
+
+def _arm_cross_turn_cache(srv, kind):
+    """Give the server a real (sentinel) cross-turn cache so the assertions
+    below can tell "bypassed" apart from "there was no cache to pass"."""
+    sentinel = [_CacheLayer()]
+    setattr(srv, kind, sentinel)
+    return sentinel
+
+
+_RETRY_LINE_RE = r"^  \[empty-retry\] adapter=seth-glm-air-test first_tokens={first} " \
+                 r"retry_tokens={retry} retry_ms=\d+ ok={ok}$"
+
+
 # --------------------------------------------------------------------------
 # Empty detector
 # --------------------------------------------------------------------------
@@ -168,7 +189,9 @@ def test_finalize_still_salvages_real_text(srv):
 # Retry path
 # --------------------------------------------------------------------------
 
-def test_empty_reply_retried_once_without_adapter_and_adapter_restored(srv, monkeypatch, capsys):
+@pytest.mark.parametrize("kind", CACHE_KINDS)
+def test_empty_reply_retried_once_without_adapter_and_adapter_restored(srv, monkeypatch, capsys, kind):
+    sentinel = _arm_cross_turn_cache(srv, kind)
     fake = FakeGenerate(srv.model, [("</think>", 2), ("yeah im around", 5)])
     _install(monkeypatch, fake)
     assert _scales(srv.model) == [LORA_SCALE, LORA_SCALE]
@@ -179,12 +202,14 @@ def test_empty_reply_retried_once_without_adapter_and_adapter_restored(srv, monk
     assert len(fake.calls) == 2, "exactly one retry"
     assert fake.calls[0]["scales"] == [LORA_SCALE, LORA_SCALE]   # first: adapter on
     assert fake.calls[1]["scales"] == [0.0, 0.0]                 # retry: adapter off
-    assert fake.calls[1]["prompt_cache"] is None                 # retry: no cross-turn cache
+    assert fake.calls[0]["prompt_cache"] is sentinel             # first: shared cache
+    assert fake.calls[1]["prompt_cache"] is None                 # retry: bypassed
     assert _scales(srv.model) == [LORA_SCALE, LORA_SCALE]        # restored
     assert gen == 2 + 5
     out = capsys.readouterr().out
     line = [l for l in out.splitlines() if "[empty-retry]" in l]
-    assert line == ["  [empty-retry] adapter=seth-glm-air-test first_tokens=2 retry_tokens=5 ok=True"]
+    assert len(line) == 1
+    assert re.match(_RETRY_LINE_RE.format(first=2, retry=5, ok="True"), line[0]), line
     assert "yeah im around" not in line[0]  # never log output text
 
 
@@ -294,7 +319,9 @@ def _handler(srv, sent):
     return h
 
 
-def test_disable_adapter_flag_routes_one_request_to_base_weights(srv, monkeypatch, capsys):
+@pytest.mark.parametrize("kind", CACHE_KINDS)
+def test_disable_adapter_flag_routes_one_request_to_base_weights(srv, monkeypatch, capsys, kind):
+    sentinel = _arm_cross_turn_cache(srv, kind)
     fake = FakeGenerate(srv.model, [("base reply", 3), ("persona reply", 4)])
     _install(monkeypatch, fake)
     sent = []
@@ -304,8 +331,9 @@ def test_disable_adapter_flag_routes_one_request_to_base_weights(srv, monkeypatc
     h._do_chat_completion({"messages": MSGS}, "id2", time.time())
 
     assert fake.calls[0]["scales"] == [0.0, 0.0]
-    assert fake.calls[0]["prompt_cache"] is None
+    assert fake.calls[0]["prompt_cache"] is None                # base arm: bypassed
     assert fake.calls[1]["scales"] == [LORA_SCALE, LORA_SCALE]  # next request: adapter again
+    assert fake.calls[1]["prompt_cache"] is sentinel            # ...and its shared cache
     assert _scales(srv.model) == [LORA_SCALE, LORA_SCALE]
     assert [obj["choices"][0]["message"]["content"] for _c, obj in sent] == \
         ["base reply", "persona reply"]
@@ -344,9 +372,11 @@ def test_disable_adapter_skips_empty_retry(srv, monkeypatch):
     assert sent[0][1]["choices"][0]["message"]["content"] == ""
 
 
-def test_buffered_stream_path_retries_empty_reply(srv, monkeypatch):
+@pytest.mark.parametrize("kind", CACHE_KINDS)
+def test_buffered_stream_path_retries_empty_reply(srv, monkeypatch, kind):
     import io
     import json as _json
+    sentinel = _arm_cross_turn_cache(srv, kind)
     fake = FakeGenerate(srv.model, [("</think>", 2), ("yeah im around", 5)])
     _install(monkeypatch, fake)
     h = srv.ChatHandler.__new__(srv.ChatHandler)
@@ -360,8 +390,26 @@ def test_buffered_stream_path_retries_empty_reply(srv, monkeypatch):
     content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
     assert content == "yeah im around"
     assert fake.calls[1]["scales"] == [0.0, 0.0]
+    assert fake.calls[0]["prompt_cache"] is sentinel
+    assert fake.calls[1]["prompt_cache"] is None
     assert _scales(srv.model) == [LORA_SCALE, LORA_SCALE]
     assert chunks[-1]["usage"]["completion_tokens"] == 7
+
+
+def test_buffered_first_tokens_counts_raw_tokens_not_yielded_chunks(srv, monkeypatch, capsys):
+    """Immediate EOS yields NO text chunk, so counting from yielded chunks
+    reported first_tokens=0. The log must carry the generator's raw count."""
+    import io
+    fake = FakeGenerate(srv.model, [("", 1), ("yeah", 1)])
+    _install(monkeypatch, fake)
+    h = srv.ChatHandler.__new__(srv.ChatHandler)
+    h.wfile = io.BytesIO()
+
+    h._handle_stream_buffered(MSGS, "id", time.time(), 64, 0.7)
+
+    line = [l for l in capsys.readouterr().out.splitlines() if "[empty-retry]" in l]
+    assert len(line) == 1
+    assert re.match(_RETRY_LINE_RE.format(first=1, retry=1, ok="True"), line[0]), line
 
 
 def test_zero_scale_is_exactly_base_forward(srv):

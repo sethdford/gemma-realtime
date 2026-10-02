@@ -2599,6 +2599,7 @@ def _retry_empty_without_adapter(messages, raw, visible, first_tokens,
         return visible, 0
     label = _adapter_label()
     text, retry_tokens, err = "", 0, None
+    t_retry = time.monotonic()
     try:
         with _base_weights_request():
             text, _pt, retry_tokens = generate_response(
@@ -2608,8 +2609,9 @@ def _retry_empty_without_adapter(messages, raw, visible, first_tokens,
             text = ""
     except Exception as e:  # noqa: BLE001 — first generation succeeded; degrade to empty
         text, err = "", type(e).__name__
+    retry_ms = int((time.monotonic() - t_retry) * 1000)
     print(f"  [empty-retry] adapter={label} first_tokens={first_tokens} "
-          f"retry_tokens={retry_tokens} ok={bool(text)}"
+          f"retry_tokens={retry_tokens} retry_ms={retry_ms} ok={bool(text)}"
           + (f" error={err}" if err else ""), flush=True)
     return text, retry_tokens
 
@@ -2699,6 +2701,13 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
     return strip_thought_channels(text), prompt_toks, gen_toks
 
 
+# (prompt_tokens, generation_tokens) as last reported by the generator inside
+# the most recent stream_response call — including steps that yielded no text
+# (an immediate EOS yields nothing, so callers counting yielded chunks saw 0).
+# Written and read only on the admission_queue worker thread.
+_last_stream_counts = (0, 0)
+
+
 def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_primer=None):
     """Streaming generator: yield (text_chunk, prompt_toks, gen_toks) per token.
 
@@ -2711,9 +2720,11 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
     `skip_thinking_primer` is forwarded to prepare_prompt_lm so streamed casual
     tiers (stream_strip=false) generate reply-first. None = legacy default.
     """
+    global _last_stream_counts
     has_imgs = _has_images(messages)
     prompt_toks = 0
     gen_toks = 0
+    _last_stream_counts = (0, 0)
 
     # Speculative decoding path — mlx_lm.stream_generate supports draft_model natively
     if speculative_enabled and draft_model is not None and not has_imgs \
@@ -2749,6 +2760,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
                     prefill_done = True
                 prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
                 gen_toks = getattr(resp, "generation_tokens", gen_toks)
+                _last_stream_counts = (prompt_toks, gen_toks)
                 text = resp.text or ""
                 cleaned, hit_stop = strip_stop_tokens(text)
                 if cleaned:
@@ -2790,6 +2802,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
                 prefill_done = True
             prompt_toks = getattr(resp, "prompt_tokens", prompt_toks)
             gen_toks = getattr(resp, "generation_tokens", gen_toks)
+            _last_stream_counts = (prompt_toks, gen_toks)
             text = resp.text or ""
             cleaned, hit_stop = strip_stop_tokens(text)
             if cleaned:
@@ -2815,6 +2828,7 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
     ):
         prompt_toks = getattr(chunk, "prompt_tokens", prompt_toks)
         gen_toks = getattr(chunk, "generation_tokens", gen_toks)
+        _last_stream_counts = (prompt_toks, gen_toks)
         text = chunk.text or ""
 
         cleaned, hit_stop = strip_stop_tokens(text)
@@ -3085,6 +3099,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if text and first_token_time is None:
                     first_token_time = time.time()
                 raw_parts.append(text)
+        # Raw generator counts: an immediate EOS yields no chunk at all.
+        prompt_toks = max(prompt_toks, _last_stream_counts[0])
+        gen_toks = max(gen_toks, _last_stream_counts[1])
 
         full = "".join(raw_parts).strip()
         clean, is_runaway = finalize_generation(full, messages)
