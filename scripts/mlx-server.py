@@ -170,6 +170,8 @@ def _load_human_config():
             defaults["prompt_cache_lcp"] = str(mlx["prompt_cache_lcp"])
         if mlx.get("prompt_cache_slots") is not None:
             defaults["prompt_cache_slots"] = mlx["prompt_cache_slots"]
+        if mlx.get("prompt_cache_slot_max_tokens") is not None:
+            defaults["prompt_cache_slot_max_tokens"] = mlx["prompt_cache_slot_max_tokens"]
         if mlx.get("prompt_cache_scratch_max_tokens") is not None:
             defaults["prompt_cache_scratch_max_tokens"] = mlx["prompt_cache_scratch_max_tokens"]
         if "iosurface_kv" in mlx:
@@ -390,6 +392,12 @@ lm_cache_slot_count = 2   # regular slots; MLX_LCP_SLOTS / mlx_local.prompt_cach
 # MLX_LCP_SCRATCH_MAX_TOKENS (default 400); the module default stays 0 so the
 # legacy pool semantics are what an un-configured import (tests) gets.
 lcp_scratch_max_tokens = 0
+# Per-slot token cap (2026-10-02 review). A recycled slot keeps its PEAK KV
+# buffers, so an uncapped 30k-token prompt would pin ~3 GB in that slot for
+# good. Prompts over the cap are never cached, and a slot whose observed peak
+# exceeded it is freed+reallocated (not trimmed) when recycled. main() sets it
+# from MLX_LCP_SLOT_MAX_TOKENS (default 12000); 0 here = uncapped for tests.
+lcp_slot_max_tokens = 0
 lcp_evict_policy = "value"  # HU_LCP_EVICT=lru rolls back to legacy LRU
 lm_cache_slots = None     # [{"cache": list, "prev_tokens": list|None, "last_used": int}]
 _lcp_shadow_slots = None  # shadow-mode simulation of the pool (token lists only)
@@ -2360,17 +2368,31 @@ def _lcp_active_slot():
 
 
 def _reinit_cache_slot(idx):
-    """Fail-safe: rebuild one slot's cache after a trim we can't trust."""
+    """Free one slot's KV buffers and give it a fresh empty cache.
+
+    Used after a trim we can't trust, and by the per-slot token cap: trimming
+    only moves the offset, so a slot that once grew to N tokens keeps N
+    tokens of buffers until its cache list is replaced here."""
     global lm_prompt_cache
     slot = lm_cache_slots[idx]
     was_active = slot["cache"] is lm_prompt_cache
     fresh = _fresh_lm_cache()
     if fresh is not None:
         slot["cache"] = fresh
+        if model is not None:
+            # Return the dropped buffers to the OS rather than MLX's free-list.
+            # Runs on the admission worker thread (every caller is inside a
+            # model job), so this respects mx thread affinity.
+            try:
+                import mlx.core as _mx
+                _mx.clear_cache()
+            except Exception:  # noqa: BLE001 — freeing is best-effort
+                pass
     else:
         # Can't rebuild (no model, clone failed) — hard-reset what's there.
         _trim_cache(slot["cache"], _cache_offset(slot["cache"]))
     slot["prev_tokens"] = None
+    slot["peak"] = 0
     if was_active:
         lm_prompt_cache = slot["cache"]
 
@@ -2528,7 +2550,10 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
                 [s["prev_tokens"] for s in sim],
                 [s["last_used"] for s in sim], tokens,
                 scratch_idx=_lcp_scratch_index(len(sim)),
-                scratch_max_tokens=lcp_scratch_max_tokens)
+                scratch_max_tokens=lcp_scratch_max_tokens,
+                slot_max_tokens=lcp_slot_max_tokens,
+                policy=lcp_evict_policy)
+            _sim_oversize = 0 < lcp_slot_max_tokens < len(tokens)
             _lcp_request_counter += 1
             _lcp_last = {"mode": "shadow", "would_reuse": reuse,
                          "prompt_tokens": len(tokens),
@@ -2539,7 +2564,7 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
                   f"(slot {slot_idx}{' scratch' if is_scratch else ''}, best-of-{len(sim)}, "
                   f"{'hit' if reuse > 0 else 'miss'})", flush=True)
             _prepare_cache_for_request(messages)  # legacy manages the real cache
-            sim[slot_idx] = {"prev_tokens": tokens,
+            sim[slot_idx] = {"prev_tokens": [] if _sim_oversize else tokens,
                              "last_used": _lcp_request_counter}
         except Exception as e:
             print(f"  [lcp shadow] measurement failed: {e}", flush=True)
@@ -2556,10 +2581,16 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
         [s["last_used"] for s in slots], tokens,
         scratch_idx=_lcp_scratch_index(len(slots)),
         scratch_max_tokens=lcp_scratch_max_tokens,
+        slot_max_tokens=lcp_slot_max_tokens,
         policy=lcp_evict_policy)
+    oversize = 0 < lcp_slot_max_tokens < len(tokens)
     slot = slots[slot_idx]
     lm_prompt_cache = slot["cache"]  # _kv_kwargs routes this into stream_generate
     cache_size = _cache_offset(slot["cache"])
+    # Peak KV positions this slot's buffers have grown to. The cache grows
+    # during prefill+generation, AFTER planning, so the growth from request N
+    # is observed when the slot is next planned (request N+k).
+    slot["peak"] = max(slot.get("peak", 0), cache_size)
     if planned > 0:
         reuse, trim_amount = plan_reuse(slot["prev_tokens"], tokens, cache_size)
     else:
@@ -2593,6 +2624,15 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
                   f"incoming {len(tokens)} toks; best_lcp {_best}/floor "
                   f"{DEFAULT_SLOT_FLOOR}; pool[{_pool}]", flush=True)
         reuse, trim_amount = 0, cache_size  # recycle the slot as a fresh cache
+    if reuse == 0 and (oversize or slot["peak"] > lcp_slot_max_tokens > 0):
+        # Per-slot memory cap: free + reallocate instead of trimming, so an
+        # outsized prompt can't pin its buffers in this slot.
+        print(f"  [lcp cap] slot {slot_idx}: reallocating (peak {slot['peak']} kv pos, "
+              f"incoming {len(tokens)} toks, cap {lcp_slot_max_tokens}"
+              f"{', not cached' if oversize else ''})", flush=True)
+        _reinit_cache_slot(slot_idx)
+        lm_prompt_cache = slot["cache"]
+        trim_amount = 0
     if trim_amount > 0:
         trimmed = _trim_cache(slot["cache"], trim_amount)
         if trimmed != trim_amount:
@@ -2605,10 +2645,14 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
     _lcp_request_counter += 1
     slot["prev_tokens"] = None  # invalid until prefill completes
     slot["last_used"] = _lcp_request_counter
-    _lcp_pending_tokens = tokens
+    # Oversize prompts are never cached: [] (not None — None would fall through
+    # to the legacy system-boundary bookkeeping in _after_prefill) leaves the
+    # slot EMPTY, so it is the first victim and gets reallocated by the cap.
+    _lcp_pending_tokens = [] if oversize else tokens
     _lcp_pending_slot = slot_idx
     _lcp_last = {"mode": "live", "reused": reuse, "prompt_tokens": len(tokens),
-                 "slot": slot_idx, "slots": len(slots), "scratch": is_scratch}
+                 "slot": slot_idx, "slots": len(slots), "scratch": is_scratch,
+                 "cached": not oversize}
     print(f"  [lcp live] reusing {reuse}/{len(tokens)} prompt toks "
           f"(slot {slot_idx}{' scratch' if is_scratch else ''}, best-of-{len(slots)}), "
           f"prefilling {len(tokens) - reuse}", flush=True)
@@ -2936,12 +2980,14 @@ class ChatHandler(BaseHTTPRequestHandler):
             health["prompt_cache_lcp"] = lcp_mode
             health["prompt_cache_lcp_slots"] = lm_cache_slot_count
             health["prompt_cache_lcp_scratch_max_tokens"] = lcp_scratch_max_tokens
+            health["prompt_cache_lcp_slot_max_tokens"] = lcp_slot_max_tokens
             if _lcp_last:
                 health["prompt_cache_lcp_last"] = dict(_lcp_last)
             if lm_cache_slots:
                 health["prompt_cache_lcp_slot_state"] = [
                     {"prev_tokens": len(s["prev_tokens"] or []),
                      "offset": _cache_offset(s["cache"]),
+                     "peak": s.get("peak", 0),
                      "last_used": s["last_used"],
                      "active": s["cache"] is lm_prompt_cache,
                      "scratch": i == _lcp_scratch_index(len(lm_cache_slots))}
@@ -3576,6 +3622,13 @@ def _lcp_pool_config_raw(hc, environ):
     return slots, scratch
 
 
+def _lcp_slot_max_raw(hc, environ):
+    """MLX_LCP_SLOT_MAX_TOKENS > mlx_local.prompt_cache_slot_max_tokens > None
+    (parse_slot_max_tokens -> DEFAULT_SLOT_MAX_TOKENS)."""
+    v = (environ.get("MLX_LCP_SLOT_MAX_TOKENS") or "").strip()
+    return v or (hc or {}).get("prompt_cache_slot_max_tokens")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -3589,7 +3642,7 @@ def _env_int(name: str, default: int) -> int:
 def main():
     global kv_bits, kv_quant_scheme, prompt_cache_state, hw_info, speculative_draft_tokens
     global server_realtime_mode, lcp_mode, lm_cache_slot_count, lcp_evict_policy
-    global lcp_scratch_max_tokens
+    global lcp_scratch_max_tokens, lcp_slot_max_tokens
 
     hc = _load_human_config()
     _apply_mlx_local_env_from_hc(hc)
@@ -3668,6 +3721,12 @@ Examples:
              "they never evict a long reply prefix (default 400; 0 disables).",
     )
     parser.add_argument(
+        "--lcp-slot-max-tokens",
+        default=_lcp_slot_max_raw(hc, os.environ),
+        help="Per-slot KV cap (default 12000; 0 disables). Longer prompts are "
+             "not cached; a slot that grew past it is reallocated on recycle.",
+    )
+    parser.add_argument(
         "--speculative-draft", default=hc.get("speculative_draft"),
         help="Draft model for speculative decoding (e.g. mlx-community/gemma-4-e2b-it-4bit "
              "or a path to a LoRA adapter dir with adapters.safetensors).",
@@ -3744,15 +3803,19 @@ Examples:
     from prompt_cache_lcp import (parse_mode as _lcp_parse_mode,
                                   parse_slots as _lcp_parse_slots,
                                   parse_scratch_max_tokens as _lcp_parse_scratch,
+                                  parse_slot_max_tokens as _lcp_parse_slot_max,
                                   parse_evict_policy as _lcp_parse_evict)
     lcp_mode = "off" if args.no_prompt_cache else _lcp_parse_mode(args.prompt_cache_lcp)
     lm_cache_slot_count = _lcp_parse_slots(args.prompt_cache_slots)
     lcp_scratch_max_tokens = _lcp_parse_scratch(args.lcp_scratch_max_tokens)
+    lcp_slot_max_tokens = _lcp_parse_slot_max(args.lcp_slot_max_tokens)
     # Eviction policy. Default 'value'; HU_LCP_EVICT=lru restores the legacy
     # size-indifferent LRU as a one-env-var rollback (see slot_evict_value).
     lcp_evict_policy = _lcp_parse_evict(os.environ.get("HU_LCP_EVICT"))
     _scratch_note = (f" + 1 scratch slot for prompts < {lcp_scratch_max_tokens} toks"
                      if lcp_scratch_max_tokens > 0 else ", no scratch slot")
+    _scratch_note += (f", per-slot cap {lcp_slot_max_tokens} toks"
+                      if lcp_slot_max_tokens > 0 else ", no per-slot cap")
     print(f"Prompt cache LCP mode: {lcp_mode}"
           + (f" ({lm_cache_slot_count} slots{_scratch_note}, token-prefix reuse ACTIVE)" if lcp_mode == "live" else
              f" ({lm_cache_slot_count} slots{_scratch_note} simulated, measurement only)" if lcp_mode == "shadow" else ""),

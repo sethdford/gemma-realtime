@@ -48,6 +48,23 @@ DEFAULT_SLOTS = 6
 DEFAULT_SCRATCH_MAX_TOKENS = 400
 MAX_SCRATCH_MAX_TOKENS = 8192
 
+# Per-slot memory cap. A recycled slot keeps the PEAK buffers it ever grew to
+# (trim only moves the offset), so one 30k-token prompt would pin ~3 GB in
+# that slot forever (~20 GB worst case across 7 slots). Prompts longer than
+# this are never cached: they run in a freshly reallocated slot (the scratch
+# slot when enabled) whose bookkeeping stays EMPTY, so the next request to
+# land there frees and reallocates it. A slot whose observed peak exceeded
+# the cap is likewise freed+reallocated instead of trimmed when recycled.
+# 0 disables the cap.
+DEFAULT_SLOT_MAX_TOKENS = 12000
+
+# Reuse-trim guard. Reusing a slot trims it to the shared prefix; for a slot
+# holding a long reply prefix, a mid-size prompt (400-1000 tokens) that shares
+# only the chat-template + a little head would shred it — the same damage the
+# scratch slot prevents for small prompts. A reuse that would trim away MORE
+# THAN HALF of a slot holding more than this many tokens is refused.
+REUSE_GUARD_MIN_SLOT_TOKENS = 2000
+
 
 def parse_mode(raw, default="shadow"):
     """Parse an LCP mode string. Unknown values fail closed to 'off'."""
@@ -113,6 +130,17 @@ def parse_slots(raw, default=DEFAULT_SLOTS):
     except (TypeError, ValueError):
         return default
     return max(1, min(n, MAX_SLOTS))
+
+
+def parse_slot_max_tokens(raw, default=DEFAULT_SLOT_MAX_TOKENS):
+    """Parse the per-slot token cap; 0/negative disables, junk -> default."""
+    if raw is None:
+        return default
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0, n)
 
 
 def parse_scratch_max_tokens(raw, default=DEFAULT_SCRATCH_MAX_TOKENS):
@@ -217,33 +245,49 @@ def choose_slot(slot_prev_tokens, slot_last_used, new_tokens,
     if best_lcp >= floor and best_lcp > 0:
         return best_idx, best_lcp
 
-    for i, prev in enumerate(slot_prev_tokens):
-        if not prev:
-            return i, 0
+    return pick_victim(slot_prev_tokens, slot_last_used, range(n), policy), 0
 
+
+def pick_victim(slot_prev_tokens, slot_last_used, candidates, policy="value"):
+    """The slot to recycle among `candidates`: an empty one first, then the
+    least valuable (or least recently used under the 'lru' rollback)."""
+    candidates = list(candidates)
+    for i in candidates:
+        if not slot_prev_tokens[i]:
+            return i
     if policy == "lru":
-        return min(range(n), key=lambda i: slot_last_used[i]), 0
-
+        return min(candidates, key=lambda i: slot_last_used[i])
     # `now` is the newest counter seen: the current request has not been
     # counted yet at selection time, so this is the best available clock.
     now = max(slot_last_used)
-    victim = min(
-        range(n),
+    return min(
+        candidates,
         key=lambda i: (slot_evict_value(slot_prev_tokens[i], now - slot_last_used[i]),
                        slot_last_used[i]),  # tie-break: oldest first, deterministic
     )
-    return victim, 0
+
+
+def reuse_would_shred(held_tokens, reuse, guard_min=REUSE_GUARD_MIN_SLOT_TOKENS):
+    """True when reusing `reuse` tokens of a slot holding `held_tokens` would
+    trim away more than half of a long (> guard_min) cached prefix."""
+    return guard_min > 0 and held_tokens > guard_min and reuse * 2 < held_tokens
 
 
 def route_request(slot_prev_tokens, slot_last_used, new_tokens,
                   scratch_idx=None, scratch_max_tokens=0,
-                  floor=DEFAULT_SLOT_FLOOR, policy="value"):
-    """Pick a slot for a request, honouring the scratch slot.
+                  floor=DEFAULT_SLOT_FLOOR, policy="value",
+                  slot_max_tokens=0, guard_min_tokens=REUSE_GUARD_MIN_SLOT_TOKENS):
+    """Pick a slot for a request, honouring the scratch slot, the per-slot
+    token cap and the reuse-trim guard.
 
-    scratch_idx:        index of the scratch slot in the pool, or None (no
-                        scratch slot — identical to choose_slot over the pool).
+    scratch_idx:        index of the scratch slot in the pool, or None.
     scratch_max_tokens: prompts with len(new_tokens) < this go to the scratch
                         slot; 0 disables scratch routing.
+    slot_max_tokens:    prompts longer than this never reuse and land on the
+                        scratch slot (else the least valuable regular slot);
+                        the caller must not cache them. 0 disables.
+    guard_min_tokens:   reuse-trim guard threshold (see reuse_would_shred);
+                        0 disables.
 
     Returns (slot_idx, reuse, is_scratch).
 
@@ -252,21 +296,39 @@ def route_request(slot_prev_tokens, slot_last_used, new_tokens,
     slot either: plan_reuse would trim that slot to the short LCP, destroying
     its long prefix. Long prompts pick among the regular slots only, with the
     usual best-LCP / least-valuable-victim logic, and never see the scratch.
+    A long-prompt reuse that would shred a big slot is refused: a prompt
+    shorter than guard_min_tokens goes to scratch, anything bigger to the
+    least valuable OTHER regular slot (reset). With a single regular slot and
+    no scratch there is nowhere else to go, so the trim is allowed (legacy).
     """
     n = len(slot_prev_tokens)
     scratch_on = (scratch_idx is not None and scratch_max_tokens > 0
                   and 0 <= scratch_idx < n and n >= 2)
-    if scratch_on and len(new_tokens) < scratch_max_tokens:
+    regular = [i for i in range(n) if not (scratch_on and i == scratch_idx)]
+
+    def _to_scratch():
         prev = slot_prev_tokens[scratch_idx]
         cap = max(0, len(new_tokens) - 1)
         lcp = min(common_prefix_len(prev, new_tokens), cap) if prev else 0
         return scratch_idx, (lcp if lcp >= floor and lcp > 0 else 0), True
-    if not scratch_on:
-        idx, reuse = choose_slot(slot_prev_tokens, slot_last_used, new_tokens,
-                                 floor=floor, policy=policy)
-        return idx, reuse, False
-    regular = [i for i in range(n) if i != scratch_idx]
+
+    if slot_max_tokens > 0 and len(new_tokens) > slot_max_tokens:
+        if scratch_on:
+            return scratch_idx, 0, True
+        return pick_victim(slot_prev_tokens, slot_last_used, regular, policy), 0, False
+
+    if scratch_on and len(new_tokens) < scratch_max_tokens:
+        return _to_scratch()
+
     sub_idx, reuse = choose_slot([slot_prev_tokens[i] for i in regular],
                                  [slot_last_used[i] for i in regular],
                                  new_tokens, floor=floor, policy=policy)
-    return regular[sub_idx], reuse, False
+    idx = regular[sub_idx]
+    held = len(slot_prev_tokens[idx] or ())
+    if reuse > 0 and reuse_would_shred(held, reuse, guard_min_tokens):
+        if scratch_on and len(new_tokens) < guard_min_tokens:
+            return _to_scratch()
+        others = [i for i in regular if i != idx]
+        if others:
+            return pick_victim(slot_prev_tokens, slot_last_used, others, policy), 0, False
+    return idx, reuse, False
