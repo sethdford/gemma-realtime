@@ -31,6 +31,7 @@ Environment (see guides/08-inference-sota-roadmap.md):
 """
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -576,6 +577,82 @@ def _apply_adapter_weights(adapter_path):
             f"adapter {adapter_file} bound 0 of its tensors to the model "
             f"(key layout / num_layers mismatch) — refusing to report success")
     return bound
+
+
+# >0 while the current request generates on BASE weights (adapter's LoRA scale
+# zeroed). Read by the cross-turn cache entry points, which become no-ops so
+# base-weight KV never lands in a cache the next (adapter) request reuses.
+_base_weights_depth = 0
+
+
+class _AdapterToggleUnsupported(RuntimeError):
+    """The bound adapter cannot be switched off by zeroing a scale (DoRA)."""
+
+
+def _adapter_active():
+    """A LoRA adapter is bound AND not suppressed for the current request."""
+    return bool(adapter_path_global) and tensors_loaded_global > 0 \
+        and _base_weights_depth == 0
+
+
+def _adapter_label():
+    """Adapter directory basename for log lines (a name, never request text)."""
+    if not adapter_path_global:
+        return "none"
+    return os.path.basename(str(adapter_path_global).rstrip("/")) or "?"
+
+
+@contextlib.contextmanager
+def _base_weights_request():
+    """Run the enclosed generation on BASE weights, then restore the adapter.
+
+    mlx_lm's LoRA wrappers compute ``y = base(x) + scale * lora(x)``, so a
+    scale of 0.0 is exactly the base model — no unbind/rebind, no safetensors
+    reload, O(#LoRA modules) attribute writes each way. Original scales are
+    restored in ``finally`` (exceptions included). Yields the number of LoRA
+    modules suppressed (0 when no adapter is bound — then it is a no-op on the
+    weights but still bypasses the cross-turn caches).
+
+    Thread safety: every model-touching job (chat completions, the adapter
+    swap, embeddings) runs on the admission_queue's ONE worker thread, and
+    this context is entered and exited inside a single such job, so no other
+    request can ever observe the zeroed scales. The cross-turn cache bypass
+    (``_base_weights_depth``) keeps base-weight KV out of the shared caches,
+    so the next adapter request cannot reuse it either.
+
+    DoRA wrappers renormalise the weight magnitude, so scale=0 is NOT base:
+    raise _AdapterToggleUnsupported before mutating anything.
+    """
+    global _base_weights_depth
+    saved = []
+    if model is not None and hasattr(model, "named_modules"):
+        for _name, mod in model.named_modules():
+            cls = type(mod).__name__.lower()
+            if cls.startswith("dora"):
+                raise _AdapterToggleUnsupported(
+                    f"{type(mod).__name__} cannot be disabled by scale")
+            if cls.startswith("lora") and hasattr(mod, "scale"):
+                saved.append((mod, mod.scale))
+    _base_weights_depth += 1
+    try:
+        for mod, _scale in saved:
+            mod.scale = 0.0
+        yield len(saved)
+    finally:
+        for mod, scale in saved:
+            mod.scale = scale
+        _base_weights_depth -= 1
+
+
+def _empty_retry_enabled():
+    """MLX_EMPTY_RETRY kill switch (default ON; 0/false/no/off disables)."""
+    return os.environ.get("MLX_EMPTY_RETRY", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _request_disable_adapter(req):
+    """Per-request `"disable_adapter": true` (strict bool; default False)."""
+    return isinstance(req, dict) and req.get("disable_adapter") is True
 
 
 def load_model(model_name, adapter_path=None):
@@ -1522,6 +1599,42 @@ def _is_input_echo(reply, messages, detail=None):
     return False
 
 
+# Template / thought-channel markers that are never reply content on their own.
+# GLM: `<think>`, `</think>`, `<|assistant|>`/`<|user|>`/`<|endoftext|>` etc.
+# Gemma: `<|channel>thought`, `<channel|>`, `<start_of_turn>`, `<end_of_turn>`.
+_SCAFFOLD_TOKEN_RE = re.compile(
+    r"</?think>|<\|channel>(?:thought)?|<channel\|>|<\|[A-Za-z_][\w.-]{0,40}\|>"
+    r"|<(?:start|end)_of_turn>|<eos>|<bos>|\[gMASK\]|<sop>",
+    re.IGNORECASE)
+
+
+def _is_pure_scaffold(text):
+    """True when `text` holds nothing but template/thought markers and
+    whitespace (including the empty string). Such text must never be returned
+    as a reply: on 2026-09-19..10-01 the strip-fallback "salvaged" a bare
+    `</think>` ~1,100 times, the h-uman client stripped it to empty and failed
+    over to cloud."""
+    return not _SCAFFOLD_TOKEN_RE.sub("", text or "").strip()
+
+
+def _is_empty_generation(raw, visible, gen_tokens):
+    """Did this generation produce no reply at all?
+
+    True when the visible text is empty/pure scaffold AND either
+      - the raw output minus scaffold markers and whitespace is empty
+        (immediate EOS, `</think>`+EOS, `<think></think>`), or
+      - the model stopped within 3 tokens.
+    Long generations that were guarded to empty (runaway deliberation, echo,
+    residue) are deliberately NOT empty here: they already spent a full budget
+    and have their own policies, and a retry would double that cost.
+    """
+    if not _is_pure_scaffold(visible):
+        return False
+    if _is_pure_scaffold(raw):
+        return True
+    return gen_tokens is not None and gen_tokens <= 3
+
+
 def finalize_generation(full, messages=None):
     """Strip thought blocks from a fully-accumulated raw generation.
 
@@ -1549,6 +1662,10 @@ def finalize_generation(full, messages=None):
     import re as _re
 
     def _guard(text):
+        # Never hand back a bare template/thought marker (`</think>`) as the
+        # reply — every return path funnels through here.
+        if _is_pure_scaffold(text):
+            return "", False
         # Reject input-echo / system-prompt-leak as runaway: when `messages` is
         # supplied and the candidate merely echoes the prompt/history or leaks a
         # system-prompt span, return empty (better empty than garbage — same
@@ -1646,6 +1763,12 @@ def finalize_generation(full, messages=None):
             if cleaned_line:
                 salvaged = cleaned_line
                 break
+    if _is_pure_scaffold(salvaged):
+        # `</think>`-only output (adapter emitted the closer + EOS): there is
+        # nothing to salvage. Empty lets generate_response retry locally.
+        print(f"  [strip-fallback] extractor empty; raw ({len(full)} chars) is "
+              f"pure scaffold; returning empty", flush=True)
+        return "", False
     try:
         print(f"  [strip-fallback] extractor empty; salvaged from raw "
               f"({len(full)} chars): {salvaged[:80]!r}", flush=True)
@@ -2014,7 +2137,7 @@ def _init_turbo_cache():
 
 def _compact_turbo_cache():
     """Compress prefill FP16 data to TurboQuant packed storage."""
-    if turbo_cache is None:
+    if turbo_cache is None or _base_weights_depth:
         return
     try:
         from mlx.nn.layers.turbo_kv_cache import compact_turbo_cache
@@ -2074,7 +2197,13 @@ def _kv_kwargs(use_lm_cache=True):
       1. TurboQuant+ cache (turbo_cache list) — design-intent path.
       2. Stock mlx_lm prompt cache + kv_bits quantization — fallback path.
       3. Plain kv_bits (no cache reuse) — last resort for vlm path.
+
+    Base-weights requests (_base_weights_request) get NO prompt cache: the
+    shared caches hold adapter-weight KV, and base-weight KV must not be
+    written into them. stream_generate then builds a private throwaway cache.
     """
+    if _base_weights_depth:
+        return {}
     extra = {}
     if turbo_cache is not None:
         extra["prompt_cache"] = turbo_cache
@@ -2249,6 +2378,9 @@ def _prepare_cache_for_request(messages):
     """
     global _cached_system_hash, _cached_system_ntokens
 
+    if _base_weights_depth:
+        return  # base-weights request: cross-turn cache untouched (see _kv_kwargs)
+
     # Any legacy-managed request invalidates the LCP bookkeeping for the
     # slot it mutates: after this function runs, that slot's prev_tokens no
     # longer describes its cache's token prefix. Only the ACTIVE slot is
@@ -2282,7 +2414,7 @@ def _record_system_cache_boundary(messages):
     """After prefill, record how many tokens the system prompt occupies."""
     global _cached_system_ntokens
 
-    if _active_prompt_cache() is None or _cached_system_ntokens > 0:
+    if _base_weights_depth or _active_prompt_cache() is None or _cached_system_ntokens > 0:
         return
 
     system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
@@ -2324,6 +2456,8 @@ def _plan_cache_for_prompt(messages, prompt_text, allow_lcp=True):
     global lm_prompt_cache, _lcp_pending_tokens, _lcp_pending_slot
     global _lcp_last, _lcp_request_counter
 
+    if _base_weights_depth:
+        return prompt_text  # base-weights request: full prefill, no slot/bookkeeping
     _lcp_pending_tokens = None
     _lcp_pending_slot = None
     live_ok = (
@@ -2434,6 +2568,8 @@ def _after_prefill(messages):
     request: promote pending LCP tokens to their slot, or record the legacy
     system boundary."""
     global _lcp_pending_tokens, _lcp_pending_slot
+    if _base_weights_depth:
+        return
     if _lcp_pending_tokens is not None:
         if (lm_cache_slots and _lcp_pending_slot is not None
                 and 0 <= _lcp_pending_slot < len(lm_cache_slots)):
@@ -2442,6 +2578,40 @@ def _after_prefill(messages):
         _lcp_pending_slot = None
         return
     _record_system_cache_boundary(messages)
+
+
+def _retry_empty_without_adapter(messages, raw, visible, first_tokens,
+                                 max_tokens, temperature, skip_thinking_primer=None):
+    """Regenerate ONCE on base weights when an adapter request came back empty.
+
+    The persona adapter (bound since 3c4a582, 2026-09-03) was trained without
+    GLM's chat template; on `<|assistant|>\\n<think></think>` prompts it emits
+    EOS (1 token) or `</think>`+EOS (2-3 tokens) on ~13% of requests. Empty
+    replies made the h-uman client fail over to cloud; base weights answer.
+
+    Returns (text, retry_tokens). Returns `visible` and 0 untouched unless the
+    kill switch is on, an adapter is active, and _is_empty_generation holds.
+    A retry that is also empty (or raises) yields "" — never scaffold.
+    Logs exactly one counts-only line per event; never prompt/output text.
+    """
+    if not (_empty_retry_enabled() and _adapter_active()
+            and _is_empty_generation(raw, visible, first_tokens)):
+        return visible, 0
+    label = _adapter_label()
+    text, retry_tokens, err = "", 0, None
+    try:
+        with _base_weights_request():
+            text, _pt, retry_tokens = generate_response(
+                messages, max_tokens, temperature,
+                skip_thinking_primer=skip_thinking_primer)
+        if _is_pure_scaffold(text):
+            text = ""
+    except Exception as e:  # noqa: BLE001 — first generation succeeded; degrade to empty
+        text, err = "", type(e).__name__
+    print(f"  [empty-retry] adapter={label} first_tokens={first_tokens} "
+          f"retry_tokens={retry_tokens} ok={bool(text)}"
+          + (f" error={err}" if err else ""), flush=True)
+    return text, retry_tokens
 
 
 def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_primer=None):
@@ -2504,7 +2674,14 @@ def generate_response(messages, max_tokens=256, temperature=0.7, skip_thinking_p
         # so the buffered streaming path (_handle_stream_buffered) applies the
         # IDENTICAL logic. See m3_live_path_extractor_strip.md "runaway" arc.
         stripped, _runaway = finalize_generation(full, messages)
-        return stripped, prompt_toks_out, gen_toks_out
+        # Empty adapter reply -> one local regeneration on base weights
+        # instead of an empty answer the client fails over to cloud. No-op on
+        # base-weights requests (no adapter active) and under MLX_EMPTY_RETRY=0.
+        # completion_tokens reports BOTH generations (the compute actually spent).
+        stripped, retry_toks = _retry_empty_without_adapter(
+            messages, full, stripped, gen_toks_out, max_tokens, temperature,
+            skip_thinking_primer)
+        return stripped, prompt_toks_out, gen_toks_out + retry_toks
 
     from mlx_vlm import generate as vlm_generate
     formatted, images = prepare_prompt_vlm(messages)
@@ -2539,7 +2716,8 @@ def stream_response(messages, max_tokens=256, temperature=0.7, skip_thinking_pri
     gen_toks = 0
 
     # Speculative decoding path — mlx_lm.stream_generate supports draft_model natively
-    if speculative_enabled and draft_model is not None and not has_imgs:
+    if speculative_enabled and draft_model is not None and not has_imgs \
+            and not _base_weights_depth:
         try:
             from mlx_lm import stream_generate as lm_stream_generate
             from mlx_lm.sample_utils import make_sampler
@@ -2910,6 +3088,12 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         full = "".join(raw_parts).strip()
         clean, is_runaway = finalize_generation(full, messages)
+        # Same empty-adapter-reply retry as the non-stream path; nothing has
+        # been streamed yet, so the retry's text becomes the single chunk.
+        with model_lock:
+            clean, retry_toks = _retry_empty_without_adapter(
+                messages, full, clean, gen_toks, internal_max, temperature)
+        gen_toks += retry_toks
 
         if clean:
             content_chunk = {
@@ -3265,10 +3449,24 @@ class ChatHandler(BaseHTTPRequestHandler):
         # strict no-op (byte-identical to unsteered).
         ps.set_active(req.get("steering"))
         try:
-            if req.get("stream", False):
-                self._handle_stream(req, resp_id, t0)
-            else:
-                self._handle_non_stream(req, resp_id, t0)
+            # Per-request base arm: `"disable_adapter": true` generates THIS
+            # request with the LoRA scale zeroed (see _base_weights_request:
+            # restored in finally, single worker thread, cross-turn caches
+            # bypassed) without touching the live default adapter.
+            with contextlib.ExitStack() as stack:
+                if _request_disable_adapter(req):
+                    try:
+                        n_mod = stack.enter_context(_base_weights_request())
+                    except _AdapterToggleUnsupported as exc:
+                        raise _RequestError(409, {"error": {
+                            "message": f"disable_adapter unsupported: {exc}",
+                            "type": "invalid_request_error"}})
+                    print(f"  [disable-adapter] adapter={_adapter_label()} "
+                          f"lora_modules={n_mod}", flush=True)
+                if req.get("stream", False):
+                    self._handle_stream(req, resp_id, t0)
+                else:
+                    self._handle_non_stream(req, resp_id, t0)
         finally:
             ps.clear_active()
 
