@@ -112,13 +112,15 @@ def test_empty_new_prompt_resets():
 # ── parse_slots ─────────────────────────────────────────────────────────
 
 def test_parse_slots_default_and_clamping():
-    assert parse_slots(None) == 2
-    assert parse_slots("") == 2
+    # Default raised 2 -> 6 and cap 4 -> 8 on 2026-10-02 (28% of main-reply
+    # calls evicted at 3 slots; ~0.5-0.6 GB per 5k-token 8-bit GLM slot).
+    assert parse_slots(None) == 6
+    assert parse_slots("") == 6
     assert parse_slots(3) == 3
     assert parse_slots("3") == 3
     assert parse_slots(0) == 1                 # floor at 1 (single-slot v1)
-    assert parse_slots(99) == 4                # each slot is real KV memory
-    assert parse_slots("garbage") == 2
+    assert parse_slots(99) == 8                # each slot is real KV memory
+    assert parse_slots("garbage") == 6
 
 
 # ── choose_slot ─────────────────────────────────────────────────────────

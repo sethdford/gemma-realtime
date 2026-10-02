@@ -25,11 +25,28 @@ MODES = ("off", "shadow", "live")
 # preamble is exactly the failure the slot pool exists to prevent.
 DEFAULT_SLOT_FLOOR = 64
 
-# Each slot pins real KV memory (a 5K-token prompt at kv_bits=8 on a 31B
-# model is on the order of a GB), so the pool stays small no matter what
-# the config asks for.
-MAX_SLOTS = 4
-DEFAULT_SLOTS = 2
+# Each slot pins real KV memory once prefilled, so the pool stays bounded no
+# matter what the config asks for. Sizing (2026-10-02, prod GLM-4.5-Air-4bit,
+# kv_bits=8, group 64): 46 layers x 2 (K,V) x 8 kv heads x 128 head_dim =
+# 94,208 elements/token; 8-bit packed + bf16 scale/bias per 64 = 1.0625 B/elem
+# => ~100 KB/token. A ~5k-token reply prefix (+ generation, 256-token step
+# rounding) pins ~0.5-0.6 GB, so 6 slots ~= 3.6 GB beside ~57 GB of weights.
+# Note a slot keeps the PEAK allocation it ever reached (trim only moves the
+# offset), so a slot that once held an 8k prompt pins ~0.8 GB.
+#
+# Why 6 (was 3 in prod): a measured 28% of main-reply calls were evicted with
+# 3 slots — the slots churned under small judge/extract/proposer prompts. The
+# scratch slot (below) takes the small prompts off the pool entirely; 6
+# regular slots then cover the ~6 active contacts' reply prefixes.
+MAX_SLOTS = 8
+DEFAULT_SLOTS = 6
+
+# Prompts shorter than this many tokens are routed to a dedicated SCRATCH slot
+# and never touch (reuse-trim OR evict) a regular slot. Reusing a regular slot
+# for a short prompt trims it to the LCP, which destroys a long reply prefix
+# just as surely as evicting it. 0 disables the scratch slot (legacy routing).
+DEFAULT_SCRATCH_MAX_TOKENS = 400
+MAX_SCRATCH_MAX_TOKENS = 8192
 
 
 def parse_mode(raw, default="shadow"):
@@ -90,12 +107,26 @@ def plan_reuse(prev_tokens, new_tokens, cache_size):
 
 
 def parse_slots(raw, default=DEFAULT_SLOTS):
-    """Parse the slot-pool size, clamped to [1, MAX_SLOTS]."""
+    """Parse the regular slot-pool size, clamped to [1, MAX_SLOTS]."""
     try:
         n = int(str(raw).strip())
     except (TypeError, ValueError):
         return default
     return max(1, min(n, MAX_SLOTS))
+
+
+def parse_scratch_max_tokens(raw, default=DEFAULT_SCRATCH_MAX_TOKENS):
+    """Parse the scratch-slot threshold, clamped to [0, MAX_SCRATCH_MAX_TOKENS].
+
+    0 (or any negative) disables the scratch slot. Junk falls back to default.
+    """
+    if raw is None:
+        return default
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(n, MAX_SCRATCH_MAX_TOKENS))
 
 
 EVICT_POLICIES = ("value", "lru")
@@ -202,3 +233,40 @@ def choose_slot(slot_prev_tokens, slot_last_used, new_tokens,
                        slot_last_used[i]),  # tie-break: oldest first, deterministic
     )
     return victim, 0
+
+
+def route_request(slot_prev_tokens, slot_last_used, new_tokens,
+                  scratch_idx=None, scratch_max_tokens=0,
+                  floor=DEFAULT_SLOT_FLOOR, policy="value"):
+    """Pick a slot for a request, honouring the scratch slot.
+
+    scratch_idx:        index of the scratch slot in the pool, or None (no
+                        scratch slot — identical to choose_slot over the pool).
+    scratch_max_tokens: prompts with len(new_tokens) < this go to the scratch
+                        slot; 0 disables scratch routing.
+
+    Returns (slot_idx, reuse, is_scratch).
+
+    Small prompts ALWAYS land on the scratch slot (reusing its prefix when
+    that clears the floor, else resetting it). They never reuse a regular
+    slot either: plan_reuse would trim that slot to the short LCP, destroying
+    its long prefix. Long prompts pick among the regular slots only, with the
+    usual best-LCP / least-valuable-victim logic, and never see the scratch.
+    """
+    n = len(slot_prev_tokens)
+    scratch_on = (scratch_idx is not None and scratch_max_tokens > 0
+                  and 0 <= scratch_idx < n and n >= 2)
+    if scratch_on and len(new_tokens) < scratch_max_tokens:
+        prev = slot_prev_tokens[scratch_idx]
+        cap = max(0, len(new_tokens) - 1)
+        lcp = min(common_prefix_len(prev, new_tokens), cap) if prev else 0
+        return scratch_idx, (lcp if lcp >= floor and lcp > 0 else 0), True
+    if not scratch_on:
+        idx, reuse = choose_slot(slot_prev_tokens, slot_last_used, new_tokens,
+                                 floor=floor, policy=policy)
+        return idx, reuse, False
+    regular = [i for i in range(n) if i != scratch_idx]
+    sub_idx, reuse = choose_slot([slot_prev_tokens[i] for i in regular],
+                                 [slot_last_used[i] for i in regular],
+                                 new_tokens, floor=floor, policy=policy)
+    return regular[sub_idx], reuse, False
