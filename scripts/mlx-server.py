@@ -322,6 +322,21 @@ def _sanitize_purpose(raw):
         val = val.replace(ch, "_")
     val = _PURPOSE_STRIP_RE.sub("", val)[:24]
     return val or None
+
+
+def _queue_wait_tag(t0, started):
+    """' qwait=<s>s' for the per-request log line: how long a chat request sat
+    in admission_queue before the worker began it. `t0` is stamped in do_POST
+    before submit_and_wait; `started` when _do_chat_completion begins on the
+    worker. The logged elapsed time already includes this wait, so without it
+    a reply queued behind a 20 s batch job is indistinguishable from a slow
+    generation. Clamped at 0 (clock adjustments); '' on bad input, because
+    logging must never fail a request."""
+    try:
+        wait = max(0.0, float(started) - float(t0))
+    except (TypeError, ValueError):
+        return ""
+    return f" qwait={wait:.2f}s"
 # Batch cap bounds total in-flight+queued batch jobs so a runaway reindexer
 # or eval harness cannot wedge interactive traffic behind an unbounded
 # queue (the 2026-07-25 retry-amplification doom loop). Live cap is a much
@@ -3170,7 +3185,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         perf_stats["total_time"] += elapsed
         perf_stats["requests"] += 1
 
-        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s, TTFT {ttft:.2f}s){cache_tag}{spec_tag}{reused}{self._purpose_tag()} | {preview}...", flush=True)
+        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s, TTFT {ttft:.2f}s){cache_tag}{spec_tag}{reused}{self._purpose_tag()}{self._qwait_tag()} | {preview}...", flush=True)
 
     def _handle_stream_buffered(self, messages, resp_id, t0, max_tokens, temperature):
         """Buffered streaming: accumulate the full generation, apply the SAME
@@ -3257,7 +3272,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             tag = " [buffered]"
         preview = clean[:60].replace("\n", " ")
         print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s, "
-              f"TTFT {ttft:.2f}s){cache_tag}{spec_tag}{tag}{self._purpose_tag()} | {preview}...",
+              f"TTFT {ttft:.2f}s){cache_tag}{spec_tag}{tag}{self._purpose_tag()}{self._qwait_tag()} | {preview}...",
               flush=True)
 
     def _handle_non_stream(self, req, resp_id, t0):
@@ -3324,7 +3339,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         perf_stats["total_time"] += elapsed
         perf_stats["requests"] += 1
         cache_tag = f" [TQ{kv_bits}b]" if kv_bits is not None else ""
-        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s){cache_tag}{self._purpose_tag()} | {preview}...", flush=True)
+        print(f"  -> {gen_toks} tokens in {elapsed:.1f}s ({tps:.1f} tok/s){cache_tag}{self._purpose_tag()}{self._qwait_tag()} | {preview}...", flush=True)
 
     def _reject_if_priority_class_over_cap(self, priority):
         """Cheap pre-check, on the ACCEPT thread, before reading a
@@ -3444,6 +3459,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             raw = None
         val = _sanitize_purpose(raw)
         return f" purpose={val}" if val else ""
+
+    def _qwait_tag(self):
+        """' qwait=<s>s' set when the worker picked this request up, or ''."""
+        return getattr(self, "_qwait", "")
 
     def _handle_embeddings(self):
         """POST /v1/embeddings — OpenAI-shaped. Lazy-loads the nomic embedder
@@ -3565,6 +3584,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         """Runs ONLY on the admission_queue worker thread. `req` was already
         read and JSON-parsed on the accept thread in do_POST — nothing here
         touches the socket's read side, only generation + the write side."""
+        self._qwait = _queue_wait_tag(t0, time.time())
 
         # Activation steering: arm per-request trait coefficients from the
         # optional "steering" field, then clear after. Exactly one thread —
