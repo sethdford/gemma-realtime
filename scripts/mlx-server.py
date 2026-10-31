@@ -420,6 +420,96 @@ _lcp_pending_tokens = None  # this request's tokens; promoted at prefill-done
 _lcp_pending_slot = None    # slot index the pending tokens belong to
 _lcp_request_counter = 0    # monotonic clock for slot LRU
 _lcp_last = {}            # last request's stats, surfaced via /health
+# MLX memory: limits applied at startup and a snapshot the WORKER thread
+# refreshes after each chat request. /health only reads these dicts: accept
+# threads must never call into mx (the 2026-09-02 thread-affinity SIGSEGV).
+_mem_limits = {}
+_mem_snapshot = {}
+
+_GIB = 1024 ** 3
+
+
+def _gb_env(environ, name, allow_zero=False):
+    """GB value from env `name`, or None when unset/invalid/out of range.
+    Rejections are logged. `allow_zero` admits 0 (mlx: cache limit 0 = no cache)."""
+    raw = (environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        print(f"  [memory] ignoring {name}={raw!r}: not a number", flush=True)
+        return None
+    if val > 0 or (allow_zero and val == 0):
+        return val
+    print(f"  [memory] ignoring {name}={raw!r}: must be {'>= 0' if allow_zero else '> 0'}",
+          flush=True)
+    return None
+
+
+def _apply_mlx_memory_limits(mx_mod, environ):
+    """MLX_CACHE_LIMIT_GB -> mx.set_cache_limit, MLX_MEMORY_LIMIT_GB ->
+    mx.set_memory_limit. Unset = MLX defaults, i.e. no behaviour change.
+
+    Why: on 2026-10-31 the Mac reached 135 GB resident on 128 GB and was
+    force-restarted. MLX keeps freed Metal buffers in a cache whose limit
+    defaults to the memory limit (about 0.95 x RAM, ~121.6 GB here), so the
+    pool can stay huge after a spike. The CACHE limit is the lever:
+    MLX_CACHE_LIMIT_GB bounds it, and 0 disables caching.
+
+    The memory limit is SOFT (mlx: a guideline; it raises only when no RAM or
+    swap is left). It does NOT cap memory and would not have prevented the
+    10-31 event. Measured 2026-10-31: limit 64 MB, a 1 GB eval still succeeded.
+    Set too low, evals wait on in-flight work, which slows replies quietly;
+    _seed_memory_after_load warns when it is below the loaded model's active
+    memory. Returns the applied limits in GB."""
+    applied = {}
+    for env_name, setter, key, zero_ok in (
+            ("MLX_CACHE_LIMIT_GB", "set_cache_limit", "cache_limit_gb", True),
+            ("MLX_MEMORY_LIMIT_GB", "set_memory_limit", "memory_limit_gb", False)):
+        gb = _gb_env(environ, env_name, allow_zero=zero_ok)
+        if gb is None:
+            continue
+        fn = getattr(mx_mod, setter, None)
+        if fn is None:
+            print(f"  [memory] {env_name} set but mlx has no {setter}; ignored", flush=True)
+            continue
+        prev = fn(int(gb * _GIB))
+        applied[key] = gb
+        prev_txt = f"{prev / _GIB:.1f} GB" if isinstance(prev, (int, float)) else "unknown"
+        print(f"  [memory] {setter}({gb:g} GB), previous {prev_txt}", flush=True)
+    return applied
+
+
+def _mlx_memory_snapshot(mx_mod):
+    """{active,peak,cache}_gb from mx, or {} if unavailable. Worker thread only."""
+    try:
+        return {"active_gb": round(mx_mod.get_active_memory() / _GIB, 2),
+                "peak_gb": round(mx_mod.get_peak_memory() / _GIB, 2),
+                "cache_gb": round(mx_mod.get_cache_memory() / _GIB, 2)}
+    except Exception:  # noqa: BLE001 — telemetry must never fail a request
+        return {}
+
+
+def _seed_memory_after_load(mx_mod):
+    """Run on the main thread right after load_model, the thread that just
+    loaded, so this adds no thread-affinity risk. Seeds the /health snapshot
+    so it isn't empty until the first chat, and warns when a memory limit is
+    below the model's active memory (a soft limit set that low slows evals)."""
+    snap = _mlx_memory_snapshot(mx_mod)
+    _mem_snapshot.clear()
+    _mem_snapshot.update(snap)
+    lim = _mem_limits.get("memory_limit_gb")
+    if lim is not None and snap.get("active_gb") is not None and lim < snap["active_gb"]:
+        print(f"  [memory] WARNING MLX_MEMORY_LIMIT_GB={lim:g} is below the loaded "
+              f"model's active memory ({snap['active_gb']:g} GB); this soft limit will "
+              f"slow generation, not cap memory", flush=True)
+    return snap
+
+
+def _health_memory_block():
+    """What /health reports: the last worker snapshot plus applied limits."""
+    return {**_mem_snapshot, "limits": dict(_mem_limits)}
 
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
 THINKING_TOKENS = frozenset({"|", "|\n", "\n|", "\n"})
@@ -2991,6 +3081,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 health["kv_bits"] = kv_bits
                 health["kv_quant_scheme"] = kv_quant_scheme
                 health["turboquant_plus"] = turbo_cache is not None
+            health["mlx_memory"] = _health_memory_block()
             health["lm_prompt_cache_active"] = lm_prompt_cache is not None
             health["prompt_cache_lcp"] = lcp_mode
             health["prompt_cache_lcp_slots"] = lm_cache_slot_count
@@ -3615,6 +3706,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                     self._handle_non_stream(req, resp_id, t0)
         finally:
             ps.clear_active()
+            try:
+                import mlx.core as _mx_mem
+                _mem_snapshot.clear()
+                _mem_snapshot.update(_mlx_memory_snapshot(_mx_mem))
+            except Exception:  # noqa: BLE001 — telemetry must never fail a request
+                pass
 
 
 def _lcp_pool_config_raw(hc, environ):
@@ -3845,7 +3942,10 @@ Examples:
               + ("  (least-valuable: cached toks / (age+1))" if lcp_evict_policy == "value"
                  else "  (LEGACY size-indifferent LRU — rollback mode)"), flush=True)
 
+    import mlx.core as _mx_mem
+    _mem_limits.update(_apply_mlx_memory_limits(_mx_mem, os.environ))
     load_model(args.model, adapter_path=args.adapter_path)
+    _seed_memory_after_load(_mx_mem)
 
     # Phase 1: install activation steering if trait vectors are present. Probe-
     # gated (declines on shape/version mismatch) and default-off — no behavior
