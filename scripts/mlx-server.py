@@ -405,6 +405,68 @@ _lcp_pending_tokens = None  # this request's tokens; promoted at prefill-done
 _lcp_pending_slot = None    # slot index the pending tokens belong to
 _lcp_request_counter = 0    # monotonic clock for slot LRU
 _lcp_last = {}            # last request's stats, surfaced via /health
+# MLX memory: limits applied at startup and a snapshot the WORKER thread
+# refreshes after each chat request. /health only reads these dicts: accept
+# threads must never call into mx (the 2026-09-02 thread-affinity SIGSEGV).
+_mem_limits = {}
+_mem_snapshot = {}
+
+_GIB = 1024 ** 3
+
+
+def _gb_env(environ, name):
+    """Positive GB value from env `name`, or None when unset/invalid/<=0."""
+    raw = (environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        print(f"  [memory] ignoring {name}={raw!r}: not a number", flush=True)
+        return None
+    return val if val > 0 else None
+
+
+def _apply_mlx_memory_limits(mx_mod, environ):
+    """MLX_CACHE_LIMIT_GB -> mx.set_cache_limit, MLX_MEMORY_LIMIT_GB ->
+    mx.set_memory_limit. Unset = MLX defaults, i.e. no behaviour change.
+
+    Why: by default MLX lets a process grow past physical RAM (the memory
+    limit is 1.5x the recommended working set) and keeps freed Metal buffers
+    in its cache instead of returning them. On 2026-10-31 the Mac reached
+    135 GB resident on 128 GB and had to be force-restarted. A memory limit
+    below the model's size makes the LOAD fail; set it from /health numbers,
+    not by guess. Returns the applied limits in GB."""
+    applied = {}
+    for env_name, setter, key in (("MLX_CACHE_LIMIT_GB", "set_cache_limit", "cache_limit_gb"),
+                                  ("MLX_MEMORY_LIMIT_GB", "set_memory_limit", "memory_limit_gb")):
+        gb = _gb_env(environ, env_name)
+        if gb is None:
+            continue
+        fn = getattr(mx_mod, setter, None)
+        if fn is None:
+            print(f"  [memory] {env_name} set but mlx has no {setter}; ignored", flush=True)
+            continue
+        prev = fn(int(gb * _GIB))
+        applied[key] = gb
+        prev_txt = f"{prev / _GIB:.1f} GB" if isinstance(prev, (int, float)) else "unknown"
+        print(f"  [memory] {setter}({gb:g} GB), previous {prev_txt}", flush=True)
+    return applied
+
+
+def _mlx_memory_snapshot(mx_mod):
+    """{active,peak,cache}_gb from mx, or {} if unavailable. Worker thread only."""
+    try:
+        return {"active_gb": round(mx_mod.get_active_memory() / _GIB, 2),
+                "peak_gb": round(mx_mod.get_peak_memory() / _GIB, 2),
+                "cache_gb": round(mx_mod.get_cache_memory() / _GIB, 2)}
+    except Exception:  # noqa: BLE001 — telemetry must never fail a request
+        return {}
+
+
+def _health_memory_block():
+    """What /health reports: the last worker snapshot plus applied limits."""
+    return {**_mem_snapshot, "limits": dict(_mem_limits)}
 
 STOP_STRINGS = ("<end_of_turn>", "<eos>")
 THINKING_TOKENS = frozenset({"|", "|\n", "\n|", "\n"})
@@ -2976,6 +3038,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 health["kv_bits"] = kv_bits
                 health["kv_quant_scheme"] = kv_quant_scheme
                 health["turboquant_plus"] = turbo_cache is not None
+            health["mlx_memory"] = _health_memory_block()
             health["lm_prompt_cache_active"] = lm_prompt_cache is not None
             health["prompt_cache_lcp"] = lcp_mode
             health["prompt_cache_lcp_slots"] = lm_cache_slot_count
@@ -3595,6 +3658,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                     self._handle_non_stream(req, resp_id, t0)
         finally:
             ps.clear_active()
+            try:
+                import mlx.core as _mx_mem
+                _mem_snapshot.clear()
+                _mem_snapshot.update(_mlx_memory_snapshot(_mx_mem))
+            except Exception:  # noqa: BLE001 — telemetry must never fail a request
+                pass
 
 
 def _lcp_pool_config_raw(hc, environ):
@@ -3825,6 +3894,8 @@ Examples:
               + ("  (least-valuable: cached toks / (age+1))" if lcp_evict_policy == "value"
                  else "  (LEGACY size-indifferent LRU — rollback mode)"), flush=True)
 
+    import mlx.core as _mx_mem
+    _mem_limits.update(_apply_mlx_memory_limits(_mx_mem, os.environ))
     load_model(args.model, adapter_path=args.adapter_path)
 
     # Phase 1: install activation steering if trait vectors are present. Probe-
