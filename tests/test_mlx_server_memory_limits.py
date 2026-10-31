@@ -73,11 +73,67 @@ def test_limits_applied_in_bytes(srv):
     assert mx.calls == [("cache", 4 * GIB), ("memory", int(70.5 * GIB))]
 
 
-@pytest.mark.parametrize("raw", ["", "  ", "abc", "0", "-3"])
+@pytest.mark.parametrize("raw", ["", "  ", "abc", "-3"])
 def test_bad_values_ignored(srv, raw):
     mx = FakeMx()
     assert srv._apply_mlx_memory_limits(mx, {"MLX_CACHE_LIMIT_GB": raw}) == {}
     assert mx.calls == []
+
+
+def test_cache_limit_zero_disables_cache(srv):
+    """0 is mlx's documented 'no cache' value, the main lever after a spike."""
+    mx = FakeMx()
+    assert srv._apply_mlx_memory_limits(mx, {"MLX_CACHE_LIMIT_GB": "0"}) == {"cache_limit_gb": 0.0}
+    assert mx.calls == [("cache", 0)]
+
+
+def test_memory_limit_zero_rejected_and_logged(srv, capsys):
+    mx = FakeMx()
+    assert srv._apply_mlx_memory_limits(mx, {"MLX_MEMORY_LIMIT_GB": "0"}) == {}
+    assert mx.calls == []
+    assert "ignoring MLX_MEMORY_LIMIT_GB" in capsys.readouterr().out
+
+
+def test_seed_after_load_fills_snapshot(srv, monkeypatch):
+    monkeypatch.setattr(srv, "_mem_snapshot", {})
+    monkeypatch.setattr(srv, "_mem_limits", {})
+    srv._seed_memory_after_load(FakeMx(active=56 * GIB, peak=57 * GIB, cache=1 * GIB))
+    assert srv._health_memory_block()["active_gb"] == 56.0
+
+
+def test_seed_warns_when_memory_limit_below_model(srv, monkeypatch, capsys):
+    monkeypatch.setattr(srv, "_mem_snapshot", {})
+    monkeypatch.setattr(srv, "_mem_limits", {"memory_limit_gb": 40.0})
+    srv._seed_memory_after_load(FakeMx(active=56 * GIB))
+    assert "WARNING MLX_MEMORY_LIMIT_GB=40" in capsys.readouterr().out
+
+
+def test_seed_quiet_when_memory_limit_above_model(srv, monkeypatch, capsys):
+    monkeypatch.setattr(srv, "_mem_snapshot", {})
+    monkeypatch.setattr(srv, "_mem_limits", {"memory_limit_gb": 80.0})
+    srv._seed_memory_after_load(FakeMx(active=56 * GIB))
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def _src():
+    return open(os.path.join(_SCRIPTS, "mlx-server.py"), encoding="utf-8").read()
+
+
+def test_main_applies_limits_before_load_and_seeds_after():
+    src = _src()
+    body = src[src.index("\ndef main():"):]
+    apply_at = body.index("_apply_mlx_memory_limits(")
+    load_at = body.index("load_model(args.model")
+    seed_at = body.index("_seed_memory_after_load(")
+    assert apply_at < load_at < seed_at
+
+
+def test_worker_refreshes_snapshot_after_each_chat():
+    src = _src()
+    start = src.index("def _do_chat_completion(")
+    body = src[start:src.index("\ndef ", start + 1)]
+    fin = body[body.index("finally:"):]
+    assert "_mlx_memory_snapshot(" in fin
 
 
 def test_missing_setter_is_ignored(srv):
